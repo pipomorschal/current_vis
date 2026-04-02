@@ -42,6 +42,7 @@ class ZoomAdaptivePlotPanel(QtWidgets.QWidget):
         self._full_data: PlotDataStore | None = None
         self._pen = pg.mkPen("b", width=1.2)
         self._curve = self.plot.plot([], [], pen=self._pen)
+        self._additional_curves: list[pg.PlotDataItem] = []
         self._updating = False
         self._first_draw_done = False
 
@@ -58,6 +59,8 @@ class ZoomAdaptivePlotPanel(QtWidgets.QWidget):
     def clear(self):
         self._full_data = None
         self._curve.setData([], [])
+        for curve in self._additional_curves:
+            curve.setData([], [])
         self._first_draw_done = False
 
     def set_pen(self, pen):
@@ -78,6 +81,49 @@ class ZoomAdaptivePlotPanel(QtWidgets.QWidget):
 
         self._full_data = PlotDataStore(x=x, y=y)
         self.redraw(auto_range=auto_range, initial=True)
+
+    def set_multi_data(self, x: np.ndarray, data_dict: dict[str, np.ndarray], auto_range: bool = True):
+        """Plot multiple curves with different colors.
+        
+        Args:
+            x: common x-axis array
+            data_dict: dict mapping curve_name -> y_array
+            auto_range: whether to auto-fit the view
+        """
+        x = np.asarray(x, dtype=float)
+        
+        # Clear additional curves
+        for curve in self._additional_curves:
+            curve.setData([], [])
+        self._additional_curves.clear()
+        
+        # Use first dataset as primary (for zoom-adaptive logic)
+        first_key = next(iter(data_dict.keys())) if data_dict else None
+        if first_key is None:
+            self._full_data = None
+            self._curve.setData([], [])
+            return
+        
+        y_primary = np.asarray(data_dict[first_key], dtype=float)
+        x, y_primary = _nan_safe(x, y_primary)
+        self._full_data = PlotDataStore(x=x, y=y_primary)
+        
+        # Plot primary curve
+        self.redraw(auto_range=auto_range, initial=True)
+        
+        # Add additional curves with different colors
+        colors = ["r", "g", "c", "m", "y", "orange", "purple", "brown"]
+        for idx, (label, y_data) in enumerate(data_dict.items()):
+            if label == first_key:
+                continue  # Already plotted as primary
+            
+            y_data = np.asarray(y_data, dtype=float)
+            x_safe, y_safe = _nan_safe(x, y_data)
+            
+            color = colors[(idx - 1) % len(colors)]
+            pen = pg.mkPen(color, width=1.2)
+            curve = self.plot.plot(x_safe, y_safe, pen=pen, name=label)
+            self._additional_curves.append(curve)
 
     def _visible_window(self) -> tuple[float, float] | None:
         if self._full_data is None or self._full_data.x.size == 0:

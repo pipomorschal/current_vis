@@ -9,6 +9,7 @@ from data_manager_signal_loader import DataManager
 from file_preview_dialog import FilePreviewDialog
 from signal_analysis_utils import Analysis
 from signal_data_class import SignalData
+from signal_data_import import OscilloscopeImporter, ScopeCaptureConfig
 from plot_panel_widget import PlotPanel, PlotDataStore
 
 
@@ -64,6 +65,24 @@ class StftDebugWindow(QtWidgets.QMainWindow):
         self.plot.autoRange()
 
 
+class ScopeAcquireWorker(QtCore.QObject):
+    finished = QtCore.Signal(object)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, config: ScopeCaptureConfig):
+        super().__init__()
+        self.config = config
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            data = OscilloscopeImporter.capture_channel(self.config)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(data)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -78,9 +97,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._range_initialized = False
         self._debug_enabled = True
         self._stft_debug_window: StftDebugWindow | None = None
+        self._scope_thread: QtCore.QThread | None = None
+        self._scope_worker: ScopeAcquireWorker | None = None
+        self._last_scope_data: SignalData | None = None
 
         self._build_ui()
         self._connect_signals()
+        self._update_demod_mode_ui()
         self.refresh_all_views()
         self.tabs.setCurrentWidget(self.time_plot)
         self._update_sidebar_visibility()
@@ -147,12 +170,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_browse = QtWidgets.QPushButton("Select File...")
         self.btn_load = QtWidgets.QPushButton("Load Selected File")
         self.btn_demo = QtWidgets.QPushButton("Load Demo Signal")
+        self.combo_scope_resource = QtWidgets.QComboBox()
+        self.btn_scope_refresh = QtWidgets.QPushButton("Refresh VISA Resources")
+        self.combo_scope_channel = QtWidgets.QComboBox()
+        self.combo_scope_channel.addItems(["CH1", "CH2", "CH3", "CH4"])
+        self.spin_scope_points = QtWidgets.QSpinBox()
+        self.spin_scope_points.setRange(100, 10000000)
+        self.spin_scope_points.setValue(100000)
+        self.spin_scope_timeout_ms = QtWidgets.QSpinBox()
+        self.spin_scope_timeout_ms.setRange(1000, 120000)
+        self.spin_scope_timeout_ms.setValue(5000)
+        self.spin_scope_timeout_ms.setSuffix(" ms")
+        self.btn_scope_acquire = QtWidgets.QPushButton("Acquire from Oscilloscope")
+        self.btn_scope_save = QtWidgets.QPushButton("Save Last Scope Capture")
+        self.btn_scope_save.setEnabled(False)
         self.combo_time_column = QtWidgets.QComboBox()
         self.combo_amplitude_column = QtWidgets.QComboBox()
         form_data.addRow(self.path_edit)
         form_data.addRow(self.btn_browse)
         form_data.addRow(self.btn_load)
         form_data.addRow(self.btn_demo)
+        form_data.addRow(QtWidgets.QLabel("--- Oscilloscope Input ---"))
+        form_data.addRow("Resource", self.combo_scope_resource)
+        form_data.addRow(self.btn_scope_refresh)
+        form_data.addRow("Channel", self.combo_scope_channel)
+        form_data.addRow("Sample Points", self.spin_scope_points)
+        form_data.addRow("Timeout", self.spin_scope_timeout_ms)
+        form_data.addRow(self.btn_scope_acquire)
+        form_data.addRow(self.btn_scope_save)
         form_data.addRow("Time Column", self.combo_time_column)
         form_data.addRow("Amplitude Column", self.combo_amplitude_column)
 
@@ -195,6 +240,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_demod_frequency.setSingleStep(1.0)
         self.spin_demod_frequency.setSuffix(" Hz")
 
+        self.check_demod_mode_lockin = QtWidgets.QCheckBox("Use Lock-in Mode")
+        self.check_demod_mode_lockin.setChecked(False)
+
         self.btn_use_fft_frequency = QtWidgets.QPushButton("Use Selected FFT Frequency")
         self.btn_update_demod = QtWidgets.QPushButton("Run Demodulation")
         self.lbl_selected_freq = QtWidgets.QLabel("No frequency selected")
@@ -202,26 +250,60 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_stft_window = QtWidgets.QComboBox()
         self.combo_stft_window.addItems(["hann", "hamming", "blackman", "rectangular"])
         self.spin_nperseg = QtWidgets.QSpinBox()
-        self.spin_nperseg.setRange(8, 100000)
+        self.spin_nperseg.setRange(8, 10000000)
         self.spin_nperseg.setValue(256)
         self.spin_noverlap = QtWidgets.QSpinBox()
-        self.spin_noverlap.setRange(0, 100000)
+        self.spin_noverlap.setRange(0, 10000000)
         self.spin_noverlap.setValue(128)
         self.spin_nfft = QtWidgets.QSpinBox()
-        self.spin_nfft.setRange(8, 100000)
+        self.spin_nfft.setRange(8, 10000000)
         self.spin_nfft.setValue(256)
-        self.check_stft_remove_mean = QtWidgets.QCheckBox("Remove Mean")
-        self.check_stft_remove_mean.setChecked(True)
+
+        self.group_stft_settings = QtWidgets.QGroupBox("STFT Settings")
+        form_stft = QtWidgets.QFormLayout(self.group_stft_settings)
+        form_stft.addRow("Window", self.combo_stft_window)
+        form_stft.addRow("N Per Segment", self.spin_nperseg)
+        form_stft.addRow("N Overlap", self.spin_noverlap)
+        form_stft.addRow("N FFT", self.spin_nfft)
+        self.check_show_stft_debug = QtWidgets.QCheckBox("Show STFT Debug Plot")
+        self.check_show_stft_debug.setChecked(True)
+        form_stft.addRow(self.check_show_stft_debug)
+
+        self.group_lockin = QtWidgets.QGroupBox("Lock-in Settings")
+        form_lockin = QtWidgets.QFormLayout(self.group_lockin)
+        self.spin_lockin_lowpass_cutoff = QtWidgets.QDoubleSpinBox()
+        self.spin_lockin_lowpass_cutoff.setRange(1e-9, 1e12)
+        self.spin_lockin_lowpass_cutoff.setDecimals(6)
+        self.spin_lockin_lowpass_cutoff.setValue(1000.0)
+        self.spin_lockin_lowpass_cutoff.setSuffix(" Hz")
+        self.spin_lockin_lowpass_order = QtWidgets.QSpinBox()
+        self.spin_lockin_lowpass_order.setRange(1, 10)
+        self.spin_lockin_lowpass_order.setValue(2)
+        self.check_lockin_use_iq = QtWidgets.QCheckBox("Use I/Q Magnitude")
+        self.check_lockin_use_iq.setChecked(True)
+        self.check_lockin_reconstruct_phase = QtWidgets.QCheckBox("Reconstruct Signal Using Phase")
+        self.check_lockin_reconstruct_phase.setChecked(False)
+        self.check_lockin_show_phase_separately = QtWidgets.QCheckBox("Show Magnitude & Phase Separately")
+        self.check_lockin_show_phase_separately.setChecked(False)
+        self.check_lockin_skip_transient = QtWidgets.QCheckBox("Skip Initial Transient")
+        self.check_lockin_skip_transient.setChecked(True)
+        form_lockin.addRow("Lowpass Cutoff", self.spin_lockin_lowpass_cutoff)
+        form_lockin.addRow("Lowpass Order", self.spin_lockin_lowpass_order)
+        form_lockin.addRow(self.check_lockin_use_iq)
+        form_lockin.addRow(self.check_lockin_reconstruct_phase)
+        form_lockin.addRow(self.check_lockin_show_phase_separately)
+        form_lockin.addRow(self.check_lockin_skip_transient)
 
         form_demod.addRow("Frequency", self.spin_demod_frequency)
+        form_demod.addRow(self.check_demod_mode_lockin)
         form_demod.addRow(self.btn_use_fft_frequency)
-        form_demod.addRow("STFT Window", self.combo_stft_window)
-        form_demod.addRow("N Per Segment", self.spin_nperseg)
-        form_demod.addRow("N Overlap", self.spin_noverlap)
-        form_demod.addRow("N FFT", self.spin_nfft)
-        form_demod.addRow(self.check_stft_remove_mean)
+        form_demod.addRow(self.group_stft_settings)
+        form_demod.addRow(self.group_lockin)
         form_demod.addRow(self.btn_update_demod)
         form_demod.addRow(self.lbl_selected_freq)
+
+        self.group_stft_settings.setVisible(True)
+        self.group_lockin.setVisible(False)
 
         self.group_info = QtWidgets.QGroupBox("Source / Metadata")
         info_layout = QtWidgets.QVBoxLayout(self.group_info)
@@ -262,11 +344,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_browse.clicked.connect(self.browse_file)
         self.btn_load.clicked.connect(self.load_selected_file)
         self.btn_demo.clicked.connect(self._load_demo_data)
+        self.btn_scope_refresh.clicked.connect(self._refresh_scope_resources)
+        self.btn_scope_acquire.clicked.connect(self._acquire_scope_data)
+        self.btn_scope_save.clicked.connect(self._save_scope_capture)
         self.btn_apply_range.clicked.connect(self.refresh_all_views)
 
         self.btn_update_fft.clicked.connect(self._update_frequency_plot)
         self.btn_use_fft_frequency.clicked.connect(self._use_selected_fft_frequency)
         self.btn_update_demod.clicked.connect(self._update_demodulation_plot)
+        self.check_demod_mode_lockin.stateChanged.connect(self._on_demod_mode_changed)
+        self.check_lockin_reconstruct_phase.stateChanged.connect(self._on_lockin_reconstruct_mode_changed)
+        self.check_lockin_show_phase_separately.stateChanged.connect(self._on_lockin_reconstruct_mode_changed)
 
         self.combo_time_column.currentIndexChanged.connect(self.refresh_all_views)
         self.combo_amplitude_column.currentIndexChanged.connect(self.refresh_all_views)
@@ -274,11 +362,50 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.tabs.currentChanged.connect(lambda _: self._update_sidebar_visibility())
 
+    def _set_scope_controls_enabled(self, enabled: bool):
+        controls = [
+            self.combo_scope_resource,
+            self.btn_scope_refresh,
+            self.combo_scope_channel,
+            self.spin_scope_points,
+            self.spin_scope_timeout_ms,
+            self.btn_scope_acquire,
+        ]
+        for control in controls:
+            control.setEnabled(enabled)
+
     def _update_sidebar_visibility(self):
         current = self.tabs.currentWidget()
         self.group_info.setVisible(current == self.time_plot)
         self.group_fft.setVisible(current == self.freq_plot)
         self.group_demod.setVisible(current == self.demo_plot)
+
+    def _on_demod_mode_changed(self):
+        self._update_demod_mode_ui()
+        if self.data is not None and self.selected_data is not None and self.selected_data.n_samples > 1:
+            self._update_demodulation_plot()
+
+    def _update_demod_mode_ui(self):
+        is_lock_in = self.check_demod_mode_lockin.isChecked()
+        self.group_stft_settings.setVisible(not is_lock_in)
+        self.group_lockin.setVisible(is_lock_in)
+        self._update_lockin_reconstruction_ui()
+
+    def _on_lockin_reconstruct_mode_changed(self):
+        self._update_lockin_reconstruction_ui()
+        if self.data is not None and self.selected_data is not None and self.selected_data.n_samples > 1:
+            self._update_demodulation_plot()
+
+    def _update_lockin_reconstruction_ui(self):
+        needs_iq_reconstruct = self.check_lockin_reconstruct_phase.isChecked()
+        needs_iq_phase_sep = self.check_lockin_show_phase_separately.isChecked()
+        
+        # If either reconstruction option is active, I/Q must be enabled
+        if needs_iq_reconstruct or needs_iq_phase_sep:
+            self.check_lockin_use_iq.setChecked(True)
+        
+        # Disable if I/Q is not available
+        self.check_lockin_use_iq.setEnabled(not (needs_iq_reconstruct or needs_iq_phase_sep))
 
     def browse_file(self):
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -289,6 +416,118 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if file_path:
             self.path_edit.setText(file_path)
+
+    def _refresh_scope_resources(self):
+        self.combo_scope_resource.clear()
+
+        if not OscilloscopeImporter.pyvisa_available():
+            self.combo_scope_resource.addItem("pyvisa not installed")
+            self.combo_scope_resource.setEnabled(False)
+            self.btn_scope_acquire.setEnabled(False)
+            self.statusBar().showMessage("pyvisa fehlt - Oszilloskopfunktion deaktiviert", 5000)
+            return
+
+        try:
+            resources = OscilloscopeImporter.list_resources()
+        except Exception as exc:
+            self.combo_scope_resource.addItem("No VISA resource")
+            self.combo_scope_resource.setEnabled(False)
+            self.btn_scope_acquire.setEnabled(False)
+            QtWidgets.QMessageBox.warning(self, "VISA", f"VISA-Ressourcen konnten nicht gelesen werden:\n{exc}")
+            return
+
+        if not resources:
+            self.combo_scope_resource.addItem("No VISA resource")
+            self.combo_scope_resource.setEnabled(False)
+            self.btn_scope_acquire.setEnabled(False)
+            self.statusBar().showMessage("Keine VISA-Ressourcen gefunden", 5000)
+            return
+
+        self.combo_scope_resource.addItems(list(resources))
+        self.combo_scope_resource.setEnabled(True)
+        self.btn_scope_acquire.setEnabled(True)
+        self.statusBar().showMessage(f"{len(resources)} VISA-Ressource(n) gefunden", 4000)
+
+    def _acquire_scope_data(self):
+        if self._scope_thread is not None:
+            QtWidgets.QMessageBox.information(self, "Oszilloskop", "Akquise laeuft bereits.")
+            return
+
+        resource = self.combo_scope_resource.currentText().strip()
+        if not resource or resource in {"No VISA resource", "pyvisa not installed"}:
+            QtWidgets.QMessageBox.warning(self, "Oszilloskop", "Bitte zuerst eine gueltige VISA-Ressource waehlen.")
+            return
+
+        config = ScopeCaptureConfig(
+            resource_name=resource,
+            channel=self.combo_scope_channel.currentText().strip(),
+            point_count=int(self.spin_scope_points.value()),
+            timeout_ms=int(self.spin_scope_timeout_ms.value()),
+        )
+
+        self._scope_worker = ScopeAcquireWorker(config)
+        self._scope_thread = QtCore.QThread(self)
+        self._scope_worker.moveToThread(self._scope_thread)
+
+        self._scope_thread.started.connect(self._scope_worker.run)
+        self._scope_worker.finished.connect(self._on_scope_capture_finished)
+        self._scope_worker.failed.connect(self._on_scope_capture_failed)
+        self._scope_worker.finished.connect(self._scope_thread.quit)
+        self._scope_worker.failed.connect(self._scope_thread.quit)
+        self._scope_worker.finished.connect(self._scope_worker.deleteLater)
+        self._scope_worker.failed.connect(self._scope_worker.deleteLater)
+        self._scope_thread.finished.connect(self._scope_thread.deleteLater)
+        self._scope_thread.finished.connect(self._on_scope_thread_finished)
+
+        self._set_scope_controls_enabled(False)
+        self.statusBar().showMessage("Oszilloskop-Akquise gestartet...", 3000)
+        self._scope_thread.start()
+
+    @QtCore.Slot(object)
+    def _on_scope_capture_finished(self, data: SignalData):
+        self._last_scope_data = data
+        self.btn_scope_save.setEnabled(True)
+
+        self.data = data
+        self._sync_column_choices_from_data()
+        self._range_initialized = False
+        self.refresh_all_views()
+        self.tabs.setCurrentWidget(self.time_plot)
+        self._update_sidebar_visibility()
+        self.statusBar().showMessage("Oszilloskop-Daten eingelesen", 5000)
+
+    @QtCore.Slot(str)
+    def _on_scope_capture_failed(self, message: str):
+        QtWidgets.QMessageBox.critical(self, "Oszilloskop Fehler", message)
+        self.statusBar().showMessage("Oszilloskop-Akquise fehlgeschlagen", 5000)
+
+    @QtCore.Slot()
+    def _on_scope_thread_finished(self):
+        self._scope_thread = None
+        self._scope_worker = None
+        self._set_scope_controls_enabled(True)
+
+    def _save_scope_capture(self):
+        if self._last_scope_data is None or self._last_scope_data.n_samples == 0:
+            QtWidgets.QMessageBox.information(self, "Oszilloskop", "Keine Oszilloskop-Daten zum Speichern vorhanden.")
+            return
+
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save oscilloscope capture",
+            "",
+            "CSV (*.csv)",
+        )
+        if not file_path:
+            return
+        if not file_path.lower().endswith(".csv"):
+            file_path += ".csv"
+
+        try:
+            DataManager.save_scope_csv(file_path, self._last_scope_data)
+            self.statusBar().showMessage(f"Oszilloskop-Daten gespeichert: {file_path}", 5000)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Save Error", str(exc))
 
     def load_selected_file(self):
         file_path = self.path_edit.text().strip()
@@ -589,6 +828,88 @@ class MainWindow(QtWidgets.QMainWindow):
         t = self.selected_data.time
         y = self.selected_data.amplitude
 
+        is_lock_in = self.check_demod_mode_lockin.isChecked()
+        if is_lock_in:
+            times, amplitude, phase_rad, reconstructed = Analysis.lock_in_demod(
+                SignalData(t, y, sampling_rate=self.selected_data.sampling_rate),
+                reference_frequency=f0,
+                lowpass_cutoff_hz=float(self.spin_lockin_lowpass_cutoff.value()),
+                lowpass_order=int(self.spin_lockin_lowpass_order.value()),
+                use_iq=self.check_lockin_use_iq.isChecked(),
+            )
+            if amplitude.size == 0:
+                if self._stft_debug_window is not None:
+                    self._stft_debug_window.clear()
+                    self._stft_debug_window.hide()
+                return
+
+            # Skip transient if requested
+            if self.check_lockin_skip_transient.isChecked() and amplitude.size > 1:
+                fs = float(self.selected_data.sampling_rate) if self.selected_data.sampling_rate > 0 else 1.0
+                cutoff = float(self.spin_lockin_lowpass_cutoff.value())
+                order = int(self.spin_lockin_lowpass_order.value())
+                tau = 1.0 / (2.0 * np.pi * max(cutoff, 1e-9))
+                skip_samples = int(np.ceil(5.0 * order * tau * fs))
+                skip_samples = min(skip_samples, amplitude.size - 1)
+                times = times[skip_samples:]
+                amplitude = amplitude[skip_samples:]
+                phase_rad = phase_rad[skip_samples:]
+                reconstructed = reconstructed[skip_samples:]
+
+            show_reconstructed = self.check_lockin_reconstruct_phase.isChecked()
+            show_phase_separately = self.check_lockin_show_phase_separately.isChecked()
+            
+            scale = self._time_unit_scale()
+            times_scaled = times / scale
+            
+            # Option 1: Show magnitude and phase separately as two lines
+            if show_phase_separately:
+                # Normalize phase to match magnitude scale for visualization
+                phase_normalized = phase_rad / (2.0 * np.pi)  # Normalize to [-0.5, 0.5] range approximately
+                
+                self.demo_plot.set_pen(pg.mkPen("m", width=1.5))
+                self.demo_plot.set_axis_labels(
+                    bottom="Time",
+                    left="Magnitude & Phase",
+                    bottom_units=self._time_unit_label(),
+                )
+                self.demo_plot.set_multi_data(
+                    times_scaled,
+                    {
+                        "Magnitude": amplitude,
+                        "Phase (rad)": phase_normalized,
+                    },
+                    auto_range=True
+                )
+                self.demo_plot.plot.setTitle(f"Lock-in Magnitude & Phase at {f0:.3f} Hz")
+            
+            # Option 2: Show reconstructed signal
+            elif show_reconstructed:
+                self.demo_plot.set_pen(pg.mkPen("m", width=1.5))
+                self.demo_plot.set_axis_labels(
+                    bottom="Time",
+                    left="Reconstructed Signal",
+                    bottom_units=self._time_unit_label(),
+                )
+                self.demo_plot.set_data(times_scaled, reconstructed, auto_range=True)
+                self.demo_plot.plot.setTitle(f"Lock-in Reconstructed Signal at {f0:.3f} Hz")
+            
+            # Option 3: Show magnitude only (default)
+            else:
+                self.demo_plot.set_pen(pg.mkPen("m", width=1.5))
+                self.demo_plot.set_axis_labels(
+                    bottom="Time",
+                    left="Amplitude",
+                    bottom_units=self._time_unit_label(),
+                )
+                self.demo_plot.set_data(times_scaled, amplitude, auto_range=True)
+                self.demo_plot.plot.setTitle(f"Lock-in Demodulated Amplitude at {f0:.3f} Hz")
+
+            if self._stft_debug_window is not None:
+                self._stft_debug_window.clear()
+                self._stft_debug_window.hide()
+            return
+
         # Apply frequency shift (demodulation) before STFT
         analytic = y * np.exp(-2j * np.pi * f0 * t)
 
@@ -598,7 +919,7 @@ class MainWindow(QtWidgets.QMainWindow):
             nperseg=self.spin_nperseg.value(),
             noverlap=self.spin_noverlap.value(),
             nfft=self.spin_nfft.value(),
-            remove_mean=self.check_stft_remove_mean.isChecked(),
+            remove_mean=False,
         )
         if Z.size == 0:
             if self._stft_debug_window is not None:
@@ -620,18 +941,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.demo_plot.set_data(times / scale, amplitude, auto_range=True)
         self.demo_plot.plot.setTitle(f"Demodulated Amplitude at {f0:.3f} Hz")
 
-        debug_window = self._ensure_stft_debug_window()
-        debug_window.set_stft(
-            times=times,
-            freqs=freqs,
-            Z=Z,
-            f0=f0,
-            time_unit=self._time_unit_label(),
-            time_scale=scale,
-        )
-        debug_window.show()
-        debug_window.raise_()
-        debug_window.activateWindow()
+        if self.check_show_stft_debug.isChecked():
+            debug_window = self._ensure_stft_debug_window()
+            debug_window.set_stft(
+                times=times,
+                freqs=freqs,
+                Z=Z,
+                f0=f0,
+                time_unit=self._time_unit_label(),
+                time_scale=scale,
+            )
+            debug_window.show()
+            debug_window.raise_()
+            debug_window.activateWindow()
+        elif self._stft_debug_window is not None:
+            self._stft_debug_window.clear()
+            self._stft_debug_window.hide()
 
     def export_data(self):
         if self.selected_data is None or self.selected_data.n_samples == 0:
@@ -706,4 +1031,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Exported graph to {file_path}", 5000)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Export Error", str(exc))
+
+    def showEvent(self, event: QtGui.QShowEvent):
+        super().showEvent(event)
+        if self.combo_scope_resource.count() == 0:
+            self._refresh_scope_resources()
 

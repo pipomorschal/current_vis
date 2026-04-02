@@ -208,6 +208,24 @@ class DataManager:
             writer.writerows(zip(data.time.tolist(), data.amplitude.tolist()))
 
     @staticmethod
+    def save_scope_csv(file_path: str, data: SignalData):
+        time_col, amp_col = data.column_names
+        amp_col = amp_col or "CH1"
+
+        with open(file_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+
+            # Metadaten zuerst, damit der bestehende Loader sie mit einliest.
+            if data.metadata:
+                for key, value in data.metadata.items():
+                    writer.writerow([str(key), str(value)])
+            if data.sampling_rate > 0:
+                writer.writerow(["Sample Interval", f"{1.0 / data.sampling_rate:.16g}"])
+
+            writer.writerow([time_col or "TIME", amp_col])
+            writer.writerows(zip(data.time.tolist(), data.amplitude.tolist()))
+
+    @staticmethod
     def save_json(file_path: str, data: SignalData):
         payload = {
             "source_name": data.source_name,
