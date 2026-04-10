@@ -100,9 +100,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scope_thread: QtCore.QThread | None = None
         self._scope_worker: ScopeAcquireWorker | None = None
         self._last_scope_data: SignalData | None = None
+        self._demod_cache_payload: dict | None = None
 
         self._build_ui()
         self._connect_signals()
+        self._update_demod_scale_toggle_ui()
         self._update_demod_mode_ui()
         self.refresh_all_views()
         self.tabs.setCurrentWidget(self.time_plot)
@@ -134,14 +136,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage("Ready")
         self._build_menu()
 
-        self._update_sidebar_visibility()
-
         self.setStyleSheet("""
             QPushButton {
                 background-color: #d9d9d9;
                 border: 1px solid #a6a6a6;
-                border-radius: 6px;
-                padding: 6px 10px;
+                border-radius: 5px;
+                padding: 3px 8px;
+                min-height: 22px;
             }
             QPushButton:hover {
                 background-color: #e6e6e6;
@@ -163,8 +164,22 @@ class MainWindow(QtWidgets.QMainWindow):
         widget.setMaximumWidth(380)
         layout = QtWidgets.QVBoxLayout(widget)
 
-        group_data = QtWidgets.QGroupBox("Data")
-        form_data = QtWidgets.QFormLayout(group_data)
+        def _button_grid(*buttons: QtWidgets.QPushButton) -> QtWidgets.QWidget:
+            # Compact 2-column button container to reduce vertical space.
+            container = QtWidgets.QWidget()
+            grid = QtWidgets.QGridLayout(container)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(6)
+            grid.setVerticalSpacing(4)
+            for idx, btn in enumerate(buttons):
+                row = idx // 2
+                col = idx % 2
+                btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+                grid.addWidget(btn, row, col)
+            return container
+
+        self.group_data = QtWidgets.QGroupBox("Data")
+        form_data = QtWidgets.QFormLayout(self.group_data)
         self.path_edit = QtWidgets.QLineEdit()
         self.path_edit.setReadOnly(True)
         self.btn_browse = QtWidgets.QPushButton("Select File...")
@@ -187,17 +202,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_time_column = QtWidgets.QComboBox()
         self.combo_amplitude_column = QtWidgets.QComboBox()
         form_data.addRow(self.path_edit)
-        form_data.addRow(self.btn_browse)
-        form_data.addRow(self.btn_load)
-        form_data.addRow(self.btn_demo)
+        form_data.addRow(_button_grid(self.btn_browse, self.btn_load, self.btn_demo))
         form_data.addRow(QtWidgets.QLabel("--- Oscilloscope Input ---"))
         form_data.addRow("Resource", self.combo_scope_resource)
-        form_data.addRow(self.btn_scope_refresh)
         form_data.addRow("Channel", self.combo_scope_channel)
         form_data.addRow("Sample Points", self.spin_scope_points)
         form_data.addRow("Timeout", self.spin_scope_timeout_ms)
-        form_data.addRow(self.btn_scope_acquire)
-        form_data.addRow(self.btn_scope_save)
+        form_data.addRow(_button_grid(self.btn_scope_refresh, self.btn_scope_acquire, self.btn_scope_save))
         form_data.addRow("Time Column", self.combo_time_column)
         form_data.addRow("Amplitude Column", self.combo_amplitude_column)
 
@@ -239,6 +250,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_demod_frequency.setDecimals(6)
         self.spin_demod_frequency.setSingleStep(1.0)
         self.spin_demod_frequency.setSuffix(" Hz")
+
+        self.spin_demod_target_max_amplitude = QtWidgets.QDoubleSpinBox()
+        self.spin_demod_target_max_amplitude.setRange(1e-12, 1e12)
+        self.spin_demod_target_max_amplitude.setDecimals(6)
+        self.spin_demod_target_max_amplitude.setSingleStep(0.1)
+        self.spin_demod_target_max_amplitude.setValue(1.0)
+        self.spin_demod_target_max_amplitude.setToolTip("Target peak amplitude for demodulated magnitude")
+
+        self.btn_demod_scale_toggle = QtWidgets.QPushButton("Scale Output")
+        self.btn_demod_scale_toggle.setCheckable(True)
+        self.btn_demod_scale_toggle.setChecked(True)
+        self.btn_demod_scale_toggle.setToolTip("Toggle between scaled demodulation output and raw output")
 
         self.check_demod_mode_lockin = QtWidgets.QCheckBox("Use Lock-in Mode")
         self.check_demod_mode_lockin.setChecked(False)
@@ -295,11 +318,12 @@ class MainWindow(QtWidgets.QMainWindow):
         form_lockin.addRow(self.check_lockin_skip_transient)
 
         form_demod.addRow("Frequency", self.spin_demod_frequency)
+        form_demod.addRow("Max Amplitude", self.spin_demod_target_max_amplitude)
+        form_demod.addRow("Amplitude Mode", self.btn_demod_scale_toggle)
         form_demod.addRow(self.check_demod_mode_lockin)
-        form_demod.addRow(self.btn_use_fft_frequency)
+        form_demod.addRow(_button_grid(self.btn_use_fft_frequency, self.btn_update_demod))
         form_demod.addRow(self.group_stft_settings)
         form_demod.addRow(self.group_lockin)
-        form_demod.addRow(self.btn_update_demod)
         form_demod.addRow(self.lbl_selected_freq)
 
         self.group_stft_settings.setVisible(True)
@@ -311,7 +335,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_info.setWordWrap(True)
         info_layout.addWidget(self.lbl_info)
 
-        layout.addWidget(group_data)
+        layout.addWidget(self.group_data)
         layout.addWidget(group_range)
         layout.addWidget(self.group_fft)
         layout.addWidget(self.group_demod)
@@ -353,6 +377,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_use_fft_frequency.clicked.connect(self._use_selected_fft_frequency)
         self.btn_update_demod.clicked.connect(self._update_demodulation_plot)
         self.check_demod_mode_lockin.stateChanged.connect(self._on_demod_mode_changed)
+        self.btn_demod_scale_toggle.toggled.connect(self._on_demod_scale_toggled)
+        self.spin_demod_target_max_amplitude.valueChanged.connect(self._on_demod_target_max_changed)
         self.check_lockin_reconstruct_phase.stateChanged.connect(self._on_lockin_reconstruct_mode_changed)
         self.check_lockin_show_phase_separately.stateChanged.connect(self._on_lockin_reconstruct_mode_changed)
 
@@ -376,6 +402,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_sidebar_visibility(self):
         current = self.tabs.currentWidget()
+        self.group_data.setVisible(current == self.time_plot)
         self.group_info.setVisible(current == self.time_plot)
         self.group_fft.setVisible(current == self.freq_plot)
         self.group_demod.setVisible(current == self.demo_plot)
@@ -384,6 +411,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_demod_mode_ui()
         if self.data is not None and self.selected_data is not None and self.selected_data.n_samples > 1:
             self._update_demodulation_plot()
+
+    def _on_demod_target_max_changed(self):
+        if not self.btn_demod_scale_toggle.isChecked():
+            return
+        if self.data is not None and self.selected_data is not None and self.selected_data.n_samples > 1:
+            if not self._render_demodulation_from_cache():
+                self._update_demodulation_plot()
+
+    def _on_demod_scale_toggled(self, checked: bool):
+        self._update_demod_scale_toggle_ui()
+        if self.data is not None and self.selected_data is not None and self.selected_data.n_samples > 1:
+            if not self._render_demodulation_from_cache():
+                self._update_demodulation_plot()
+
+    def _update_demod_scale_toggle_ui(self):
+        scaling_enabled = self.btn_demod_scale_toggle.isChecked()
+        self.btn_demod_scale_toggle.setText("Scale Output" if scaling_enabled else "Raw Output")
+        self.spin_demod_target_max_amplitude.setEnabled(scaling_enabled)
 
     def _update_demod_mode_ui(self):
         is_lock_in = self.check_demod_mode_lockin.isChecked()
@@ -804,11 +849,145 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stft_debug_window = StftDebugWindow(self)
         return self._stft_debug_window
 
+    def _demod_magnitude_axis_label(self, default_label: str) -> str:
+        if not self.btn_demod_scale_toggle.isChecked():
+            return default_label
+        target_max = float(self.spin_demod_target_max_amplitude.value())
+        return "Current (A)" if not np.isclose(target_max, 1.0, rtol=0.0, atol=1e-12) else default_label
+
+    def _scale_to_target_max(self, signal: np.ndarray) -> np.ndarray:
+        if not self.btn_demod_scale_toggle.isChecked():
+            return np.asarray(signal, dtype=float)
+
+        target_max = float(self.spin_demod_target_max_amplitude.value())
+        arr = np.asarray(signal, dtype=float)
+        finite = np.isfinite(arr)
+        if not np.any(finite):
+            return signal
+
+        current_max = float(np.max(np.abs(arr[finite])))
+        if current_max <= 0:
+            return signal
+
+        return arr * (target_max / current_max)
+
+    @staticmethod
+    def _wrap_phase_to_pi(phase_rad: np.ndarray) -> np.ndarray:
+        phase = np.asarray(phase_rad, dtype=float)
+        return (phase + np.pi) % (2.0 * np.pi) - np.pi
+
+    def _render_demodulation_from_cache(self) -> bool:
+        payload = self._demod_cache_payload
+        if not payload:
+            return False
+
+        mode = payload.get("mode")
+        f0 = float(payload.get("f0", 0.0))
+        scale = self._time_unit_scale()
+
+        if mode == "lockin":
+            times = np.asarray(payload.get("times", []), dtype=float)
+            amplitude_raw = np.asarray(payload.get("amplitude", []), dtype=float)
+            phase_rad = self._wrap_phase_to_pi(np.asarray(payload.get("phase_rad", []), dtype=float))
+            reconstructed_raw = np.asarray(payload.get("reconstructed", []), dtype=float)
+            show_reconstructed = bool(payload.get("show_reconstructed", False))
+            show_phase_separately = bool(payload.get("show_phase_separately", False))
+
+            if amplitude_raw.size == 0:
+                return False
+
+            times_scaled = times / scale
+
+            if show_phase_separately:
+                amplitude = self._scale_to_target_max(amplitude_raw)
+                self.demo_plot.set_pen(pg.mkPen("m", width=1.5))
+                self.demo_plot.set_axis_labels(
+                    bottom="Time",
+                    left=self._demod_magnitude_axis_label("Magnitude"),
+                    bottom_units=self._time_unit_label(),
+                )
+                self.demo_plot.set_dual_axis_data(
+                    times_scaled,
+                    amplitude,
+                    phase_rad,
+                    right_label="Phase",
+                    right_units="rad",
+                    right_pen=pg.mkPen("g", width=1.4),
+                    auto_range=True,
+                )
+                self.demo_plot.plot.setTitle(f"Lock-in Magnitude & Phase at {f0:.3f} Hz")
+            elif show_reconstructed:
+                reconstructed = self._scale_to_target_max(reconstructed_raw)
+                self.demo_plot.set_pen(pg.mkPen("m", width=1.5))
+                self.demo_plot.set_axis_labels(
+                    bottom="Time",
+                    left="Reconstructed Signal",
+                    bottom_units=self._time_unit_label(),
+                )
+                self.demo_plot.set_data(times_scaled, reconstructed, auto_range=True)
+                self.demo_plot.plot.setTitle(f"Lock-in Reconstructed Signal at {f0:.3f} Hz")
+            else:
+                amplitude = self._scale_to_target_max(amplitude_raw)
+                self.demo_plot.set_pen(pg.mkPen("m", width=1.5))
+                self.demo_plot.set_axis_labels(
+                    bottom="Time",
+                    left=self._demod_magnitude_axis_label("Amplitude"),
+                    bottom_units=self._time_unit_label(),
+                )
+                self.demo_plot.set_data(times_scaled, amplitude, auto_range=True)
+                self.demo_plot.plot.setTitle(f"Lock-in Demodulated Amplitude at {f0:.3f} Hz")
+
+            if self._stft_debug_window is not None:
+                self._stft_debug_window.clear()
+                self._stft_debug_window.hide()
+            return True
+
+        if mode == "stft":
+            times = np.asarray(payload.get("times", []), dtype=float)
+            amplitude_raw = np.asarray(payload.get("amplitude", []), dtype=float)
+            freqs = np.asarray(payload.get("freqs", []), dtype=float)
+            Z = np.asarray(payload.get("Z", []), dtype=float)
+
+            if amplitude_raw.size == 0:
+                return False
+
+            amplitude = self._scale_to_target_max(amplitude_raw)
+
+            self.demo_plot.set_pen(pg.mkPen("m", width=1.5))
+            self.demo_plot.set_axis_labels(
+                bottom="Time",
+                left=self._demod_magnitude_axis_label("Amplitude"),
+                bottom_units=self._time_unit_label(),
+            )
+            self.demo_plot.set_data(times / scale, amplitude, auto_range=True)
+            self.demo_plot.plot.setTitle(f"Demodulated Amplitude at {f0:.3f} Hz")
+
+            if self.check_show_stft_debug.isChecked():
+                debug_window = self._ensure_stft_debug_window()
+                debug_window.set_stft(
+                    times=times,
+                    freqs=freqs,
+                    Z=Z,
+                    f0=f0,
+                    time_unit=self._time_unit_label(),
+                    time_scale=scale,
+                )
+                debug_window.show()
+                debug_window.raise_()
+                debug_window.activateWindow()
+            elif self._stft_debug_window is not None:
+                self._stft_debug_window.clear()
+                self._stft_debug_window.hide()
+            return True
+
+        return False
+
     def _update_demodulation_plot(self):
         self.demo_plot.clear()
         self._stft_color_bar = None
 
         if self.data is None:
+            self._demod_cache_payload = None
             self.demo_plot.clear()
             if self._stft_debug_window is not None:
                 self._stft_debug_window.clear()
@@ -817,6 +996,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Ensure we use the full, non-downsampled data for the STFT calculation
         self.selected_data = self._selected_data()
         if self.selected_data is None or self.selected_data.n_samples < 2:
+            self._demod_cache_payload = None
             self.demo_plot.clear()
             if self._stft_debug_window is not None:
                 self._stft_debug_window.clear()
@@ -837,7 +1017,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 lowpass_order=int(self.spin_lockin_lowpass_order.value()),
                 use_iq=self.check_lockin_use_iq.isChecked(),
             )
+            phase_rad = self._wrap_phase_to_pi(phase_rad)
             if amplitude.size == 0:
+                self._demod_cache_payload = None
                 if self._stft_debug_window is not None:
                     self._stft_debug_window.clear()
                     self._stft_debug_window.hide()
@@ -856,58 +1038,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 phase_rad = phase_rad[skip_samples:]
                 reconstructed = reconstructed[skip_samples:]
 
-            show_reconstructed = self.check_lockin_reconstruct_phase.isChecked()
-            show_phase_separately = self.check_lockin_show_phase_separately.isChecked()
-            
-            scale = self._time_unit_scale()
-            times_scaled = times / scale
-            
-            # Option 1: Show magnitude and phase separately as two lines
-            if show_phase_separately:
-                # Normalize phase to match magnitude scale for visualization
-                phase_normalized = phase_rad / (2.0 * np.pi)  # Normalize to [-0.5, 0.5] range approximately
-                
-                self.demo_plot.set_pen(pg.mkPen("m", width=1.5))
-                self.demo_plot.set_axis_labels(
-                    bottom="Time",
-                    left="Magnitude & Phase",
-                    bottom_units=self._time_unit_label(),
-                )
-                self.demo_plot.set_multi_data(
-                    times_scaled,
-                    {
-                        "Magnitude": amplitude,
-                        "Phase (rad)": phase_normalized,
-                    },
-                    auto_range=True
-                )
-                self.demo_plot.plot.setTitle(f"Lock-in Magnitude & Phase at {f0:.3f} Hz")
-            
-            # Option 2: Show reconstructed signal
-            elif show_reconstructed:
-                self.demo_plot.set_pen(pg.mkPen("m", width=1.5))
-                self.demo_plot.set_axis_labels(
-                    bottom="Time",
-                    left="Reconstructed Signal",
-                    bottom_units=self._time_unit_label(),
-                )
-                self.demo_plot.set_data(times_scaled, reconstructed, auto_range=True)
-                self.demo_plot.plot.setTitle(f"Lock-in Reconstructed Signal at {f0:.3f} Hz")
-            
-            # Option 3: Show magnitude only (default)
-            else:
-                self.demo_plot.set_pen(pg.mkPen("m", width=1.5))
-                self.demo_plot.set_axis_labels(
-                    bottom="Time",
-                    left="Amplitude",
-                    bottom_units=self._time_unit_label(),
-                )
-                self.demo_plot.set_data(times_scaled, amplitude, auto_range=True)
-                self.demo_plot.plot.setTitle(f"Lock-in Demodulated Amplitude at {f0:.3f} Hz")
-
-            if self._stft_debug_window is not None:
-                self._stft_debug_window.clear()
-                self._stft_debug_window.hide()
+            self._demod_cache_payload = {
+                "mode": "lockin",
+                "f0": f0,
+                "times": times,
+                "amplitude": amplitude,
+                "phase_rad": phase_rad,
+                "reconstructed": reconstructed,
+                "show_reconstructed": self.check_lockin_reconstruct_phase.isChecked(),
+                "show_phase_separately": self.check_lockin_show_phase_separately.isChecked(),
+            }
+            self._render_demodulation_from_cache()
             return
 
         # Apply frequency shift (demodulation) before STFT
@@ -922,6 +1063,7 @@ class MainWindow(QtWidgets.QMainWindow):
             remove_mean=False,
         )
         if Z.size == 0:
+            self._demod_cache_payload = None
             if self._stft_debug_window is not None:
                 self._stft_debug_window.clear()
             return
@@ -929,34 +1071,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # "plots the amplitude" -> amplitude of the DC bin after frequency shift
         # Z is (n_freqs, n_times)
         # freqs[0] should be 0 Hz (DC)
-        amplitude = Z[0, :]
-
-        scale = self._time_unit_scale()
-        self.demo_plot.set_pen(pg.mkPen("m", width=1.5))
-        self.demo_plot.set_axis_labels(
-            bottom="Time",
-            left="Amplitude",
-            bottom_units=self._time_unit_label(),
-        )
-        self.demo_plot.set_data(times / scale, amplitude, auto_range=True)
-        self.demo_plot.plot.setTitle(f"Demodulated Amplitude at {f0:.3f} Hz")
-
-        if self.check_show_stft_debug.isChecked():
-            debug_window = self._ensure_stft_debug_window()
-            debug_window.set_stft(
-                times=times,
-                freqs=freqs,
-                Z=Z,
-                f0=f0,
-                time_unit=self._time_unit_label(),
-                time_scale=scale,
-            )
-            debug_window.show()
-            debug_window.raise_()
-            debug_window.activateWindow()
-        elif self._stft_debug_window is not None:
-            self._stft_debug_window.clear()
-            self._stft_debug_window.hide()
+        self._demod_cache_payload = {
+            "mode": "stft",
+            "f0": f0,
+            "times": times,
+            "amplitude": Z[0, :],
+            "freqs": freqs,
+            "Z": Z,
+        }
+        self._render_demodulation_from_cache()
 
     def export_data(self):
         if self.selected_data is None or self.selected_data.n_samples == 0:
@@ -1036,4 +1159,3 @@ class MainWindow(QtWidgets.QMainWindow):
         super().showEvent(event)
         if self.combo_scope_resource.count() == 0:
             self._refresh_scope_resources()
-
