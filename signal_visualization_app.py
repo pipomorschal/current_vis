@@ -10,7 +10,7 @@ from file_preview_dialog import FilePreviewDialog
 from signal_analysis_utils import Analysis
 from signal_data_class import SignalData
 from signal_data_import import OscilloscopeImporter, ScopeCaptureConfig
-from plot_panel_widget import PlotPanel, PlotDataStore
+from plot_panel_widget import PlotPanel
 
 
 class StftDebugWindow(QtWidgets.QMainWindow):
@@ -185,6 +185,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_browse = QtWidgets.QPushButton("Select File...")
         self.btn_load = QtWidgets.QPushButton("Load Selected File")
         self.btn_demo = QtWidgets.QPushButton("Load Demo Signal")
+        self.btn_save_loaded = QtWidgets.QPushButton("Save Last Loaded Data")
+        self.btn_save_loaded.setEnabled(False)
         self.combo_scope_resource = QtWidgets.QComboBox()
         self.btn_scope_refresh = QtWidgets.QPushButton("Refresh VISA Resources")
         self.combo_scope_channel = QtWidgets.QComboBox()
@@ -202,7 +204,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_time_column = QtWidgets.QComboBox()
         self.combo_amplitude_column = QtWidgets.QComboBox()
         form_data.addRow(self.path_edit)
-        form_data.addRow(_button_grid(self.btn_browse, self.btn_load, self.btn_demo))
+        form_data.addRow(_button_grid(self.btn_browse, self.btn_load, self.btn_demo, self.btn_save_loaded))
         form_data.addRow(QtWidgets.QLabel("--- Oscilloscope Input ---"))
         form_data.addRow("Resource", self.combo_scope_resource)
         form_data.addRow("Channel", self.combo_scope_channel)
@@ -368,6 +370,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_browse.clicked.connect(self.browse_file)
         self.btn_load.clicked.connect(self.load_selected_file)
         self.btn_demo.clicked.connect(self._load_demo_data)
+        self.btn_save_loaded.clicked.connect(self._save_loaded_data)
         self.btn_scope_refresh.clicked.connect(self._refresh_scope_resources)
         self.btn_scope_acquire.clicked.connect(self._acquire_scope_data)
         self.btn_scope_save.clicked.connect(self._save_scope_capture)
@@ -457,7 +460,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self,
             "Select data file",
             "",
-            "Data Files (*.csv *.txt *.npy *.npz);;All Files (*)",
+            "HDF5 Files (*.h5 *.hdf5);;Data Files (*.h5 *.hdf5 *.csv *.txt *.npy *.npz);;All Files (*)",
         )
         if file_path:
             self.path_edit.setText(file_path)
@@ -532,6 +535,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_scope_capture_finished(self, data: SignalData):
         self._last_scope_data = data
         self.btn_scope_save.setEnabled(True)
+        self.btn_save_loaded.setEnabled(True)
 
         self.data = data
         self._sync_column_choices_from_data()
@@ -561,16 +565,50 @@ class MainWindow(QtWidgets.QMainWindow):
             self,
             "Save oscilloscope capture",
             "",
-            "CSV (*.csv)",
+            "HDF5 (*.h5 *.hdf5);;CSV (*.csv)",
         )
         if not file_path:
             return
-        if not file_path.lower().endswith(".csv"):
-            file_path += ".csv"
+
+        ext = Path(file_path).suffix.lower()
+        if not ext:
+            file_path += ".h5"
+            ext = ".h5"
 
         try:
-            DataManager.save_scope_csv(file_path, self._last_scope_data)
+            if ext in {".h5", ".hdf5"}:
+                DataManager.save_scope_hdf5(file_path, self._last_scope_data)
+            else:
+                DataManager.save_scope_csv(file_path, self._last_scope_data)
             self.statusBar().showMessage(f"Oszilloskop-Daten gespeichert: {file_path}", 5000)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Save Error", str(exc))
+
+    def _save_loaded_data(self):
+        if self.data is None or self.data.n_samples == 0:
+            QtWidgets.QMessageBox.information(self, "Data", "Keine geladenen Daten zum Speichern vorhanden.")
+            return
+
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save loaded data",
+            "",
+            "HDF5 (*.h5 *.hdf5);;CSV (*.csv)",
+        )
+        if not file_path:
+            return
+
+        ext = Path(file_path).suffix.lower()
+        if not ext:
+            file_path += ".h5"
+            ext = ".h5"
+
+        try:
+            if ext in {".h5", ".hdf5"}:
+                DataManager.save_hdf5(file_path, self.data)
+            else:
+                DataManager.save_csv(file_path, self.data)
+            self.statusBar().showMessage(f"Geladene Daten gespeichert: {file_path}", 5000)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Save Error", str(exc))
 
@@ -592,9 +630,24 @@ class MainWindow(QtWidgets.QMainWindow):
                     amplitude_column=dialog.selected_amplitude_column,
                 )
                 self._sync_column_choices_from_data()
+                self.btn_save_loaded.setEnabled(True)
+            elif suffix in {".h5", ".hdf5"}:
+                preview = DataManager.preview_hdf5(file_path)
+                dialog = FilePreviewDialog(preview, self)
+                if dialog.exec() != QtWidgets.QDialog.Accepted:
+                    return
+
+                self.data = DataManager.load_file(
+                    file_path,
+                    time_dataset=dialog.selected_time_column,
+                    amplitude_dataset=dialog.selected_amplitude_column,
+                )
+                self._sync_column_choices_from_data()
+                self.btn_save_loaded.setEnabled(True)
             else:
                 self.data = DataManager.load_file(file_path)
                 self._sync_column_choices_from_data()
+                self.btn_save_loaded.setEnabled(True)
 
             self._range_initialized = False
             self.refresh_all_views()
@@ -696,6 +749,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.data = SignalData(t, y, source_name="Demo Signal", sampling_rate=fs)
         self._sync_column_choices_from_data()
+        self.btn_save_loaded.setEnabled(True)
         self._range_initialized = False
         self.refresh_all_views()
         self.tabs.setCurrentWidget(self.time_plot)
@@ -703,6 +757,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def refresh_all_views(self):
         if self.data is None:
+            self.btn_save_loaded.setEnabled(False)
             self.time_plot.clear()
             self.freq_plot.clear()
             self.demo_plot.clear()
@@ -1090,7 +1145,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self,
             "Export processed data",
             "",
-            "CSV (*.csv);;JSON (*.json);;NumPy NPZ (*.npz)",
+            "HDF5 (*.h5 *.hdf5);;CSV (*.csv);;JSON (*.json);;NumPy NPZ (*.npz)",
         )
         if not file_path:
             return
@@ -1098,7 +1153,9 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             ext = Path(file_path).suffix.lower()
             if not ext:
-                if "csv" in selected_filter.lower():
+                if "hdf5" in selected_filter.lower() or "h5" in selected_filter.lower():
+                    file_path += ".h5"
+                elif "csv" in selected_filter.lower():
                     file_path += ".csv"
                 elif "json" in selected_filter.lower():
                     file_path += ".json"
@@ -1106,7 +1163,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     file_path += ".npz"
 
             ext = Path(file_path).suffix.lower()
-            if ext == ".csv":
+            if ext in {".h5", ".hdf5"}:
+                DataManager.save_hdf5(file_path, self.selected_data)
+            elif ext == ".csv":
                 DataManager.save_csv(file_path, self.selected_data)
             elif ext == ".json":
                 DataManager.save_json(file_path, self.selected_data)
