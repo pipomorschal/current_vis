@@ -264,7 +264,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_demod_scale_toggle.setToolTip("Toggle between scaled demodulation output and raw output")
 
         self.check_demod_mode_lockin = QtWidgets.QCheckBox("Use Lock-in Mode")
-        self.check_demod_mode_lockin.setChecked(False)
+        self.check_demod_mode_lockin.setChecked(True)
 
         self.btn_use_fft_frequency = QtWidgets.QPushButton("Use Selected FFT Frequency")
         self.btn_update_demod = QtWidgets.QPushButton("Run Demodulation")

@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover - optional dependency
 class ScopeCaptureConfig:
 	resource_name: str
 	channel: str = "CH1"
-	point_count: int = 100000
+	point_count: int = 10000000
 	timeout_ms: int = 5000
 
 
