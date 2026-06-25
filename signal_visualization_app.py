@@ -161,6 +161,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_controls(self):
         widget = QtWidgets.QWidget()
+        widget.setMinimumWidth(380)
         widget.setMaximumWidth(380)
         layout = QtWidgets.QVBoxLayout(widget)
 
@@ -193,7 +194,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_scope_channel.addItems(["CH1", "CH2", "CH3", "CH4"])
         self.spin_scope_points = QtWidgets.QSpinBox()
         self.spin_scope_points.setRange(100, 10000000)
-        self.spin_scope_points.setValue(100000)
+        self.spin_scope_points.setValue(10000000)
         self.spin_scope_timeout_ms = QtWidgets.QSpinBox()
         self.spin_scope_timeout_ms.setRange(1000, 120000)
         self.spin_scope_timeout_ms.setValue(5000)
@@ -389,7 +390,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_amplitude_column.currentIndexChanged.connect(self.refresh_all_views)
         self.combo_time_unit.currentIndexChanged.connect(self._on_time_unit_changed)
 
-        self.tabs.currentChanged.connect(lambda _: self._update_sidebar_visibility())
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    def _on_tab_changed(self, _: int):
+        if self.isMaximized() or self.isFullScreen():
+            self._update_sidebar_visibility()
+            return
+
+        # Keep the main window geometry stable even if tab contents have different size hints.
+        old_geometry = self.geometry()
+        self._update_sidebar_visibility()
+
+        def _restore_geometry():
+            if not self.isMaximized() and not self.isFullScreen():
+                self.setGeometry(old_geometry)
+
+        QtCore.QTimer.singleShot(0, _restore_geometry)
 
     def _set_scope_controls_enabled(self, enabled: bool):
         controls = [
@@ -943,7 +959,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if mode == "lockin":
             times = np.asarray(payload.get("times", []), dtype=float)
             amplitude_raw = np.asarray(payload.get("amplitude", []), dtype=float)
-            phase_rad = self._wrap_phase_to_pi(np.asarray(payload.get("phase_rad", []), dtype=float))
+            phase_derivative = np.asarray(
+                payload.get("phase_derivative", payload.get("phase_rad", [])),
+                dtype=float,
+            )
             reconstructed_raw = np.asarray(payload.get("reconstructed", []), dtype=float)
             show_reconstructed = bool(payload.get("show_reconstructed", False))
             show_phase_separately = bool(payload.get("show_phase_separately", False))
@@ -964,13 +983,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.demo_plot.set_dual_axis_data(
                     times_scaled,
                     amplitude,
-                    phase_rad,
-                    right_label="Phase",
-                    right_units="rad",
+                    phase_derivative,
+                    right_label="Phase Derivative",
+                    right_units="rad/s",
                     right_pen=pg.mkPen("g", width=1.4),
                     auto_range=True,
                 )
-                self.demo_plot.plot.setTitle(f"Lock-in Magnitude & Phase at {f0:.3f} Hz")
+                self.demo_plot.plot.setTitle(f"Lock-in Magnitude & Phase Derivative at {f0:.3f} Hz")
             elif show_reconstructed:
                 reconstructed = self._scale_to_target_max(reconstructed_raw)
                 self.demo_plot.set_pen(pg.mkPen("m", width=1.5))
@@ -1065,14 +1084,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         is_lock_in = self.check_demod_mode_lockin.isChecked()
         if is_lock_in:
-            times, amplitude, phase_rad, reconstructed = Analysis.lock_in_demod(
+            times, amplitude, phase_derivative, reconstructed = Analysis.lock_in_demod(
                 SignalData(t, y, sampling_rate=self.selected_data.sampling_rate),
                 reference_frequency=f0,
                 lowpass_cutoff_hz=float(self.spin_lockin_lowpass_cutoff.value()),
                 lowpass_order=int(self.spin_lockin_lowpass_order.value()),
                 use_iq=self.check_lockin_use_iq.isChecked(),
             )
-            phase_rad = self._wrap_phase_to_pi(phase_rad)
             if amplitude.size == 0:
                 self._demod_cache_payload = None
                 if self._stft_debug_window is not None:
@@ -1090,7 +1108,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 skip_samples = min(skip_samples, amplitude.size - 1)
                 times = times[skip_samples:]
                 amplitude = amplitude[skip_samples:]
-                phase_rad = phase_rad[skip_samples:]
+                phase_derivative = phase_derivative[skip_samples:]
                 reconstructed = reconstructed[skip_samples:]
 
             self._demod_cache_payload = {
@@ -1098,7 +1116,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "f0": f0,
                 "times": times,
                 "amplitude": amplitude,
-                "phase_rad": phase_rad,
+                "phase_derivative": phase_derivative,
+                "phase_rad": phase_derivative,
                 "reconstructed": reconstructed,
                 "show_reconstructed": self.check_lockin_reconstruct_phase.isChecked(),
                 "show_phase_separately": self.check_lockin_show_phase_separately.isChecked(),

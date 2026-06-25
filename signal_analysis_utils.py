@@ -152,13 +152,17 @@ class Analysis:
             q_f = _apply_lowpass_real(np.imag(baseband))
             baseband_f = i_f + 1j * q_f
             amplitude = np.hypot(i_f, q_f)
-            phase_rad = np.unwrap(np.angle(baseband_f))
         else:
             q_f = np.zeros_like(i_f)
             baseband_f = i_f + 0j
             amplitude = np.abs(i_f)
-            phase_rad = np.where(i_f >= 0.0, 0.0, np.pi)
 
-        reconstructed = amplitude * np.cos(phase_rad)
-        return t, amplitude, phase_rad, reconstructed
+        phase_raw = np.unwrap(np.angle(baseband_f))
+        if t.size > 1:
+            phase_derivative = np.gradient(phase_raw, t)
+        else:
+            phase_derivative = np.zeros_like(phase_raw)
+
+        reconstructed = amplitude * np.cos(phase_raw)
+        return t, amplitude, phase_derivative, reconstructed
 
