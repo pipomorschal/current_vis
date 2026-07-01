@@ -61,45 +61,6 @@ class Analysis:
         return xf, mag
 
     @staticmethod
-    def stft(
-        data: SignalData,
-        window_name: str = "hann",
-        nperseg: int = 256,
-        noverlap: int = 128,
-        nfft: int | None = None,
-        remove_mean: bool = True,
-    ):
-        y = np.asarray(data.amplitude)
-        if y.size < 2:
-            return np.array([]), np.array([]), np.empty((0, 0))
-
-        nperseg = int(max(8, min(nperseg, len(y))))
-        noverlap = int(max(0, min(noverlap, nperseg - 1)))
-        step = nperseg - noverlap
-        nfft = int(max(nperseg, nfft or nperseg))
-
-        window = Analysis.window(window_name, nperseg)
-
-        frames = []
-        times = []
-
-        for start in range(0, len(y) - nperseg + 1, step):
-            segment = y[start:start + nperseg].copy()
-            if remove_mean:
-                segment -= np.mean(segment)
-            segment *= window
-            spec = np.fft.fft(segment, n=nfft)
-            frames.append(np.abs(spec[:nfft // 2 + 1]))
-            times.append(data.time[start + nperseg // 2])
-
-        if not frames:
-            return np.array([]), np.array([]), np.empty((0, 0))
-
-        Z = np.array(frames).T
-        freqs = np.fft.rfftfreq(nfft, d=1.0 / data.sampling_rate if data.sampling_rate > 0 else 1.0)
-        return np.asarray(times, dtype=float), freqs, Z
-
-    @staticmethod
     def lock_in_demod(
         data: SignalData,
         reference_frequency: float,

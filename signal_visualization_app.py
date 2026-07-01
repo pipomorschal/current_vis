@@ -13,58 +13,6 @@ from signal_data_import import OscilloscopeImporter, ScopeCaptureConfig
 from plot_panel_widget import PlotPanel
 
 
-class StftDebugWindow(QtWidgets.QMainWindow):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("STFT Debug View")
-        self.resize(950, 600)
-
-        central = QtWidgets.QWidget(self)
-        self.setCentralWidget(central)
-        layout = QtWidgets.QVBoxLayout(central)
-
-        self.plot = pg.PlotWidget(title="Demodulated Signal STFT (Full)")
-        self.plot.setBackground("w")
-        self.plot.showGrid(x=True, y=True, alpha=0.25)
-        self.plot.setLabel("bottom", "Time", units="s")
-        self.plot.setLabel("left", "Frequency", units="Hz")
-
-        self.image_item = pg.ImageItem()
-        self.image_item.setOpts(axisOrder="row-major")
-        self._stft_lut = pg.colormap.get("inferno").getLookupTable(0.0, 1.0, 256)
-        self.image_item.setLookupTable(self._stft_lut)
-        self.plot.addItem(self.image_item)
-        layout.addWidget(self.plot)
-
-    def clear(self):
-        self.image_item.clear()
-        self.plot.setTitle("Demodulated Signal STFT (Full)")
-
-    def set_stft(self, times: np.ndarray, freqs: np.ndarray, Z: np.ndarray, f0: float, time_unit: str, time_scale: float):
-        if Z.size == 0 or times.size == 0 or freqs.size == 0:
-            self.clear()
-            return
-
-        mag = np.asarray(Z, dtype=float)
-        mag_db = 20.0 * np.log10(np.maximum(mag, 1e-12))
-
-        dt = float(np.median(np.diff(times))) if times.size > 1 else 1.0
-        df = float(np.median(np.diff(freqs))) if freqs.size > 1 else 1.0
-
-        x0 = float(times[0] / time_scale - dt / (2.0 * time_scale))
-        width = float((times[-1] - times[0] + dt) / time_scale)
-        y0 = float(freqs[0] - df / 2.0)
-        height = float((freqs[-1] - freqs[0] + df))
-
-        self.image_item.setImage(mag_db, autoLevels=True)
-        self.image_item.setRect(QtCore.QRectF(x0, y0, width, height))
-
-        self.plot.setLabel("bottom", "Time", units=time_unit)
-        self.plot.setLabel("left", "Frequency", units="Hz")
-        self.plot.setTitle(f"Demodulated Signal STFT (Full) @ {f0:.3f} Hz")
-        self.plot.autoRange()
-
-
 class ScopeAcquireWorker(QtCore.QObject):
     finished = QtCore.Signal(object)
     failed = QtCore.Signal(str)
@@ -83,6 +31,62 @@ class ScopeAcquireWorker(QtCore.QObject):
         self.finished.emit(data)
 
 
+class DemodulationWorker(QtCore.QObject):
+    finished = QtCore.Signal(int, object)
+    failed = QtCore.Signal(int, str)
+
+    def __init__(self, request_id: int, data: SignalData, config: dict):
+        super().__init__()
+        self.request_id = request_id
+        self.data = data
+        self.config = config
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            payload = self._calculate_payload(self.data, self.config)
+        except Exception as exc:
+            self.failed.emit(self.request_id, str(exc))
+            return
+        self.finished.emit(self.request_id, payload)
+
+    @staticmethod
+    def _calculate_payload(data: SignalData, config: dict) -> dict | None:
+        f0 = float(config["reference_frequency"])
+        times, amplitude, phase_derivative, reconstructed = Analysis.lock_in_demod(
+            data,
+            reference_frequency=f0,
+            lowpass_cutoff_hz=float(config["lowpass_cutoff_hz"]),
+            lowpass_order=int(config["lowpass_order"]),
+            use_iq=bool(config["use_iq"]),
+        )
+        if amplitude.size == 0:
+            return None
+
+        if bool(config["skip_transient"]) and amplitude.size > 1:
+            fs = float(data.sampling_rate) if data.sampling_rate > 0 else 1.0
+            cutoff = float(config["lowpass_cutoff_hz"])
+            order = int(config["lowpass_order"])
+            tau = 1.0 / (2.0 * np.pi * max(cutoff, 1e-9))
+            skip_samples = int(np.ceil(5.0 * order * tau * fs))
+            skip_samples = min(skip_samples, amplitude.size - 1)
+            times = times[skip_samples:]
+            amplitude = amplitude[skip_samples:]
+            phase_derivative = phase_derivative[skip_samples:]
+            reconstructed = reconstructed[skip_samples:]
+
+        return {
+            "mode": "lockin",
+            "f0": f0,
+            "times": times,
+            "amplitude": amplitude,
+            "phase_derivative": phase_derivative,
+            "reconstructed": reconstructed,
+            "show_reconstructed": bool(config["show_reconstructed"]),
+            "show_phase_separately": bool(config["show_phase_separately"]),
+        }
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -92,15 +96,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._selected_fft_frequency: float | None = None
         self.data: SignalData | None = None
         self.selected_data: SignalData | None = None
-        self._stft_color_bar = None
         self._current_time_unit_scale = 1.0
         self._range_initialized = False
+        self._fft_click_handler_installed = False
         self._debug_enabled = True
-        self._stft_debug_window: StftDebugWindow | None = None
         self._scope_thread: QtCore.QThread | None = None
         self._scope_worker: ScopeAcquireWorker | None = None
+        self._demod_thread: QtCore.QThread | None = None
+        self._demod_worker: DemodulationWorker | None = None
+        self._demod_request_id = 0
         self._last_scope_data: SignalData | None = None
         self._demod_cache_payload: dict | None = None
+        self.action_auto_demod: QtGui.QAction | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -245,7 +252,7 @@ class MainWindow(QtWidgets.QMainWindow):
         form_fft.addRow(self.check_fft_remove_mean)
         form_fft.addRow(self.btn_update_fft)
 
-        self.group_demod = QtWidgets.QGroupBox("Demodulation / STFT Settings")
+        self.group_demod = QtWidgets.QGroupBox("Lock-in Demodulation Settings")
         form_demod = QtWidgets.QFormLayout(self.group_demod)
 
         self.spin_demod_frequency = QtWidgets.QDoubleSpinBox()
@@ -266,34 +273,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_demod_scale_toggle.setChecked(True)
         self.btn_demod_scale_toggle.setToolTip("Toggle between scaled demodulation output and raw output")
 
-        self.check_demod_mode_lockin = QtWidgets.QCheckBox("Use Lock-in Mode")
-        self.check_demod_mode_lockin.setChecked(True)
-
         self.btn_use_fft_frequency = QtWidgets.QPushButton("Use Selected FFT Frequency")
         self.btn_update_demod = QtWidgets.QPushButton("Run Demodulation")
         self.lbl_selected_freq = QtWidgets.QLabel("No frequency selected")
-
-        self.combo_stft_window = QtWidgets.QComboBox()
-        self.combo_stft_window.addItems(["hann", "hamming", "blackman", "rectangular"])
-        self.spin_nperseg = QtWidgets.QSpinBox()
-        self.spin_nperseg.setRange(8, 10000000)
-        self.spin_nperseg.setValue(256)
-        self.spin_noverlap = QtWidgets.QSpinBox()
-        self.spin_noverlap.setRange(0, 10000000)
-        self.spin_noverlap.setValue(128)
-        self.spin_nfft = QtWidgets.QSpinBox()
-        self.spin_nfft.setRange(8, 10000000)
-        self.spin_nfft.setValue(256)
-
-        self.group_stft_settings = QtWidgets.QGroupBox("STFT Settings")
-        form_stft = QtWidgets.QFormLayout(self.group_stft_settings)
-        form_stft.addRow("Window", self.combo_stft_window)
-        form_stft.addRow("N Per Segment", self.spin_nperseg)
-        form_stft.addRow("N Overlap", self.spin_noverlap)
-        form_stft.addRow("N FFT", self.spin_nfft)
-        self.check_show_stft_debug = QtWidgets.QCheckBox("Show STFT Debug Plot")
-        self.check_show_stft_debug.setChecked(True)
-        form_stft.addRow(self.check_show_stft_debug)
 
         self.group_lockin = QtWidgets.QGroupBox("Lock-in Settings")
         form_lockin = QtWidgets.QFormLayout(self.group_lockin)
@@ -323,14 +305,11 @@ class MainWindow(QtWidgets.QMainWindow):
         form_demod.addRow("Frequency", self.spin_demod_frequency)
         form_demod.addRow("Max Amplitude", self.spin_demod_target_max_amplitude)
         form_demod.addRow("Amplitude Mode", self.btn_demod_scale_toggle)
-        form_demod.addRow(self.check_demod_mode_lockin)
         form_demod.addRow(_button_grid(self.btn_use_fft_frequency, self.btn_update_demod))
-        form_demod.addRow(self.group_stft_settings)
         form_demod.addRow(self.group_lockin)
         form_demod.addRow(self.lbl_selected_freq)
 
-        self.group_stft_settings.setVisible(True)
-        self.group_lockin.setVisible(False)
+        self.group_lockin.setVisible(True)
 
         self.group_info = QtWidgets.QGroupBox("Source / Metadata")
         info_layout = QtWidgets.QVBoxLayout(self.group_info)
@@ -367,6 +346,14 @@ class MainWindow(QtWidgets.QMainWindow):
         action_exit.triggered.connect(self.close)
         file_menu.addAction(action_exit)
 
+        processing_menu = self.menuBar().addMenu("&Processing")
+        self.action_auto_demod = QtGui.QAction("Auto Run Lock-in Demodulation", self)
+        self.action_auto_demod.setCheckable(True)
+        self.action_auto_demod.setChecked(False)
+        self.action_auto_demod.setToolTip("Run lock-in demodulation automatically after data or range changes.")
+        self.action_auto_demod.toggled.connect(self._on_auto_demod_toggled)
+        processing_menu.addAction(self.action_auto_demod)
+
     def _connect_signals(self):
         self.btn_browse.clicked.connect(self.browse_file)
         self.btn_load.clicked.connect(self.load_selected_file)
@@ -380,11 +367,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_update_fft.clicked.connect(self._update_frequency_plot)
         self.btn_use_fft_frequency.clicked.connect(self._use_selected_fft_frequency)
         self.btn_update_demod.clicked.connect(self._update_demodulation_plot)
-        self.check_demod_mode_lockin.stateChanged.connect(self._on_demod_mode_changed)
         self.btn_demod_scale_toggle.toggled.connect(self._on_demod_scale_toggled)
+        self.spin_demod_frequency.valueChanged.connect(self._on_demod_settings_changed)
         self.spin_demod_target_max_amplitude.valueChanged.connect(self._on_demod_target_max_changed)
         self.check_lockin_reconstruct_phase.stateChanged.connect(self._on_lockin_reconstruct_mode_changed)
         self.check_lockin_show_phase_separately.stateChanged.connect(self._on_lockin_reconstruct_mode_changed)
+        self.spin_lockin_lowpass_cutoff.valueChanged.connect(self._on_demod_settings_changed)
+        self.spin_lockin_lowpass_order.valueChanged.connect(self._on_demod_settings_changed)
+        self.check_lockin_use_iq.stateChanged.connect(self._on_demod_settings_changed)
+        self.check_lockin_skip_transient.stateChanged.connect(self._on_demod_settings_changed)
 
         self.combo_time_column.currentIndexChanged.connect(self.refresh_all_views)
         self.combo_amplitude_column.currentIndexChanged.connect(self.refresh_all_views)
@@ -426,10 +417,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.group_fft.setVisible(current == self.freq_plot)
         self.group_demod.setVisible(current == self.demo_plot)
 
-    def _on_demod_mode_changed(self):
-        self._update_demod_mode_ui()
-        if self.data is not None and self.selected_data is not None and self.selected_data.n_samples > 1:
+    def _auto_demod_enabled(self) -> bool:
+        return bool(self.action_auto_demod is not None and self.action_auto_demod.isChecked())
+
+    def _on_auto_demod_toggled(self, checked: bool):
+        if checked and self.data is not None and self.selected_data is not None and self.selected_data.n_samples > 1:
             self._update_demodulation_plot()
+
+    def _on_demod_settings_changed(self):
+        if self.data is None or self.selected_data is None or self.selected_data.n_samples < 2:
+            self._clear_demodulation(invalidate_running=True)
+            return
+        if self._auto_demod_enabled():
+            self._update_demodulation_plot()
+        else:
+            self._clear_demodulation(invalidate_running=True)
 
     def _on_demod_target_max_changed(self):
         if not self.btn_demod_scale_toggle.isChecked():
@@ -450,15 +452,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_demod_target_max_amplitude.setEnabled(scaling_enabled)
 
     def _update_demod_mode_ui(self):
-        is_lock_in = self.check_demod_mode_lockin.isChecked()
-        self.group_stft_settings.setVisible(not is_lock_in)
-        self.group_lockin.setVisible(is_lock_in)
+        self.group_lockin.setVisible(True)
         self._update_lockin_reconstruction_ui()
 
     def _on_lockin_reconstruct_mode_changed(self):
         self._update_lockin_reconstruction_ui()
         if self.data is not None and self.selected_data is not None and self.selected_data.n_samples > 1:
-            self._update_demodulation_plot()
+            if self._auto_demod_enabled():
+                self._update_demodulation_plot()
+            elif self._demod_cache_payload:
+                self._demod_cache_payload["show_reconstructed"] = self.check_lockin_reconstruct_phase.isChecked()
+                self._demod_cache_payload["show_phase_separately"] = self.check_lockin_show_phase_separately.isChecked()
+                self._render_demodulation_from_cache()
 
     def _update_lockin_reconstruction_ui(self):
         needs_iq_reconstruct = self.check_lockin_reconstruct_phase.isChecked()
@@ -776,7 +781,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_save_loaded.setEnabled(False)
             self.time_plot.clear()
             self.freq_plot.clear()
-            self.demo_plot.clear()
+            self._clear_demodulation(invalidate_running=True)
             return
 
         scale = self._time_unit_scale()
@@ -809,13 +814,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.selected_data is None:
             self.time_plot.clear()
             self.freq_plot.clear()
-            self.demo_plot.clear()
+            self._clear_demodulation(invalidate_running=True)
             return
 
         self._update_time_plot()
         self._update_frequency_plot()
         self._install_fft_click_handler()
-        self._update_demodulation_plot()
+        if self._auto_demod_enabled():
+            self._update_demodulation_plot()
+        else:
+            self._clear_demodulation(invalidate_running=True)
         self.statusBar().showMessage("Views updated", 2500)
 
     def _update_time_plot(self):
@@ -874,8 +882,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._debug("FFT plot updated successfully")
 
     def _install_fft_click_handler(self):
-        # Call this once after the plots are created
+        if self._fft_click_handler_installed:
+            return
         self.freq_plot.plot.scene().sigMouseClicked.connect(self._on_fft_plot_clicked)
+        self._fft_click_handler_installed = True
 
     def _on_fft_plot_clicked(self, event):
         if self.tabs.currentWidget() != self.freq_plot:
@@ -914,11 +924,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_demod_frequency.setValue(self._selected_fft_frequency)
         self.lbl_selected_freq.setText(f"Selected FFT frequency: {self._selected_fft_frequency:.6f} Hz")
         self.tabs.setCurrentWidget(self.demo_plot)
-
-    def _ensure_stft_debug_window(self) -> StftDebugWindow:
-        if self._stft_debug_window is None:
-            self._stft_debug_window = StftDebugWindow(self)
-        return self._stft_debug_window
 
     def _demod_magnitude_axis_label(self, default_label: str) -> str:
         if not self.btn_demod_scale_toggle.isChecked():
@@ -1011,149 +1016,116 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.demo_plot.set_data(times_scaled, amplitude, auto_range=True)
                 self.demo_plot.plot.setTitle(f"Lock-in Demodulated Amplitude at {f0:.3f} Hz")
 
-            if self._stft_debug_window is not None:
-                self._stft_debug_window.clear()
-                self._stft_debug_window.hide()
-            return True
-
-        if mode == "stft":
-            times = np.asarray(payload.get("times", []), dtype=float)
-            amplitude_raw = np.asarray(payload.get("amplitude", []), dtype=float)
-            freqs = np.asarray(payload.get("freqs", []), dtype=float)
-            Z = np.asarray(payload.get("Z", []), dtype=float)
-
-            if amplitude_raw.size == 0:
-                return False
-
-            amplitude = self._scale_to_target_max(amplitude_raw)
-
-            self.demo_plot.set_pen(pg.mkPen("m", width=1.5))
-            self.demo_plot.set_axis_labels(
-                bottom="Time",
-                left=self._demod_magnitude_axis_label("Amplitude"),
-                bottom_units=self._time_unit_label(),
-            )
-            self.demo_plot.set_data(times / scale, amplitude, auto_range=True)
-            self.demo_plot.plot.setTitle(f"Demodulated Amplitude at {f0:.3f} Hz")
-
-            if self.check_show_stft_debug.isChecked():
-                debug_window = self._ensure_stft_debug_window()
-                debug_window.set_stft(
-                    times=times,
-                    freqs=freqs,
-                    Z=Z,
-                    f0=f0,
-                    time_unit=self._time_unit_label(),
-                    time_scale=scale,
-                )
-                debug_window.show()
-                debug_window.raise_()
-                debug_window.activateWindow()
-            elif self._stft_debug_window is not None:
-                self._stft_debug_window.clear()
-                self._stft_debug_window.hide()
             return True
 
         return False
 
-    def _update_demodulation_plot(self):
+    def _clear_demodulation(self, invalidate_running: bool = False):
+        if invalidate_running:
+            self._demod_request_id += 1
+        self._demod_cache_payload = None
         self.demo_plot.clear()
-        self._stft_color_bar = None
+        self.demo_plot.plot.setTitle("Demodulation")
 
+    def _demodulation_config(self) -> dict:
+        return {
+            "reference_frequency": float(self.spin_demod_frequency.value()),
+            "lowpass_cutoff_hz": float(self.spin_lockin_lowpass_cutoff.value()),
+            "lowpass_order": int(self.spin_lockin_lowpass_order.value()),
+            "use_iq": self.check_lockin_use_iq.isChecked(),
+            "skip_transient": self.check_lockin_skip_transient.isChecked(),
+            "show_reconstructed": self.check_lockin_reconstruct_phase.isChecked(),
+            "show_phase_separately": self.check_lockin_show_phase_separately.isChecked(),
+        }
+
+    def _set_demod_controls_enabled(self, enabled: bool):
+        controls = [
+            self.spin_demod_frequency,
+            self.btn_demod_scale_toggle,
+            self.spin_demod_target_max_amplitude,
+            self.btn_use_fft_frequency,
+            self.btn_update_demod,
+            self.spin_lockin_lowpass_cutoff,
+            self.spin_lockin_lowpass_order,
+            self.check_lockin_use_iq,
+            self.check_lockin_reconstruct_phase,
+            self.check_lockin_show_phase_separately,
+            self.check_lockin_skip_transient,
+        ]
+        for control in controls:
+            control.setEnabled(enabled)
+        if enabled:
+            self._update_demod_scale_toggle_ui()
+            self._update_lockin_reconstruction_ui()
+
+    def _update_demodulation_plot(self):
         if self.data is None:
-            self._demod_cache_payload = None
-            self.demo_plot.clear()
-            if self._stft_debug_window is not None:
-                self._stft_debug_window.clear()
+            self._clear_demodulation(invalidate_running=True)
             return
 
-        # Ensure we use the full, non-downsampled data for the STFT calculation
+        if self._demod_thread is not None:
+            self._demod_request_id += 1
+            self.statusBar().showMessage("Lock-in demodulation is already running.", 2500)
+            return
+
         self.selected_data = self._selected_data()
         if self.selected_data is None or self.selected_data.n_samples < 2:
-            self._demod_cache_payload = None
-            self.demo_plot.clear()
-            if self._stft_debug_window is not None:
-                self._stft_debug_window.clear()
+            self._clear_demodulation(invalidate_running=True)
             return
 
-        self._debug(f"Demodulation calculation on {self.selected_data.n_samples} full-resolution samples.")
+        self._clear_demodulation()
+        self._debug(f"Lock-in demodulation calculation on {self.selected_data.n_samples} full-resolution samples.")
 
-        f0 = float(self.spin_demod_frequency.value())
-        t = self.selected_data.time
-        y = self.selected_data.amplitude
-
-        is_lock_in = self.check_demod_mode_lockin.isChecked()
-        if is_lock_in:
-            times, amplitude, phase_derivative, reconstructed = Analysis.lock_in_demod(
-                SignalData(t, y, sampling_rate=self.selected_data.sampling_rate),
-                reference_frequency=f0,
-                lowpass_cutoff_hz=float(self.spin_lockin_lowpass_cutoff.value()),
-                lowpass_order=int(self.spin_lockin_lowpass_order.value()),
-                use_iq=self.check_lockin_use_iq.isChecked(),
-            )
-            if amplitude.size == 0:
-                self._demod_cache_payload = None
-                if self._stft_debug_window is not None:
-                    self._stft_debug_window.clear()
-                    self._stft_debug_window.hide()
-                return
-
-            # Skip transient if requested
-            if self.check_lockin_skip_transient.isChecked() and amplitude.size > 1:
-                fs = float(self.selected_data.sampling_rate) if self.selected_data.sampling_rate > 0 else 1.0
-                cutoff = float(self.spin_lockin_lowpass_cutoff.value())
-                order = int(self.spin_lockin_lowpass_order.value())
-                tau = 1.0 / (2.0 * np.pi * max(cutoff, 1e-9))
-                skip_samples = int(np.ceil(5.0 * order * tau * fs))
-                skip_samples = min(skip_samples, amplitude.size - 1)
-                times = times[skip_samples:]
-                amplitude = amplitude[skip_samples:]
-                phase_derivative = phase_derivative[skip_samples:]
-                reconstructed = reconstructed[skip_samples:]
-
-            self._demod_cache_payload = {
-                "mode": "lockin",
-                "f0": f0,
-                "times": times,
-                "amplitude": amplitude,
-                "phase_derivative": phase_derivative,
-                "phase_rad": phase_derivative,
-                "reconstructed": reconstructed,
-                "show_reconstructed": self.check_lockin_reconstruct_phase.isChecked(),
-                "show_phase_separately": self.check_lockin_show_phase_separately.isChecked(),
-            }
-            self._render_demodulation_from_cache()
-            return
-
-        # Apply frequency shift (demodulation) before STFT
-        analytic = y * np.exp(-2j * np.pi * f0 * t)
-
-        times, freqs, Z = Analysis.stft(
-            SignalData(t, analytic, sampling_rate=self.selected_data.sampling_rate),
-            window_name=self.combo_stft_window.currentText(),
-            nperseg=self.spin_nperseg.value(),
-            noverlap=self.spin_noverlap.value(),
-            nfft=self.spin_nfft.value(),
-            remove_mean=False,
+        worker_data = SignalData(
+            self.selected_data.time.copy(),
+            self.selected_data.amplitude.copy(),
+            sampling_rate=self.selected_data.sampling_rate,
         )
-        if Z.size == 0:
-            self._demod_cache_payload = None
-            if self._stft_debug_window is not None:
-                self._stft_debug_window.clear()
-            return
+        self._demod_request_id += 1
+        request_id = self._demod_request_id
+        self._demod_worker = DemodulationWorker(request_id, worker_data, self._demodulation_config())
+        self._demod_thread = QtCore.QThread(self)
+        self._demod_worker.moveToThread(self._demod_thread)
 
-        # "plots the amplitude" -> amplitude of the DC bin after frequency shift
-        # Z is (n_freqs, n_times)
-        # freqs[0] should be 0 Hz (DC)
-        self._demod_cache_payload = {
-            "mode": "stft",
-            "f0": f0,
-            "times": times,
-            "amplitude": Z[0, :],
-            "freqs": freqs,
-            "Z": Z,
-        }
+        self._demod_thread.started.connect(self._demod_worker.run)
+        self._demod_worker.finished.connect(self._on_demodulation_finished)
+        self._demod_worker.failed.connect(self._on_demodulation_failed)
+        self._demod_worker.finished.connect(self._demod_thread.quit)
+        self._demod_worker.failed.connect(self._demod_thread.quit)
+        self._demod_worker.finished.connect(self._demod_worker.deleteLater)
+        self._demod_worker.failed.connect(self._demod_worker.deleteLater)
+        self._demod_thread.finished.connect(self._demod_thread.deleteLater)
+        self._demod_thread.finished.connect(self._on_demod_thread_finished)
+
+        self._set_demod_controls_enabled(False)
+        self.statusBar().showMessage("Lock-in demodulation running...", 3000)
+        self._demod_thread.start()
+
+    @QtCore.Slot(int, object)
+    def _on_demodulation_finished(self, request_id: int, payload: dict | None):
+        if request_id != self._demod_request_id:
+            return
+        if not payload:
+            self._clear_demodulation()
+            self.statusBar().showMessage("Lock-in demodulation returned no data.", 3000)
+            return
+        self._demod_cache_payload = payload
         self._render_demodulation_from_cache()
+        self.statusBar().showMessage("Lock-in demodulation finished.", 3000)
+
+    @QtCore.Slot(int, str)
+    def _on_demodulation_failed(self, request_id: int, message: str):
+        if request_id != self._demod_request_id:
+            return
+        self._clear_demodulation()
+        QtWidgets.QMessageBox.critical(self, "Demodulation Error", message)
+        self.statusBar().showMessage("Lock-in demodulation failed.", 5000)
+
+    @QtCore.Slot()
+    def _on_demod_thread_finished(self):
+        self._demod_thread = None
+        self._demod_worker = None
+        self._set_demod_controls_enabled(True)
 
     def export_data(self):
         if self.selected_data is None or self.selected_data.n_samples == 0:

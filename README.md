@@ -1,6 +1,6 @@
 # current_vis
 
-GUI fuer Signal-Visualisierung und Demodulation (FFT, STFT, Lock-in) mit optionalem Oszilloskop-Import via VISA.
+GUI fuer Signal-Visualisierung und Lock-in-Demodulation mit optionalem Oszilloskop-Import via VISA.
 
 Standardformat fuer Laden und Speichern ist jetzt HDF5 (`.h5` / `.hdf5`). CSV/TXT kann weiterhin geladen werden, ist aber nur noch ein Legacy-Importpfad.
 
