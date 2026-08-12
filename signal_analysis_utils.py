@@ -21,6 +21,8 @@ class Analysis:
                 amplitude=np.array([], dtype=float),
                 source_name=data.source_name,
                 sampling_rate=data.sampling_rate,
+                metadata=data.metadata.copy(),
+                column_names=data.column_names,
             )
 
         return SignalData(
@@ -28,7 +30,67 @@ class Analysis:
             amplitude=data.amplitude[mask],
             source_name=data.source_name,
             sampling_rate=data.sampling_rate,
+            metadata=data.metadata.copy(),
+            column_names=data.column_names,
         )
+
+    @staticmethod
+    def lowpass_filter(data: SignalData, cutoff_hz: float, order: int = 2) -> np.ndarray:
+        """Return a zero-phase low-pass-filtered copy of the signal amplitude.
+
+        A non-positive cutoff disables the filter. Frequencies at or above
+        Nyquist are also returned unchanged because there is no representable
+        frequency content above that limit to remove.
+        """
+        values = np.asarray(data.amplitude, dtype=float)
+        if values.size < 2:
+            return values.copy()
+
+        fs = float(data.sampling_rate)
+        cutoff = float(cutoff_hz)
+        if not np.isfinite(fs) or fs <= 0 or not np.isfinite(cutoff) or cutoff <= 0:
+            return values.copy()
+
+        nyquist = 0.5 * fs
+        if cutoff >= nyquist:
+            return values.copy()
+
+        stages = int(max(1, order))
+        alpha = 1.0 - np.exp(-2.0 * np.pi * cutoff / fs)
+
+        def _one_pole(samples: np.ndarray) -> np.ndarray:
+            filtered = np.empty_like(samples)
+            filtered[0] = samples[0]
+            for idx in range(1, samples.size):
+                filtered[idx] = filtered[idx - 1] + alpha * (samples[idx] - filtered[idx - 1])
+            return filtered
+
+        def _filter_finite_segment(samples: np.ndarray) -> np.ndarray:
+            filtered = samples.copy()
+            for _ in range(stages):
+                filtered = _one_pole(filtered)
+            filtered = filtered[::-1].copy()
+            for _ in range(stages):
+                filtered = _one_pole(filtered)
+            return filtered[::-1]
+
+        if np.all(np.isfinite(values)):
+            return _filter_finite_segment(values)
+
+        # Keep gaps as gaps and filter each finite run independently so one NaN
+        # does not contaminate the remainder of a long acquisition.
+        result = values.copy()
+        start = 0
+        while start < values.size:
+            while start < values.size and not np.isfinite(values[start]):
+                start += 1
+            end = start
+            while end < values.size and np.isfinite(values[end]):
+                end += 1
+            if end > start:
+                result[start:end] = _filter_finite_segment(values[start:end])
+            start = end
+        return result
 
     @staticmethod
     def window(name: str, n: int) -> np.ndarray:

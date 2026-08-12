@@ -2,4 +2,5 @@ numpy
 pyqtgraph
 PySide6
 pyvisa
+pyvisa-py
 h5py

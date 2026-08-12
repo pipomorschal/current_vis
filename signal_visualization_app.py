@@ -11,6 +11,7 @@ from signal_analysis_utils import Analysis
 from signal_data_class import SignalData
 from signal_data_import import OscilloscopeImporter, ScopeCaptureConfig
 from plot_panel_widget import PlotPanel
+from frequency_sweep_widget import FrequencySweepWidget
 
 
 class ScopeAcquireWorker(QtCore.QObject):
@@ -90,7 +91,7 @@ class DemodulationWorker(QtCore.QObject):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Reusable Signal Visualization App")
+        self.setWindowTitle("Signal Visualization App")
         self.resize(1500, 900)
 
         self._selected_fft_frequency: float | None = None
@@ -108,6 +109,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_scope_data: SignalData | None = None
         self._demod_cache_payload: dict | None = None
         self.action_auto_demod: QtGui.QAction | None = None
+        self._scope_controls_before_sweep: list[bool] | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -127,18 +129,29 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout = QtWidgets.QHBoxLayout(central)
 
         self.controls = self._build_controls()
-        main_layout.addWidget(self.controls, 0)
-
         self.tabs = QtWidgets.QTabWidget()
-        main_layout.addWidget(self.tabs, 1)
 
         self.time_plot = PlotPanel("Time Domain")
         self.freq_plot = PlotPanel("Frequency Domain")
         self.demo_plot = PlotPanel("Demodulation")
+        self.sweep_widget = FrequencySweepWidget()
+
+        self.sidebar_stack = QtWidgets.QStackedWidget()
+        self.sidebar_stack.addWidget(self.controls)
+        self.sidebar_stack.addWidget(self.sweep_widget.control_panel)
+        self.sidebar_stack.setMinimumWidth(400)
+        self.sidebar_stack.setMaximumWidth(400)
+        self.sidebar_stack.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        main_layout.addWidget(self.sidebar_stack, 0)
+        main_layout.addWidget(self.tabs, 1)
 
         self.tabs.addTab(self.time_plot, "Time")
         self.tabs.addTab(self.freq_plot, "Frequency")
         self.tabs.addTab(self.demo_plot, "Demodulation")
+        self.tabs.addTab(self.sweep_widget, "Frequency Sweep")
 
         self.statusBar().showMessage("Ready")
         self._build_menu()
@@ -167,10 +180,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """)
 
     def _build_controls(self):
-        widget = QtWidgets.QWidget()
-        widget.setMinimumWidth(380)
-        widget.setMaximumWidth(380)
-        layout = QtWidgets.QVBoxLayout(widget)
+        content = QtWidgets.QWidget()
+        content.setMinimumWidth(360)
+        layout = QtWidgets.QVBoxLayout(content)
 
         def _button_grid(*buttons: QtWidgets.QPushButton) -> QtWidgets.QWidget:
             # Compact 2-column button container to reduce vertical space.
@@ -241,6 +253,20 @@ class MainWindow(QtWidgets.QMainWindow):
         form_range.addRow("Unit", self.combo_time_unit)
         form_range.addRow(self.btn_apply_range)
 
+        self.group_time = QtWidgets.QGroupBox("Time Domain Settings")
+        form_time = QtWidgets.QFormLayout(self.group_time)
+        self.spin_time_lowpass_cutoff = QtWidgets.QDoubleSpinBox()
+        self.spin_time_lowpass_cutoff.setRange(0.0, 1e12)
+        self.spin_time_lowpass_cutoff.setDecimals(6)
+        self.spin_time_lowpass_cutoff.setSingleStep(1.0)
+        self.spin_time_lowpass_cutoff.setSuffix(" Hz")
+        self.spin_time_lowpass_cutoff.setSpecialValueText("Off (0 Hz)")
+        self.spin_time_lowpass_cutoff.setValue(0.0)
+        self.spin_time_lowpass_cutoff.setToolTip(
+            "Zero disables the time-domain display filter. FFT and demodulation continue to use raw data."
+        )
+        form_time.addRow("Low-pass Cutoff", self.spin_time_lowpass_cutoff)
+
         self.group_fft = QtWidgets.QGroupBox("FFT Settings")
         form_fft = QtWidgets.QFormLayout(self.group_fft)
         self.combo_fft_window = QtWidgets.QComboBox()
@@ -261,6 +287,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_demod_frequency.setSingleStep(1.0)
         self.spin_demod_frequency.setSuffix(" Hz")
 
+        self.combo_demod_voltage_unit = QtWidgets.QComboBox()
+        self.combo_demod_voltage_unit.addItems(["V", "mV"])
+        self.combo_demod_voltage_unit.setCurrentText("V")
+        self.combo_demod_voltage_unit.setToolTip(
+            "Unit already used by the input amplitude samples. Raw lock-in output preserves this unit."
+        )
+
         self.spin_demod_target_max_amplitude = QtWidgets.QDoubleSpinBox()
         self.spin_demod_target_max_amplitude.setRange(1e-12, 1e12)
         self.spin_demod_target_max_amplitude.setDecimals(6)
@@ -268,9 +301,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_demod_target_max_amplitude.setValue(1.0)
         self.spin_demod_target_max_amplitude.setToolTip("Target peak amplitude for demodulated magnitude")
 
-        self.btn_demod_scale_toggle = QtWidgets.QPushButton("Scale Output")
+        self.btn_demod_scale_toggle = QtWidgets.QPushButton("Raw Output")
         self.btn_demod_scale_toggle.setCheckable(True)
-        self.btn_demod_scale_toggle.setChecked(True)
+        self.btn_demod_scale_toggle.setChecked(False)
         self.btn_demod_scale_toggle.setToolTip("Toggle between scaled demodulation output and raw output")
 
         self.btn_use_fft_frequency = QtWidgets.QPushButton("Use Selected FFT Frequency")
@@ -303,6 +336,7 @@ class MainWindow(QtWidgets.QMainWindow):
         form_lockin.addRow(self.check_lockin_skip_transient)
 
         form_demod.addRow("Frequency", self.spin_demod_frequency)
+        form_demod.addRow("Raw Data Unit", self.combo_demod_voltage_unit)
         form_demod.addRow("Max Amplitude", self.spin_demod_target_max_amplitude)
         form_demod.addRow("Amplitude Mode", self.btn_demod_scale_toggle)
         form_demod.addRow(_button_grid(self.btn_use_fft_frequency, self.btn_update_demod))
@@ -319,11 +353,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
         layout.addWidget(self.group_data)
         layout.addWidget(group_range)
+        layout.addWidget(self.group_time)
         layout.addWidget(self.group_fft)
         layout.addWidget(self.group_demod)
         layout.addWidget(self.group_info)
         layout.addStretch(1)
-        return widget
+
+        # A scrollable sidebar keeps changing tab contents from increasing the
+        # main-window minimum height and clipping plots in maximized/fullscreen mode.
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(content)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setMinimumWidth(400)
+        scroll.setMaximumWidth(400)
+        scroll.setMinimumHeight(0)
+        scroll.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Expanding)
+        return scroll
 
     def _build_menu(self):
         file_menu = self.menuBar().addMenu("&File")
@@ -363,11 +411,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_scope_acquire.clicked.connect(self._acquire_scope_data)
         self.btn_scope_save.clicked.connect(self._save_scope_capture)
         self.btn_apply_range.clicked.connect(self.refresh_all_views)
+        self.spin_time_lowpass_cutoff.valueChanged.connect(self._on_time_lowpass_changed)
 
         self.btn_update_fft.clicked.connect(self._update_frequency_plot)
         self.btn_use_fft_frequency.clicked.connect(self._use_selected_fft_frequency)
         self.btn_update_demod.clicked.connect(self._update_demodulation_plot)
         self.btn_demod_scale_toggle.toggled.connect(self._on_demod_scale_toggled)
+        self.combo_demod_voltage_unit.currentIndexChanged.connect(self._on_demod_voltage_unit_changed)
         self.spin_demod_frequency.valueChanged.connect(self._on_demod_settings_changed)
         self.spin_demod_target_max_amplitude.valueChanged.connect(self._on_demod_target_max_changed)
         self.check_lockin_reconstruct_phase.stateChanged.connect(self._on_lockin_reconstruct_mode_changed)
@@ -380,6 +430,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_time_column.currentIndexChanged.connect(self.refresh_all_views)
         self.combo_amplitude_column.currentIndexChanged.connect(self.refresh_all_views)
         self.combo_time_unit.currentIndexChanged.connect(self._on_time_unit_changed)
+
+        self.sweep_widget.frequency_selected.connect(self._on_sweep_frequency_selected)
+        self.sweep_widget.status_message.connect(self.statusBar().showMessage)
+        self.sweep_widget.hardware_busy_changed.connect(self._on_sweep_hardware_busy_changed)
+        self.combo_scope_resource.textActivated.connect(self.sweep_widget.set_scope_resource)
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -399,7 +454,11 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, _restore_geometry)
 
     def _set_scope_controls_enabled(self, enabled: bool):
-        controls = [
+        for control in self._scope_controls():
+            control.setEnabled(enabled)
+
+    def _scope_controls(self) -> list[QtWidgets.QWidget]:
+        return [
             self.combo_scope_resource,
             self.btn_scope_refresh,
             self.combo_scope_channel,
@@ -407,15 +466,50 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_scope_timeout_ms,
             self.btn_scope_acquire,
         ]
-        for control in controls:
-            control.setEnabled(enabled)
+
+    @QtCore.Slot(bool)
+    def _on_sweep_hardware_busy_changed(self, busy: bool):
+        controls = self._scope_controls()
+        if busy:
+            self._scope_controls_before_sweep = [control.isEnabled() for control in controls]
+            for control in controls:
+                control.setEnabled(False)
+            return
+
+        previous = self._scope_controls_before_sweep
+        self._scope_controls_before_sweep = None
+        if previous is not None:
+            for control, enabled in zip(controls, previous):
+                control.setEnabled(enabled)
 
     def _update_sidebar_visibility(self):
         current = self.tabs.currentWidget()
+        self.sidebar_stack.setCurrentWidget(
+            self.sweep_widget.control_panel if current == self.sweep_widget else self.controls
+        )
         self.group_data.setVisible(current == self.time_plot)
         self.group_info.setVisible(current == self.time_plot)
+        self.group_time.setVisible(current == self.time_plot)
         self.group_fft.setVisible(current == self.freq_plot)
         self.group_demod.setVisible(current == self.demo_plot)
+
+    @QtCore.Slot(float)
+    def _on_sweep_frequency_selected(self, frequency_hz: float):
+        self._selected_fft_frequency = frequency_hz
+        self.spin_demod_frequency.setValue(frequency_hz)
+        self.lbl_selected_freq.setText(f"Selected sweep frequency: {frequency_hz:.6f} Hz")
+        self.tabs.setCurrentWidget(self.demo_plot)
+        self.statusBar().showMessage(
+            f"Sweep peak {frequency_hz:.6f} Hz selected for lock-in demodulation",
+            5000,
+        )
+
+    def _on_time_lowpass_changed(self, _value: float):
+        self._update_time_plot()
+
+    def _on_demod_voltage_unit_changed(self, _index: int):
+        if self._demod_cache_payload:
+            self._render_demodulation_from_cache()
 
     def _auto_demod_enabled(self) -> bool:
         return bool(self.action_auto_demod is not None and self.action_auto_demod.isChecked())
@@ -549,6 +643,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scope_thread.finished.connect(self._on_scope_thread_finished)
 
         self._set_scope_controls_enabled(False)
+        self.sweep_widget.set_external_hardware_busy(True)
         self.statusBar().showMessage("Oszilloskop-Akquise gestartet...", 3000)
         self._scope_thread.start()
 
@@ -576,6 +671,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scope_thread = None
         self._scope_worker = None
         self._set_scope_controls_enabled(True)
+        self.sweep_widget.set_external_hardware_busy(False)
 
     def _save_scope_capture(self):
         if self._last_scope_data is None or self._last_scope_data.n_samples == 0:
@@ -768,7 +864,14 @@ class MainWindow(QtWidgets.QMainWindow):
             + 0.2 * np.sin(2 * np.pi * 180 * t)
             + 0.05 * np.random.default_rng(42).normal(size=len(t))
         )
-        self.data = SignalData(t, y, source_name="Demo Signal", sampling_rate=fs)
+        self.data = SignalData(
+            t,
+            y,
+            source_name="Demo Signal",
+            sampling_rate=fs,
+            metadata={"amplitude_unit": "V"},
+            column_names=("TIME", "Voltage"),
+        )
         self._sync_column_choices_from_data()
         self.btn_save_loaded.setEnabled(True)
         self._range_initialized = False
@@ -828,12 +931,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_time_plot(self):
         if self.selected_data is None or self.selected_data.n_samples == 0:
-            self.time_plot.plot.clear()
+            self.time_plot.clear()
             return
 
         scale = self._time_unit_scale()
         x = self.selected_data.time / scale
-        y = self.selected_data.amplitude
+        cutoff_hz = float(self.spin_time_lowpass_cutoff.value())
+        y = Analysis.lowpass_filter(self.selected_data, cutoff_hz=cutoff_hz)
 
         self.time_plot.set_pen(pg.mkPen("b", width=1.2))
         self.time_plot.set_axis_labels(
@@ -844,6 +948,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Adaptive plot: initial draw uses full data, zoom redraws use visible range
         self.time_plot.set_data(x, y, auto_range=True)
+        if cutoff_hz > 0:
+            self.time_plot.plot.setTitle(f"Time Domain (Low-pass: {cutoff_hz:g} Hz)")
+        else:
+            self.time_plot.plot.setTitle("Time Domain")
 
     def _update_frequency_plot(self):
         self._debug("FFT update requested")
@@ -1128,6 +1236,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_demod_controls_enabled(True)
 
     def export_data(self):
+        if self.tabs.currentWidget() == self.sweep_widget:
+            self.sweep_widget.export_csv()
+            return
+
         if self.selected_data is None or self.selected_data.n_samples == 0:
             QtWidgets.QMessageBox.information(self, "Export", "No selected data to export.")
             return
@@ -1171,6 +1283,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def export_graph(self):
         current = self.tabs.currentWidget()
+        if current == self.sweep_widget:
+            self.sweep_widget.export_graph()
+            return
+
         if not isinstance(current, PlotPanel):
             return
 
@@ -1209,3 +1325,14 @@ class MainWindow(QtWidgets.QMainWindow):
         super().showEvent(event)
         if self.combo_scope_resource.count() == 0:
             self._refresh_scope_resources()
+
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        if not self.sweep_widget.shutdown():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Frequency Sweep",
+                "The active sweep is stopping. Close the application again after it has finished.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)

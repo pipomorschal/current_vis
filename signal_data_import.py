@@ -94,6 +94,7 @@ class OscilloscopeImporter:
 
 			metadata = {
 				"source": "oscilloscope",
+				"amplitude_unit": "V",
 				"resource": config.resource_name,
 				"channel": channel,
 				"point_count": str(points),
