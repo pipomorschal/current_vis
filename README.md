@@ -43,7 +43,10 @@ Der Tab `Frequency Sweep` integriert den Workflow aus
    auswaehlen. Die Oszilloskop-Auswahl des normalen Datenimports wird mit dem
    Sweep-Tab synchronisiert.
 2. `Frequency Sweep` auswaehlen und Start, Stop, Schrittweite, Scope-Fenster,
-   RBW, Mittelungen und Messungen pro Schritt einstellen.
+   RBW, Mittelungen und Messungen pro Schritt einstellen. Mit
+   `Evaluation Freq. Offset` kann die Messfrequenz gegenueber der jeweiligen
+   AWG-Frequenz verschoben werden: `Messfrequenz = AWG-Frequenz + Offset`.
+   Der Standardwert ist `0 Hz`.
 3. `Start Scan` klicken. Fuer jeden AWG-Frequenzschritt wird das RF-Fenster des
    MDO3024 gesetzt, die Amplitude aus `CURVE?` gelesen und live geplottet.
 4. Der beste Messpunkt wird unter dem Plot angezeigt. Mit
