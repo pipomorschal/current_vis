@@ -575,7 +575,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self,
             "Select data file",
             "",
-            "HDF5 Files (*.h5 *.hdf5);;Data Files (*.h5 *.hdf5 *.csv *.txt *.npy *.npz);;All Files (*)",
+            "HDF5 Files (*.h5 *.hdf5);;Tektronix Waveform (*.wfm);;Data Files (*.h5 *.hdf5 *.wfm *.csv *.txt *.npy *.npz);;All Files (*)",
         )
         if file_path:
             self.path_edit.setText(file_path)

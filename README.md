@@ -3,7 +3,7 @@
 GUI fuer Signal-Visualisierung, Lock-in-Demodulation und eine integrierte
 Modulationsfrequenz-Suche mit AWG und Tektronix-MDO-Oszilloskop.
 
-Standardformat fuer Laden und Speichern ist jetzt HDF5 (`.h5` / `.hdf5`). CSV/TXT kann weiterhin geladen werden, ist aber nur noch ein Legacy-Importpfad.
+Standardformat fuer Laden und Speichern ist jetzt HDF5 (`.h5` / `.hdf5`). Tektronix-Waveforms (`.wfm`) koennen direkt geladen werden. CSV/TXT kann weiterhin geladen werden, ist aber nur noch ein Legacy-Importpfad.
 
 ## Setup
 
@@ -16,6 +16,7 @@ Hinweis fuer Oszilloskopzugriff:
 - `pyvisa-py` ist als softwarebasiertes VISA-Backend enthalten; NI-VISA kann
   weiterhin verwendet werden.
 - Fuer HDF5-Dateien wird `h5py` verwendet.
+- Tektronix-WFM-Dateien werden mit `tm_data_types` als kalibrierte Zeit- und Spannungswerte importiert.
 
 ## Start
 

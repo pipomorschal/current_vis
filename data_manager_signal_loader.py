@@ -16,6 +16,17 @@ from signal_data_class import SignalData
 
 class DataManager:
     @staticmethod
+    def _require_tm_data_types():
+        try:
+            from tm_data_types import AnalogWaveform, read_file
+        except Exception as exc:
+            raise ImportError(
+                "tm_data_types is required for Tektronix WFM import. "
+                "Install it via requirements.txt."
+            ) from exc
+        return AnalogWaveform, read_file
+
+    @staticmethod
     def _require_h5py():
         if h5py is None:
             raise ImportError("h5py is required for HDF5 import/export. Install it via requirements.txt.")
@@ -140,6 +151,8 @@ class DataManager:
             return cls._load_csv_or_txt(path, time_column=time_column, amplitude_column=amplitude_column)
         if suffix in {".h5", ".hdf5"}:
             return cls._load_hdf5(path, time_dataset=time_dataset, amplitude_dataset=amplitude_dataset)
+        if suffix == ".wfm":
+            return cls._load_wfm(path)
         if suffix == ".npy":
             return cls._load_npy(path)
         if suffix == ".npz":
@@ -171,6 +184,12 @@ class DataManager:
                             header = parts
                             continue
 
+                        if left_float is not None and right_float is not None:
+                            header = ["TIME", "VOLTAGE"]
+                            header.extend(f"COLUMN_{index}" for index in range(3, len(parts) + 1))
+                            rows.append(parts[:len(header)])
+                            continue
+
                         if left_float is None or right_float is None:
                             metadata[left] = ",".join(parts[1:]).strip()
                             continue
@@ -181,7 +200,9 @@ class DataManager:
                     rows.append(parts[:len(header)])
 
         if header is None:
-            raise ValueError("Could not find table header line (for example: TIME,CH3).")
+            raise ValueError(
+                "Could not find a table header or a row with at least two numeric columns."
+            )
 
         return metadata, header, rows
 
@@ -195,7 +216,7 @@ class DataManager:
         metadata, header, rows = cls._parse_metadata_and_table(path)
 
         if not rows:
-            raise ValueError("No numeric data rows found after the table header.")
+            raise ValueError("No numeric data rows found.")
 
         header_upper = [h.strip().upper() for h in header]
 
@@ -346,6 +367,74 @@ class DataManager:
                     )
 
         raise ValueError("Could not find HDF5 datasets for time/amplitude. Expected 'time' and 'amplitude' datasets or a saved current_vis file.")
+
+    @classmethod
+    def _load_wfm(cls, path: Path) -> SignalData:
+        analog_waveform_type, read_wfm_file = cls._require_tm_data_types()
+
+        def clean_wfm_text(value) -> str:
+            return cls._to_text(value).replace("\x00", "").strip()
+
+        try:
+            waveform = read_wfm_file(str(path))
+        except Exception as exc:
+            raise ValueError(f"Could not read Tektronix WFM file '{path.name}': {exc}") from exc
+
+        if not isinstance(waveform, analog_waveform_type):
+            waveform_type = type(waveform).__name__
+            raise ValueError(
+                f"Unsupported WFM waveform type '{waveform_type}'. "
+                "Only analog voltage waveforms can be loaded."
+            )
+
+        try:
+            time = np.asarray(waveform.normalized_horizontal_values, dtype=float).reshape(-1)
+            amplitude = np.asarray(waveform.normalized_vertical_values, dtype=float).reshape(-1)
+        except Exception as exc:
+            raise ValueError(f"Could not convert WFM samples to time and voltage: {exc}") from exc
+
+        if time.size == 0 or amplitude.size == 0:
+            raise ValueError("The WFM file contains no waveform samples.")
+        if time.size != amplitude.size:
+            raise ValueError(
+                "WFM time and voltage arrays have different lengths "
+                f"({time.size} and {amplitude.size})."
+            )
+
+        metadata: dict[str, str] = {}
+        meta_info = getattr(waveform, "meta_info", None)
+        if meta_info is not None:
+            try:
+                meta_values = meta_info.operable_metainfo()
+            except Exception:
+                meta_values = {}
+
+            for key, value in meta_values.items():
+                if key == "extended_metadata" and isinstance(value, dict):
+                    for extra_key, extra_value in value.items():
+                        metadata[str(extra_key)] = clean_wfm_text(extra_value)
+                else:
+                    metadata[str(key)] = clean_wfm_text(value)
+
+        x_units = clean_wfm_text(getattr(waveform, "x_axis_units", "") or "")
+        y_units = clean_wfm_text(getattr(waveform, "y_axis_units", "") or "")
+        if x_units:
+            metadata["x_axis_units"] = x_units
+        if y_units:
+            metadata["y_axis_units"] = y_units
+
+        source_name = clean_wfm_text(getattr(waveform, "source_name", "") or path.name)
+        waveform_label = clean_wfm_text(getattr(meta_info, "waveform_label", "") or "")
+        amplitude_column = waveform_label or ("VOLTAGE" if y_units.upper() == "V" else "AMPLITUDE")
+
+        return SignalData(
+            time=time,
+            amplitude=amplitude,
+            source_name=source_name,
+            sampling_rate=cls.estimate_sampling_rate(time),
+            metadata=metadata,
+            column_names=("TIME", amplitude_column),
+        )
 
     @classmethod
     def _load_npy(cls, path: Path) -> SignalData:

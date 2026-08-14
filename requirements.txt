@@ -4,3 +4,4 @@ PySide6
 pyvisa
 pyvisa-py
 h5py
+tm_data_types>=0.4.1,<0.5
