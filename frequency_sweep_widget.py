@@ -9,15 +9,36 @@ import pyqtgraph as pg
 import pyqtgraph.exporters
 
 from frequency_sweep import (
+    AWG_WAVEFORM_OPTIONS,
     MeasurementPoint,
     MockClient,
+    RECTANGULAR_RAMP_WAVEFORM,
     ScanConfig,
     SpectrumScanner,
     TektronixVisaClient,
     inspect_visa_resources,
+    is_rectangular_ramp_waveform,
     list_visa_resources,
 )
 from plot_panel_widget import PlotPanel
+from rectangular_ramp import (
+    AFG1062_MAX_ARB_POINTS,
+    RectangularRampSettings,
+    RectangularRampWaveform,
+    generate_rectangular_ramp,
+)
+
+
+RAMP_SLOPE_PRESETS_MV_PER_PERIOD = (
+    10.0,
+    20.0,
+    50.0,
+    100.0,
+    -10.0,
+    -20.0,
+    -50.0,
+    -100.0,
+)
 
 
 class FrequencyInput(QtWidgets.QWidget):
@@ -41,11 +62,21 @@ class FrequencyInput(QtWidgets.QWidget):
         self.value_spin.setDecimals(9)
         self.value_spin.setValue(value)
         self.value_spin.setKeyboardTracking(False)
+        self.value_spin.setMinimumWidth(0)
+        self.value_spin.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         self.unit_combo = QtWidgets.QComboBox()
         self.unit_combo.addItems(list(self.UNIT_FACTORS))
         self.unit_combo.setCurrentText(unit)
         layout.addWidget(self.value_spin, 1)
         layout.addWidget(self.unit_combo, 0)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
 
     def value_hz(self) -> float:
         return float(self.value_spin.value()) * self.UNIT_FACTORS[self.unit_combo.currentText()]
@@ -80,18 +111,63 @@ class SweepWorker(QtCore.QObject):
         self.scanner.stop()
 
 
+class ArbitraryUploadWorker(QtCore.QObject):
+    completed = QtCore.Signal(object, str, object)
+    failed = QtCore.Signal(str)
+    finished = QtCore.Signal()
+
+    def __init__(
+        self,
+        resource: str,
+        timeout_ms: int,
+        waveform: RectangularRampWaveform,
+        use_mock: bool,
+    ):
+        super().__init__()
+        self.resource = resource
+        self.timeout_ms = timeout_ms
+        self.waveform = waveform
+        self.use_mock = use_mock
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        client = MockClient() if self.use_mock else TektronixVisaClient()
+        identity = ""
+        try:
+            identity = client.connect_awg(self.resource, self.timeout_ms)
+            if not self.use_mock and "AFG1062" not in identity.upper():
+                raise RuntimeError(
+                    "The selected resource did not identify as a Tektronix AFG1062: "
+                    f"{identity}"
+                )
+            warnings = client.upload_arbitrary_waveform(self.waveform)
+        except Exception as exc:
+            prefix = f"{identity}: " if identity else ""
+            self.failed.emit(prefix + str(exc))
+        else:
+            self.completed.emit(self.waveform, identity, warnings)
+        finally:
+            client.disconnect()
+            self.finished.emit()
+
+
 class FrequencySweepWidget(QtWidgets.QWidget):
     frequency_selected = QtCore.Signal(float)
     status_message = QtCore.Signal(str, int)
     hardware_busy_changed = QtCore.Signal(bool)
 
-    DEFAULT_AWG_RESOURCE = "USB0::0x0699::0x0353::2017597::INSTR"
+    # AFG1062 serial numbers are instrument-specific. Refreshing VISA selects
+    # the first discovered resource instead of relying on a hard-coded address.
+    DEFAULT_AWG_RESOURCE = ""
     DEFAULT_SCOPE_RESOURCE = "USB0::0x0699::0x0408::C032947::INSTR"
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._scan_thread: QtCore.QThread | None = None
         self._scan_worker: SweepWorker | None = None
+        self._upload_thread: QtCore.QThread | None = None
+        self._upload_worker: ArbitraryUploadWorker | None = None
+        self._arb_waveform: RectangularRampWaveform | None = None
         self._points: list[MeasurementPoint] = []
         self._active_mode = "frequency"
         self._expected_points = 0
@@ -100,11 +176,21 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         self._build_ui()
         self._connect_signals()
         self._update_mode_controls()
+        self._update_waveform_controls()
+        self._update_rectangular_ramp_preview()
         self._update_plot_axes()
 
     @property
     def is_running(self) -> bool:
         return self._scan_thread is not None
+
+    @property
+    def is_uploading(self) -> bool:
+        return self._upload_thread is not None
+
+    @property
+    def is_busy(self) -> bool:
+        return self.is_running or self.is_uploading
 
     @property
     def points(self) -> tuple[MeasurementPoint, ...]:
@@ -140,11 +226,22 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         )
 
         scan_group = QtWidgets.QGroupBox("Sweep Settings")
+        self.scan_group = scan_group
         scan_form = QtWidgets.QFormLayout(scan_group)
+        self.scan_form = scan_form
         self.mode_combo = QtWidgets.QComboBox()
         self.mode_combo.addItem("Frequency Sweep", "frequency")
         self.mode_combo.addItem("Amplitude Sweep", "amplitude")
         self.mode_combo.addItem("Offset Sweep", "offset")
+        self.awg_waveform = QtWidgets.QComboBox()
+        for label, command in AWG_WAVEFORM_OPTIONS:
+            self.awg_waveform.addItem(label, command)
+        self.awg_waveform.setCurrentIndex(0)
+        self.awg_waveform.setToolTip(
+            "AFG1062 frequency-sweep carrier. Limits: Sine 60 MHz, "
+            "Square 30 MHz, Ramp 2 MHz. Rectangular + Ramp is generated "
+            "as a directly uploaded arbitrary waveform."
+        )
         self.awg_vpp = self._double_spin(2.7, 0.0, 1000.0, 6, " Vpp")
         self.awg_offset = self._double_spin(0.0, -1000.0, 1000.0, 6, " V")
         self.subwindow_span = FrequencyInput(100.0, "kHz")
@@ -163,6 +260,7 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         self.dwell_s = self._double_spin(0.15, 0.0, 3600.0, 3, " s")
 
         scan_form.addRow("Mode", self.mode_combo)
+        scan_form.addRow("Carrier Waveform", self.awg_waveform)
         scan_form.addRow("AWG Base Amplitude", self.awg_vpp)
         scan_form.addRow("AWG Base Offset", self.awg_offset)
         scan_form.addRow("Scope Window Span", self.subwindow_span)
@@ -210,14 +308,116 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         offset_form.addRow("Offset Step", self.offset_step)
         self.mode_stack.addWidget(self.offset_page)
         scan_form.addRow(self.mode_stack)
+        self._standard_sweep_rows = (
+            self.mode_combo,
+            self.awg_vpp,
+            self.awg_offset,
+            self.subwindow_span,
+            self.rbw,
+            self.evaluation_offset,
+            self.iterations,
+            self.averages,
+            self.dwell_s,
+            self.mode_stack,
+        )
+
+        self.arb_group = QtWidgets.QGroupBox("Rectangular + Ramp ARB")
+        arb_form = QtWidgets.QFormLayout(self.arb_group)
+        self.rect_mod_frequency = FrequencyInput(395.0, "kHz", minimum=1e-9)
+        self.rect_mod_frequency.setToolTip(
+            "Frequency of the 50% duty-cycle rectangular component."
+        )
+        self.rectangular_vpp = self._double_spin(2.4, 0.001, 20.0, 6, " Vpp")
+        self.rectangular_vpp.setToolTip(
+            "Voltage difference between the rectangular high and low levels. "
+            "This step remains constant while the baseline ramps."
+        )
+        self.ramp_slope = self._double_spin(
+            0.0, -100000.0, 100000.0, 6, " mV/period"
+        )
+        self.ramp_slope.setToolTip(
+            "The baseline starts at 0 V and changes by this amount during one "
+            "complete rectangular period; positive and negative slopes are supported."
+        )
+        self.ramp_preset_buttons: dict[float, QtWidgets.QPushButton] = {}
+        self.ramp_preset_widget = QtWidgets.QWidget()
+        ramp_preset_layout = QtWidgets.QGridLayout(self.ramp_preset_widget)
+        ramp_preset_layout.setContentsMargins(0, 0, 0, 0)
+        ramp_preset_layout.setHorizontalSpacing(4)
+        ramp_preset_layout.setVerticalSpacing(4)
+        for index, slope_mv in enumerate(RAMP_SLOPE_PRESETS_MV_PER_PERIOD):
+            button = QtWidgets.QPushButton(f"{slope_mv:+g}")
+            button.setMinimumWidth(0)
+            button.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Ignored,
+                QtWidgets.QSizePolicy.Policy.Fixed,
+            )
+            button.setToolTip(
+                f"Add {slope_mv:+g} mV per rectangular period to the current "
+                "ramp slope and immediately upload/apply the waveform."
+            )
+            ramp_preset_layout.addWidget(button, index // 4, index % 4)
+            ramp_preset_layout.setColumnStretch(index % 4, 1)
+            self.ramp_preset_buttons[slope_mv] = button
+        self.ramp_preset_widget.setMinimumWidth(0)
+        self.ramp_preset_widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self.arb_periods = QtWidgets.QSpinBox()
+        self.arb_periods.setRange(1, AFG1062_MAX_ARB_POINTS // 4)
+        self.arb_periods.setValue(10)
+        self.arb_periods.setSuffix(" periods")
+        self.arb_periods.setToolTip(
+            "Integer number of rectangular periods in the repeating ARB record."
+        )
+        self.arb_repetition_value = QtWidgets.QLabel("—")
+        self.arb_sample_rate_value = QtWidgets.QLabel("—")
+        self.arb_points_value = QtWidgets.QLabel("—")
+        self.arb_total_vpp_value = QtWidgets.QLabel("—")
+        self.arb_offset_value = QtWidgets.QLabel("—")
+        for label in (
+            self.arb_repetition_value,
+            self.arb_sample_rate_value,
+            self.arb_points_value,
+            self.arb_total_vpp_value,
+            self.arb_offset_value,
+        ):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.upload_arb_button = QtWidgets.QPushButton("Upload / Apply")
+        self.upload_arb_button.setToolTip(
+            "Upload the generated 14-bit record directly over VISA, select edit "
+            "memory, apply the calculated amplitude/offset, and enable channel 1."
+        )
+        self.arb_input_note = QtWidgets.QLabel(
+            "50% duty cycle. The ramp baseline intentionally resets whenever the "
+            "ARB record repeats."
+        )
+        self.arb_input_note.setWordWrap(True)
+        self.arb_input_note.setStyleSheet("color: #8a3b12;")
+        arb_form.addRow("Rectangular Frequency", self.rect_mod_frequency)
+        arb_form.addRow("Rectangular Amplitude", self.rectangular_vpp)
+        arb_form.addRow("Ramp Slope", self.ramp_slope)
+        arb_form.addRow(QtWidgets.QLabel("Add & Apply (mV/period)"))
+        arb_form.addRow(self.ramp_preset_widget)
+        arb_form.addRow("ARB Record Length", self.arb_periods)
+        arb_form.addRow("ARB Repetition", self.arb_repetition_value)
+        arb_form.addRow("Effective Sample Rate", self.arb_sample_rate_value)
+        arb_form.addRow("Record Samples", self.arb_points_value)
+        arb_form.addRow("Total AFG Amplitude", self.arb_total_vpp_value)
+        arb_form.addRow("Required DC Offset", self.arb_offset_value)
+        arb_form.addRow(self.arb_input_note)
+        arb_form.addRow(self.upload_arb_button)
 
         output_group = QtWidgets.QGroupBox("Run and Output")
         output_form = QtWidgets.QFormLayout(output_group)
-        self.mock_mode = QtWidgets.QCheckBox("Mock mode (no hardware)")
-        self.auto_save_csv = QtWidgets.QCheckBox("Save CSV when scan finishes")
+        self.mock_mode = QtWidgets.QCheckBox("Mock (no hardware)")
+        self.auto_save_csv = QtWidgets.QCheckBox("Save scan CSV")
+        self.auto_save_csv.setToolTip("Save CSV automatically when a scan finishes.")
         self.auto_save_csv.setChecked(True)
         self.csv_path = QtWidgets.QLineEdit("scan_results.csv")
-        self.browse_csv_button = QtWidgets.QPushButton("...")
+        self.browse_csv_button = QtWidgets.QPushButton("…")
+        self.browse_csv_button.setToolTip("Choose the sweep CSV output path.")
         self.browse_csv_button.setMaximumWidth(36)
         path_widget = QtWidgets.QWidget()
         path_layout = QtWidgets.QHBoxLayout(path_widget)
@@ -228,9 +428,13 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         self.stop_button = QtWidgets.QPushButton("Stop")
         self.stop_button.setEnabled(False)
         self.clear_button = QtWidgets.QPushButton("Clear")
-        self.export_button = QtWidgets.QPushButton("Save Results...")
+        self.export_button = QtWidgets.QPushButton("Save...")
+        self.export_button.setToolTip("Save the current sweep results as CSV.")
         self.export_button.setEnabled(False)
-        self.use_best_button = QtWidgets.QPushButton("Use Best Frequency for Demodulation")
+        self.use_best_button = QtWidgets.QPushButton("Use Best Frequency")
+        self.use_best_button.setToolTip(
+            "Use the best sweep frequency as the demodulation reference."
+        )
         self.use_best_button.setEnabled(False)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 1)
@@ -246,20 +450,76 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         output_form.addRow(self.progress)
         output_form.addRow(self.run_status)
 
+        sidebar_forms = (
+            instrument_form,
+            scan_form,
+            frequency_form,
+            amplitude_form,
+            offset_form,
+            arb_form,
+            output_form,
+        )
+        for form in sidebar_forms:
+            form.setRowWrapPolicy(
+                QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows
+            )
+            form.setFieldGrowthPolicy(
+                QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+            )
+            form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+
+        sidebar_groups = (instrument_group, scan_group, self.arb_group, output_group)
+        for group in sidebar_groups:
+            group.setMinimumWidth(0)
+            group.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Ignored,
+                QtWidgets.QSizePolicy.Policy.Preferred,
+            )
+        self.mode_stack.setMinimumWidth(0)
+        self.mode_stack.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
+        for editor in control_content.findChildren(QtWidgets.QWidget):
+            if isinstance(editor.parentWidget(), FrequencyInput) and isinstance(
+                editor, QtWidgets.QComboBox
+            ):
+                continue
+            if isinstance(
+                editor,
+                (
+                    QtWidgets.QAbstractSpinBox,
+                    QtWidgets.QComboBox,
+                    QtWidgets.QLineEdit,
+                    QtWidgets.QPushButton,
+                ),
+            ):
+                editor.setMinimumWidth(0)
+                editor.setSizePolicy(
+                    QtWidgets.QSizePolicy.Policy.Ignored,
+                    QtWidgets.QSizePolicy.Policy.Fixed,
+                )
+        control_content.setMinimumWidth(0)
+        control_content.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
+
         control_layout.addWidget(instrument_group)
         control_layout.addWidget(scan_group)
+        control_layout.addWidget(self.arb_group)
         control_layout.addWidget(output_group)
         control_layout.addStretch(1)
 
-        self._settings_groups = (instrument_group, scan_group)
+        self._settings_groups = (instrument_group, scan_group, self.arb_group)
         self.control_panel = QtWidgets.QScrollArea()
         self.control_panel.setWidgetResizable(True)
         self.control_panel.setWidget(control_content)
         self.control_panel.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         self.control_panel.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.control_panel.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.control_panel.setMinimumWidth(400)
-        self.control_panel.setMaximumWidth(400)
+        self.control_panel.setMinimumWidth(340)
+        self.control_panel.setMaximumWidth(340)
         self.control_panel.setMinimumHeight(0)
         self.control_panel.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Fixed,
@@ -268,12 +528,46 @@ class FrequencySweepWidget(QtWidgets.QWidget):
 
         result_widget = QtWidgets.QWidget()
         result_layout = QtWidgets.QVBoxLayout(result_widget)
+        self.arb_preview_group = QtWidgets.QGroupBox(
+            "Rectangular + Ramp — One Complete ARB Record"
+        )
+        arb_preview_layout = QtWidgets.QVBoxLayout(self.arb_preview_group)
+        self.arb_preview_plot = pg.PlotWidget()
+        self.arb_preview_plot.setBackground("w")
+        self.arb_preview_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.arb_preview_plot.setLabel("bottom", "Time", units="s")
+        self.arb_preview_plot.setLabel("left", "Requested Output", units="V")
+        for axis_name in ("left", "bottom"):
+            axis = self.arb_preview_plot.getAxis(axis_name)
+            axis.setPen(pg.mkPen("k"))
+            axis.setTextPen(pg.mkPen("k"))
+        self.arb_preview_curve = self.arb_preview_plot.plot(
+            [], [], pen=pg.mkPen("#1769aa", width=1.5)
+        )
+        reset_pen = pg.mkPen(
+            "#c62828", width=2.0, style=QtCore.Qt.PenStyle.DashLine
+        )
+        self.arb_reset_curve = self.arb_preview_plot.plot([], [], pen=reset_pen)
+        self.arb_boundary_line = pg.InfiniteLine(angle=90, movable=False, pen=reset_pen)
+        self.arb_preview_plot.addItem(self.arb_boundary_line)
+        self.arb_reset_text = pg.TextItem(
+            "ARB record reset", color="#a01818", anchor=(1.0, 0.0)
+        )
+        self.arb_preview_plot.addItem(self.arb_reset_text)
+        self.arb_reset_description = QtWidgets.QLabel()
+        self.arb_reset_description.setWordWrap(True)
+        self.arb_reset_description.setStyleSheet("color: #a01818;")
+        arb_preview_layout.addWidget(self.arb_preview_plot, 1)
+        arb_preview_layout.addWidget(self.arb_reset_description)
+        self.arb_preview_group.setMinimumHeight(280)
+
         self.plot_panel = PlotPanel("Amplitude at the Current Sweep Step")
         self.plot_panel.set_pen(pg.mkPen("#1769aa", width=2.0))
         self.last_point_label = QtWidgets.QLabel("No measurements yet.")
         self.last_point_label.setWordWrap(True)
         self.best_point_label = QtWidgets.QLabel("Best: n/a")
         self.best_point_label.setWordWrap(True)
+        result_layout.addWidget(self.arb_preview_group, 1)
         result_layout.addWidget(self.plot_panel, 1)
         result_layout.addWidget(self.last_point_label)
         result_layout.addWidget(self.best_point_label)
@@ -327,12 +621,29 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         layout.setHorizontalSpacing(6)
         layout.setVerticalSpacing(4)
         for index, button in enumerate(buttons):
-            layout.addWidget(button, index // 2, index % 2)
+            layout.addWidget(button, index, 0)
         return widget
 
     def _connect_signals(self) -> None:
         self.mode_combo.currentIndexChanged.connect(self._update_mode_controls)
+        self.awg_waveform.currentIndexChanged.connect(self._update_waveform_controls)
         self.mock_mode.toggled.connect(self._update_external_hardware_state)
+        self.rect_mod_frequency.value_spin.valueChanged.connect(
+            self._update_rectangular_ramp_preview
+        )
+        self.rect_mod_frequency.unit_combo.currentTextChanged.connect(
+            self._update_rectangular_ramp_preview
+        )
+        self.rectangular_vpp.valueChanged.connect(self._update_rectangular_ramp_preview)
+        self.ramp_slope.valueChanged.connect(self._update_rectangular_ramp_preview)
+        self.arb_periods.valueChanged.connect(self._update_rectangular_ramp_preview)
+        for slope_mv, button in self.ramp_preset_buttons.items():
+            button.clicked.connect(
+                lambda _checked=False, value=slope_mv: self.apply_ramp_slope_preset(
+                    value
+                )
+            )
+        self.upload_arb_button.clicked.connect(self.upload_rectangular_ramp)
         self.refresh_resources_button.clicked.connect(self.refresh_resources)
         self.inspect_resources_button.clicked.connect(self.inspect_resources)
         self.debug_scope_button.clicked.connect(self.debug_scope)
@@ -351,6 +662,150 @@ class FrequencySweepWidget(QtWidgets.QWidget):
             self._update_plot_axes()
         self.use_best_button.setVisible(mode == "frequency")
         self._update_best_point()
+
+    def _rectangular_ramp_selected(self) -> bool:
+        return is_rectangular_ramp_waveform(str(self.awg_waveform.currentData()))
+
+    @QtCore.Slot()
+    def _update_waveform_controls(self, *_args) -> None:
+        selected = self._rectangular_ramp_selected()
+        self.scan_group.setTitle("AFG Waveform" if selected else "Sweep Settings")
+        for row_widget in self._standard_sweep_rows:
+            self.scan_form.setRowVisible(row_widget, not selected)
+        self.arb_group.setVisible(selected)
+        self.arb_preview_group.setVisible(selected)
+        self.plot_panel.setVisible(not selected)
+        self.last_point_label.setVisible(not selected)
+        self.best_point_label.setVisible(not selected)
+        if selected:
+            self.start_button.setToolTip(
+                "Rectangular + Ramp is applied as a fixed ARB record. Select a "
+                "standard carrier to run the existing sweep modes."
+            )
+        else:
+            self.start_button.setToolTip("")
+        self._update_external_hardware_state()
+
+    def _current_rectangular_ramp_settings(self) -> RectangularRampSettings:
+        return RectangularRampSettings(
+            modulation_frequency_hz=self.rect_mod_frequency.value_hz(),
+            rectangular_vpp=float(self.rectangular_vpp.value()),
+            ramp_slope_mv_per_period=float(self.ramp_slope.value()),
+            periods=int(self.arb_periods.value()),
+        )
+
+    @staticmethod
+    def _format_engineering(value: float, unit: str, *, signed: bool = False) -> str:
+        prefixes = (
+            (1e9, "G"),
+            (1e6, "M"),
+            (1e3, "k"),
+            (1.0, ""),
+            (1e-3, "m"),
+            (1e-6, "µ"),
+            (1e-9, "n"),
+            (1e-12, "p"),
+        )
+        absolute = abs(value)
+        factor, prefix = 1.0, ""
+        if absolute > 0.0:
+            for candidate, candidate_prefix in prefixes:
+                if absolute >= candidate:
+                    factor, prefix = candidate, candidate_prefix
+                    break
+        format_spec = "+.6g" if signed else ".6g"
+        return f"{value / factor:{format_spec}} {prefix}{unit}"
+
+    @QtCore.Slot()
+    def _update_rectangular_ramp_preview(self, *_args) -> None:
+        try:
+            waveform = generate_rectangular_ramp(
+                self._current_rectangular_ramp_settings()
+            )
+        except Exception as exc:
+            self._arb_waveform = None
+            for label in (
+                self.arb_repetition_value,
+                self.arb_sample_rate_value,
+                self.arb_points_value,
+                self.arb_total_vpp_value,
+                self.arb_offset_value,
+            ):
+                label.setText("Invalid")
+            self.arb_preview_curve.setData([], [])
+            self.arb_reset_curve.setData([], [])
+            self.arb_reset_description.setText(str(exc))
+            self.arb_input_note.setText(str(exc))
+            self.arb_input_note.setStyleSheet("color: #b00020;")
+            self._update_external_hardware_state()
+            return
+
+        self._arb_waveform = waveform
+        self.arb_repetition_value.setText(
+            self._format_engineering(waveform.arb_repetition_hz, "Hz")
+        )
+        self.arb_sample_rate_value.setText(
+            self._format_engineering(waveform.effective_sample_rate_sps, "S/s")
+        )
+        self.arb_points_value.setText(
+            f"{waveform.point_count} ({waveform.samples_per_period} / period)"
+        )
+        self.arb_total_vpp_value.setText(
+            self._format_engineering(waveform.total_waveform_vpp, "Vpp")
+        )
+        self.arb_offset_value.setText(
+            self._format_engineering(waveform.afg_offset_v, "V", signed=True)
+        )
+        self.arb_input_note.setText(
+            "50% duty cycle; the rectangular step remains "
+            f"{self._format_engineering(waveform.settings.rectangular_vpp, 'Vpp')}. "
+            "Baseline change over this record: "
+            f"{self._format_engineering(waveform.baseline_change_v, 'V', signed=True)}."
+        )
+        self.arb_input_note.setStyleSheet("color: #8a3b12;")
+
+        preview_time = np.append(waveform.time_s, waveform.record_duration_s)
+        preview_voltage = np.append(waveform.voltage_v, waveform.reset_from_v)
+        self.arb_preview_curve.setData(preview_time, preview_voltage)
+        self.arb_reset_curve.setData(
+            [waveform.record_duration_s, waveform.record_duration_s],
+            [waveform.reset_from_v, waveform.reset_to_v],
+        )
+        self.arb_boundary_line.setValue(waveform.record_duration_s)
+        maximum_v = max(float(np.max(waveform.voltage_v)), waveform.reset_from_v)
+        minimum_v = min(float(np.min(waveform.voltage_v)), waveform.reset_to_v)
+        voltage_span = maximum_v - minimum_v
+        padding_v = max(0.05 * voltage_span, 1e-6)
+        self.arb_reset_text.setText(
+            "ARB record reset\n"
+            "baseline "
+            f"{self._format_engineering(waveform.baseline_reset_jump_v, 'V', signed=True)}; "
+            "output "
+            f"{self._format_engineering(waveform.record_wrap_jump_v, 'V', signed=True)}"
+        )
+        self.arb_reset_text.setPos(waveform.record_duration_s, maximum_v + padding_v)
+        self.arb_preview_plot.setRange(
+            xRange=(0.0, waveform.record_duration_s),
+            yRange=(minimum_v - padding_v, maximum_v + 2.5 * padding_v),
+            padding=0.01,
+        )
+        if math.isclose(waveform.baseline_reset_jump_v, 0.0, abs_tol=1e-15):
+            reset_detail = "the baseline reset is zero"
+        else:
+            reset_detail = (
+                "the baseline returns to its starting value with an intentional "
+                f"{self._format_engineering(waveform.baseline_reset_jump_v, 'V', signed=True)} jump"
+            )
+        self.arb_reset_description.setText(
+            "Red dashed marker: end of the ARB record; "
+            f"{reset_detail}. At the same boundary the rectangle has its normal "
+            f"{self._format_engineering(waveform.settings.rectangular_vpp, 'V', signed=True)} "
+            "low-to-high edge, so the combined output jump is "
+            f"{self._format_engineering(waveform.record_wrap_jump_v, 'V', signed=True)}. "
+            "The record then repeats at "
+            f"{self._format_engineering(waveform.arb_repetition_hz, 'Hz')}."
+        )
+        self._update_external_hardware_state()
 
     def _update_plot_axes(self) -> None:
         if self._active_mode == "frequency":
@@ -393,6 +848,7 @@ class FrequencySweepWidget(QtWidgets.QWidget):
             save_csv=self.auto_save_csv.isChecked(),
             csv_path=self.csv_path.text().strip(),
             use_mock=self.mock_mode.isChecked(),
+            awg_waveform=str(self.awg_waveform.currentData()),
             timeout_ms=int(self.timeout_ms.value()),
             evaluation_offset_hz=self.evaluation_offset.value_hz(),
         )
@@ -485,9 +941,117 @@ class FrequencySweepWidget(QtWidgets.QWidget):
                 path += ".csv"
             self.csv_path.setText(path)
 
+    @QtCore.Slot(float)
+    def apply_ramp_slope_preset(self, slope_mv_per_period: float) -> None:
+        """Add a signed slope increment and immediately apply the resulting ARB."""
+        if self.is_busy or not self._rectangular_ramp_selected():
+            return
+        self.ramp_slope.setValue(
+            float(self.ramp_slope.value()) + float(slope_mv_per_period)
+        )
+        self.upload_rectangular_ramp()
+
+    @QtCore.Slot()
+    def upload_rectangular_ramp(self) -> None:
+        if self.is_busy or not self._rectangular_ramp_selected():
+            return
+        if self._external_hardware_busy and not self.mock_mode.isChecked():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Rectangular + Ramp",
+                "The oscilloscope is currently capturing a waveform. Wait for it "
+                "to finish before changing the AFG output, or enable mock mode.",
+            )
+            return
+        try:
+            waveform = generate_rectangular_ramp(
+                self._current_rectangular_ramp_settings()
+            )
+            resource = self.awg_resource.currentText().strip()
+            if not resource and not self.mock_mode.isChecked():
+                raise ValueError("Select an AFG1062 VISA resource.")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "ARB Input", str(exc))
+            return
+
+        self._arb_waveform = waveform
+        self._upload_worker = ArbitraryUploadWorker(
+            resource=resource,
+            timeout_ms=int(self.timeout_ms.value()),
+            waveform=waveform,
+            use_mock=self.mock_mode.isChecked(),
+        )
+        self._upload_thread = QtCore.QThread(self)
+        self._upload_worker.moveToThread(self._upload_thread)
+        self._upload_thread.started.connect(self._upload_worker.run)
+        self._upload_worker.completed.connect(self._on_arb_upload_completed)
+        self._upload_worker.failed.connect(self._on_arb_upload_failed)
+        self._upload_worker.finished.connect(self._upload_thread.quit)
+        self._upload_worker.finished.connect(self._upload_worker.deleteLater)
+        self._upload_thread.finished.connect(self._upload_thread.deleteLater)
+        self._upload_thread.finished.connect(self._on_arb_upload_thread_finished)
+
+        self._using_hardware = not self.mock_mode.isChecked()
+        self._set_uploading_ui(True)
+        if self._using_hardware:
+            self.hardware_busy_changed.emit(True)
+        self._set_status(
+            "Uploading Rectangular + Ramp record and applying AFG1062 scaling...", 0
+        )
+        self._upload_thread.start()
+
+    @QtCore.Slot(object, str, object)
+    def _on_arb_upload_completed(
+        self,
+        waveform: RectangularRampWaveform,
+        identity: str,
+        warnings: tuple[str, ...],
+    ) -> None:
+        self._arb_waveform = waveform
+        warning_text = ""
+        if warnings:
+            warning_text = (
+                " Verified despite AFG firmware warning(s): "
+                + " | ".join(warnings)
+                + "."
+            )
+        self._set_status(
+            "Rectangular + Ramp applied: "
+            f"{waveform.point_count} samples, "
+            f"f_ARB={self._format_engineering(waveform.arb_repetition_hz, 'Hz')}, "
+            f"amplitude={self._format_engineering(waveform.total_waveform_vpp, 'Vpp')}, "
+            f"offset={self._format_engineering(waveform.afg_offset_v, 'V', signed=True)} "
+            f"({identity})."
+            + warning_text,
+            8000,
+        )
+
+    @QtCore.Slot(str)
+    def _on_arb_upload_failed(self, message: str) -> None:
+        QtWidgets.QMessageBox.critical(self, "AFG1062 ARB Upload", message)
+        self._set_status(f"ARB upload failed: {message}", 10000)
+
+    @QtCore.Slot()
+    def _on_arb_upload_thread_finished(self) -> None:
+        self._upload_thread = None
+        self._upload_worker = None
+        used_hardware = self._using_hardware
+        self._using_hardware = False
+        self._set_uploading_ui(False)
+        if used_hardware:
+            self.hardware_busy_changed.emit(False)
+
     @QtCore.Slot()
     def start_scan(self) -> None:
-        if self.is_running:
+        if self.is_busy:
+            return
+        if self._rectangular_ramp_selected():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Rectangular + Ramp",
+                "Use Upload / Apply for this fixed arbitrary waveform. Select Sine, "
+                "Square, or Ramp to run a standard sweep.",
+            )
             return
         if self._external_hardware_busy and not self.mock_mode.isChecked():
             QtWidgets.QMessageBox.information(
@@ -530,7 +1094,8 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         if self._using_hardware:
             self.hardware_busy_changed.emit(True)
         mode_label = self.mode_combo.currentText()
-        self._set_status(f"{mode_label} started...", 0)
+        waveform_label = self.awg_waveform.currentText()
+        self._set_status(f"{mode_label} started with {waveform_label} waveform...", 0)
         self._scan_thread.start()
 
     @staticmethod
@@ -628,6 +1193,26 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         self.clear_button.setEnabled(not running)
         self.export_button.setEnabled(not running and bool(self._points))
         self.use_best_button.setEnabled(not running and self.best_frequency_hz() is not None)
+        if not running:
+            self._update_external_hardware_state()
+
+    def _set_uploading_ui(self, uploading: bool) -> None:
+        for group in self._settings_groups:
+            group.setEnabled(not uploading)
+        self.mock_mode.setEnabled(not uploading)
+        self.auto_save_csv.setEnabled(not uploading)
+        self.csv_path.setEnabled(not uploading)
+        self.browse_csv_button.setEnabled(not uploading)
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
+        self.clear_button.setEnabled(not uploading)
+        self.export_button.setEnabled(not uploading and bool(self._points))
+        self.use_best_button.setEnabled(
+            not uploading and self.best_frequency_hz() is not None
+        )
+        if not uploading:
+            self._update_waveform_controls()
+            self._update_best_point()
 
     def _set_status(self, message: str, timeout_ms: int) -> None:
         self.run_status.setText(message)
@@ -638,7 +1223,7 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         if not finite_points:
             self.best_point_label.setText("Best: n/a")
             self.use_best_button.setEnabled(False)
-            self.export_button.setEnabled(bool(self._points) and not self.is_running)
+            self.export_button.setEnabled(bool(self._points) and not self.is_busy)
             return
 
         best = max(finite_points, key=lambda point: point.amplitude_dbm)
@@ -656,8 +1241,8 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         else:
             detail = f"AWG offset={best.sweep_value:.9g} V at {best.target_freq_hz:.9g} Hz"
         self.best_point_label.setText(f"Best: {detail}, amplitude={best.amplitude_dbm:.3f} dBm")
-        self.use_best_button.setEnabled(not self.is_running and best.sweep_mode == "frequency")
-        self.export_button.setEnabled(not self.is_running)
+        self.use_best_button.setEnabled(not self.is_busy and best.sweep_mode == "frequency")
+        self.export_button.setEnabled(not self.is_busy)
 
     def best_frequency_hz(self) -> float | None:
         finite_points = [
@@ -746,7 +1331,7 @@ class FrequencySweepWidget(QtWidgets.QWidget):
 
     def set_scope_resource(self, resource: str) -> None:
         resource = resource.strip()
-        if resource and not self.is_running:
+        if resource and not self.is_busy:
             if self.scope_resource.findText(resource) < 0:
                 self.scope_resource.addItem(resource)
             self.scope_resource.setCurrentText(resource)
@@ -759,13 +1344,27 @@ class FrequencySweepWidget(QtWidgets.QWidget):
     @QtCore.Slot()
     def _update_external_hardware_state(self) -> None:
         hardware_blocked = self._external_hardware_busy and not self.mock_mode.isChecked()
-        if not self.is_running:
-            self.start_button.setEnabled(not hardware_blocked)
-        self.debug_scope_button.setEnabled(not self._external_hardware_busy and not self.is_running)
+        arb_apply_enabled = (
+            not self.is_busy
+            and not hardware_blocked
+            and self._rectangular_ramp_selected()
+            and self._arb_waveform is not None
+        )
+        if not self.is_busy:
+            self.start_button.setEnabled(
+                not hardware_blocked and not self._rectangular_ramp_selected()
+            )
+        self.upload_arb_button.setEnabled(arb_apply_enabled)
+        for button in self.ramp_preset_buttons.values():
+            button.setEnabled(arb_apply_enabled)
+        self.debug_scope_button.setEnabled(
+            not self._external_hardware_busy and not self.is_busy
+        )
 
     def shutdown(self) -> bool:
         """Request a safe stop; return False while instrument work is still active."""
-        if not self.is_running:
+        if not self.is_busy:
             return True
-        self.stop_scan()
+        if self.is_running:
+            self.stop_scan()
         return False

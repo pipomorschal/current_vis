@@ -139,8 +139,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar_stack = QtWidgets.QStackedWidget()
         self.sidebar_stack.addWidget(self.controls)
         self.sidebar_stack.addWidget(self.sweep_widget.control_panel)
-        self.sidebar_stack.setMinimumWidth(400)
-        self.sidebar_stack.setMaximumWidth(400)
+        self.sidebar_stack.setMinimumWidth(340)
+        self.sidebar_stack.setMaximumWidth(340)
         self.sidebar_stack.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Fixed,
             QtWidgets.QSizePolicy.Policy.Expanding,
@@ -181,19 +181,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_controls(self):
         content = QtWidgets.QWidget()
-        content.setMinimumWidth(360)
+        content.setMinimumWidth(0)
+        content.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
         layout = QtWidgets.QVBoxLayout(content)
 
         def _button_grid(*buttons: QtWidgets.QPushButton) -> QtWidgets.QWidget:
-            # Compact 2-column button container to reduce vertical space.
+            # A single column keeps labels readable in the compact sidebar.
             container = QtWidgets.QWidget()
             grid = QtWidgets.QGridLayout(container)
             grid.setContentsMargins(0, 0, 0, 0)
             grid.setHorizontalSpacing(6)
             grid.setVerticalSpacing(4)
             for idx, btn in enumerate(buttons):
-                row = idx // 2
-                col = idx % 2
+                row = idx
+                col = 0
                 btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
                 grid.addWidget(btn, row, col)
             return container
@@ -218,14 +222,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_scope_timeout_ms.setRange(1000, 120000)
         self.spin_scope_timeout_ms.setValue(5000)
         self.spin_scope_timeout_ms.setSuffix(" ms")
-        self.btn_scope_acquire = QtWidgets.QPushButton("Acquire from Oscilloscope")
+        self.btn_scope_acquire = QtWidgets.QPushButton("Acquire Oscilloscope")
         self.btn_scope_save = QtWidgets.QPushButton("Save Last Scope Capture")
         self.btn_scope_save.setEnabled(False)
         self.combo_time_column = QtWidgets.QComboBox()
         self.combo_amplitude_column = QtWidgets.QComboBox()
         form_data.addRow(self.path_edit)
         form_data.addRow(_button_grid(self.btn_browse, self.btn_load, self.btn_demo, self.btn_save_loaded))
-        form_data.addRow(QtWidgets.QLabel("--- Oscilloscope Input ---"))
+        form_data.addRow(QtWidgets.QLabel("Oscilloscope Input"))
         form_data.addRow("Resource", self.combo_scope_resource)
         form_data.addRow("Channel", self.combo_scope_channel)
         form_data.addRow("Sample Points", self.spin_scope_points)
@@ -278,7 +282,7 @@ class MainWindow(QtWidgets.QMainWindow):
         form_fft.addRow(self.check_fft_remove_mean)
         form_fft.addRow(self.btn_update_fft)
 
-        self.group_demod = QtWidgets.QGroupBox("Lock-in Demodulation Settings")
+        self.group_demod = QtWidgets.QGroupBox("Lock-in Demodulation")
         form_demod = QtWidgets.QFormLayout(self.group_demod)
 
         self.spin_demod_frequency = QtWidgets.QDoubleSpinBox()
@@ -306,7 +310,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_demod_scale_toggle.setChecked(False)
         self.btn_demod_scale_toggle.setToolTip("Toggle between scaled demodulation output and raw output")
 
-        self.btn_use_fft_frequency = QtWidgets.QPushButton("Use Selected FFT Frequency")
+        self.btn_use_fft_frequency = QtWidgets.QPushButton("Use FFT Frequency")
         self.btn_update_demod = QtWidgets.QPushButton("Run Demodulation")
         self.lbl_selected_freq = QtWidgets.QLabel("No frequency selected")
 
@@ -322,11 +326,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_lockin_lowpass_order.setValue(2)
         self.check_lockin_use_iq = QtWidgets.QCheckBox("Use I/Q Magnitude")
         self.check_lockin_use_iq.setChecked(True)
-        self.check_lockin_reconstruct_phase = QtWidgets.QCheckBox("Reconstruct Signal Using Phase")
+        self.check_lockin_reconstruct_phase = QtWidgets.QCheckBox("Phase Reconstruction")
         self.check_lockin_reconstruct_phase.setChecked(False)
-        self.check_lockin_show_phase_separately = QtWidgets.QCheckBox("Show Magnitude & Phase Separately")
+        self.check_lockin_show_phase_separately = QtWidgets.QCheckBox("Separate Mag / Phase")
         self.check_lockin_show_phase_separately.setChecked(False)
-        self.check_lockin_skip_transient = QtWidgets.QCheckBox("Skip Initial Transient")
+        self.check_lockin_skip_transient = QtWidgets.QCheckBox("Skip Transient")
         self.check_lockin_skip_transient.setChecked(True)
         form_lockin.addRow("Lowpass Cutoff", self.spin_lockin_lowpass_cutoff)
         form_lockin.addRow("Lowpass Order", self.spin_lockin_lowpass_order)
@@ -338,10 +342,11 @@ class MainWindow(QtWidgets.QMainWindow):
         form_demod.addRow("Frequency", self.spin_demod_frequency)
         form_demod.addRow("Raw Data Unit", self.combo_demod_voltage_unit)
         form_demod.addRow("Max Amplitude", self.spin_demod_target_max_amplitude)
-        form_demod.addRow("Amplitude Mode", self.btn_demod_scale_toggle)
+        form_demod.addRow("Mode", self.btn_demod_scale_toggle)
         form_demod.addRow(_button_grid(self.btn_use_fft_frequency, self.btn_update_demod))
         form_demod.addRow(self.group_lockin)
         form_demod.addRow(self.lbl_selected_freq)
+        self.lbl_selected_freq.setWordWrap(True)
 
         self.group_lockin.setVisible(True)
 
@@ -359,6 +364,45 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.group_info)
         layout.addStretch(1)
 
+        sidebar_forms = (
+            form_data,
+            form_range,
+            form_time,
+            form_fft,
+            form_demod,
+            form_lockin,
+        )
+        for form in sidebar_forms:
+            form.setRowWrapPolicy(
+                QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows
+            )
+            form.setFieldGrowthPolicy(
+                QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+            )
+            form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+
+        for group in content.findChildren(QtWidgets.QGroupBox):
+            group.setMinimumWidth(0)
+            group.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Ignored,
+                QtWidgets.QSizePolicy.Policy.Preferred,
+            )
+        for editor in content.findChildren(QtWidgets.QWidget):
+            if isinstance(
+                editor,
+                (
+                    QtWidgets.QAbstractSpinBox,
+                    QtWidgets.QComboBox,
+                    QtWidgets.QLineEdit,
+                    QtWidgets.QPushButton,
+                ),
+            ):
+                editor.setMinimumWidth(0)
+                editor.setSizePolicy(
+                    QtWidgets.QSizePolicy.Policy.Ignored,
+                    QtWidgets.QSizePolicy.Policy.Fixed,
+                )
+
         # A scrollable sidebar keeps changing tab contents from increasing the
         # main-window minimum height and clipping plots in maximized/fullscreen mode.
         scroll = QtWidgets.QScrollArea()
@@ -367,8 +411,8 @@ class MainWindow(QtWidgets.QMainWindow):
         scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll.setMinimumWidth(400)
-        scroll.setMaximumWidth(400)
+        scroll.setMinimumWidth(340)
+        scroll.setMaximumWidth(340)
         scroll.setMinimumHeight(0)
         scroll.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Expanding)
         return scroll
@@ -1330,8 +1374,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.sweep_widget.shutdown():
             QtWidgets.QMessageBox.information(
                 self,
-                "Frequency Sweep",
-                "The active sweep is stopping. Close the application again after it has finished.",
+                "Instrument Operation",
+                "The active sweep is stopping, or an AFG upload is still finishing. "
+                "Close the application again after the instrument operation has ended.",
             )
             event.ignore()
             return

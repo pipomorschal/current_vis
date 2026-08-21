@@ -10,6 +10,47 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from rectangular_ramp import (
+    AFG1062_MAX_ARB_POINTS,
+    AFG1062_MAX_SAMPLE_RATE_SPS,
+    RectangularRampWaveform,
+)
+
+RECTANGULAR_RAMP_WAVEFORM = "RECTANGULAR_RAMP"
+STANDARD_AWG_WAVEFORM_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("Sine", "SINusoid"),
+    ("Square", "SQUare"),
+    ("Ramp", "RAMP"),
+)
+AWG_WAVEFORM_OPTIONS: tuple[tuple[str, str], ...] = (
+    *STANDARD_AWG_WAVEFORM_OPTIONS,
+    ("Rectangular + Ramp", RECTANGULAR_RAMP_WAVEFORM),
+)
+_AWG_WAVEFORM_COMMANDS = {
+    command.upper(): command for _label, command in STANDARD_AWG_WAVEFORM_OPTIONS
+}
+_AWG_WAVEFORM_LABELS = {
+    command: label for label, command in STANDARD_AWG_WAVEFORM_OPTIONS
+}
+_AFG1062_MAX_FREQUENCY_HZ = {
+    "SINusoid": 60e6,
+    "SQUare": 30e6,
+    "RAMP": 2e6,
+}
+
+
+def normalize_awg_waveform(value: str) -> str:
+    normalized = str(value).strip().upper()
+    try:
+        return _AWG_WAVEFORM_COMMANDS[normalized]
+    except KeyError as exc:
+        choices = ", ".join(label for label, _command in STANDARD_AWG_WAVEFORM_OPTIONS)
+        raise ValueError(f"Unknown AWG waveform '{value}'. Choose one of: {choices}.") from exc
+
+
+def is_rectangular_ramp_waveform(value: str) -> bool:
+    return str(value).strip().upper() == RECTANGULAR_RAMP_WAVEFORM
+
 
 @dataclass
 class ScanConfig:
@@ -36,6 +77,7 @@ class ScanConfig:
     save_csv: bool
     csv_path: str
     use_mock: bool
+    awg_waveform: str = "SINusoid"
     timeout_ms: int = 10000
     evaluation_offset_hz: float = 0.0
 
@@ -138,20 +180,17 @@ class TektronixVisaClient:
         self.rm: Any = None
         self.awg: Any = None
         self.scope: Any = None
+        self.awg_idn = ""
         self.scope_idn = ""
         self._last_center_hz = 0.0
         self._last_span_hz = 0.0
         self._trace_unit = ""
 
     def connect(self, config: ScanConfig) -> None:
-        pyvisa = _pyvisa_module()
-        self.disconnect()
+        self.connect_awg(config.awg_resource, config.timeout_ms)
         try:
-            self.rm = pyvisa.ResourceManager()
-            self.awg = self.rm.open_resource(config.awg_resource)
             self.scope = self.rm.open_resource(config.scope_resource)
             timeout_ms = max(1000, int(config.timeout_ms))
-            self.awg.timeout = timeout_ms
             self.scope.timeout = timeout_ms
             try:
                 self.scope_idn = self.scope.query("*IDN?").strip()
@@ -174,6 +213,24 @@ class TektronixVisaClient:
             self.disconnect()
             raise
 
+    def connect_awg(self, resource: str, timeout_ms: int = 10000) -> str:
+        """Open only the AFG, leaving the oscilloscope free for other work."""
+
+        pyvisa = _pyvisa_module()
+        self.disconnect()
+        try:
+            self.rm = pyvisa.ResourceManager()
+            self.awg = self.rm.open_resource(resource)
+            self.awg.timeout = max(1000, int(timeout_ms))
+            try:
+                self.awg_idn = self.awg.query("*IDN?").strip()
+            except Exception:
+                self.awg_idn = resource
+            return self.awg_idn
+        except Exception:
+            self.disconnect()
+            raise
+
     def disconnect(self) -> None:
         for instrument in (self.awg, self.scope):
             if instrument is not None:
@@ -190,6 +247,249 @@ class TektronixVisaClient:
                 pass
         self.rm = None
 
+    def upload_arbitrary_waveform(
+        self, waveform: RectangularRampWaveform
+    ) -> tuple[str, ...]:
+        """Upload and apply an ARB record through AFG1062 edit memory."""
+
+        awg = self._require_awg()
+        verified_warnings: list[str] = []
+        point_count = waveform.point_count
+        if not 2 <= point_count <= AFG1062_MAX_ARB_POINTS:
+            raise ValueError(
+                f"AFG1062 arbitrary records must contain 2 to {AFG1062_MAX_ARB_POINTS} points."
+            )
+        if waveform.effective_sample_rate_sps > AFG1062_MAX_SAMPLE_RATE_SPS + 1e-6:
+            raise ValueError("Waveform exceeds the AFG1062 300 MS/s sample-rate limit.")
+
+        # Turn the channel off while its edit memory and scaling are replaced,
+        # then explicitly return channel 1 to unmodulated continuous-wave mode.
+        awg.write("*CLS")
+        awg.write("OUTPut1:STATe OFF")
+        awg.write("SOURce1:FREQuency:MODE CW")
+        for command in (
+            "SOURce1:AM:STATe OFF",
+            "SOURce1:FM:STATe OFF",
+            "SOURce1:PM:STATe OFF",
+            "SOURce1:ASKey:STATe OFF",
+            "SOURce1:FSKey:STATe OFF",
+            "SOURce1:PSKey:STATe OFF",
+            "SOURce1:PWM:STATe OFF",
+            "SOURce1:BURSt:STATe OFF",
+        ):
+            awg.write(command)
+        awg.query("*OPC?")
+        setup_errors = self._read_awg_errors()
+        if setup_errors:
+            raise RuntimeError(
+                "AFG1062 rejected the pre-upload output setup: "
+                + " | ".join(setup_errors)
+            )
+
+        # AFG1062 edit-memory allocation can be asynchronous. Complete and
+        # verify it before sending the binary block; otherwise some firmware
+        # revisions can retain the previous record (commonly the 10 kpoint
+        # default) and reject or misapply the incoming data.
+        awg.write(f"DATA:POINts EMEMory,{point_count}")
+        awg.query("*OPC?")
+        allocation_errors = self._read_awg_errors()
+        if allocation_errors:
+            raise RuntimeError(
+                "AFG1062 rejected the requested ARB record length: "
+                + " | ".join(allocation_errors)
+            )
+        allocated_points = int(float(awg.query("DATA:POINts? EMEMory").strip()))
+        if allocated_points != point_count:
+            raise RuntimeError(
+                "AFG1062 did not allocate the requested ARB record before upload "
+                f"({allocated_points} points reported, {point_count} requested). "
+                "No waveform data was sent."
+            )
+
+        awg.write_binary_values(
+            "DATA EMEMory,",
+            waveform.dac_codes.tolist(),
+            datatype="H",
+            is_big_endian=True,
+            termination="\n",
+        )
+        awg.query("*OPC?")
+
+        transfer_errors = self._read_awg_errors()
+
+        reported_points = int(float(awg.query("DATA:POINts? EMEMory").strip()))
+        if reported_points != point_count:
+            raise RuntimeError(
+                "AFG1062 changed the ARB record length during binary upload "
+                f"({reported_points} points reported, {point_count} expected; "
+                f"{point_count * 2} data bytes sent)."
+            )
+        # AFG1062 firmware supports binary edit-memory readback. Comparing the
+        # returned DAC record avoids the voltage-unit ambiguity of the scalar
+        # DATA:DATA:VALue? command.
+        try:
+            reported_codes = awg.query_binary_values(
+                "DATA:DATA? EMEMory",
+                datatype="H",
+                is_big_endian=True,
+                container=list,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "AFG1062 ARB readback failed. Install AFG1062 firmware 1.0.3 "
+                "or newer and check the VISA connection."
+            ) from exc
+        expected_codes = waveform.dac_codes.tolist()
+        if reported_codes != expected_codes:
+            mismatch = next(
+                (
+                    index
+                    for index, (reported, expected) in enumerate(
+                        zip(reported_codes, expected_codes), start=1
+                    )
+                    if reported != expected
+                ),
+                min(len(reported_codes), len(expected_codes)) + 1,
+            )
+            raise RuntimeError(
+                "AFG1062 ARB readback did not match the uploaded data "
+                f"(first difference at point {mismatch}; returned "
+                f"{len(reported_codes)} of {point_count} points). Check the "
+                "AFG1062 firmware and VISA connection."
+            )
+        transfer_errors = self._accept_verified_local_warnings(
+            transfer_errors,
+            verified_warnings,
+            "binary transfer",
+        )
+        if transfer_errors:
+            raise RuntimeError(
+                "AFG1062 rejected the ARB data transfer: "
+                + " | ".join(transfer_errors)
+            )
+
+        # FUNCtion (without the optional :SHAPe suffix) follows the AFG1000
+        # programmer manual and selects the AFG1062 edit-memory waveform.
+        awg.write("SOURce1:FUNCtion EMEMory")
+        self.set_awg_offset_v(0.0)
+        self.set_awg_amplitude_vpp(waveform.total_waveform_vpp)
+        self.set_awg_offset_v(waveform.afg_offset_v)
+        self.set_awg_frequency_hz(waveform.arb_repetition_hz)
+        awg.query("*OPC?")
+
+        errors = self._read_awg_errors()
+        self._verify_arbitrary_setup(waveform)
+        errors.extend(self._read_awg_errors())
+        errors = self._accept_verified_local_warnings(
+            errors,
+            verified_warnings,
+            "ARB amplitude/offset/frequency setup",
+        )
+        if errors:
+            raise RuntimeError("AFG1062 rejected the ARB setup: " + " | ".join(errors))
+        awg.write("OUTPut1:STATe ON")
+        awg.query("*OPC?")
+        output_errors = self._read_awg_errors()
+        output_enabled = bool(int(float(awg.query("OUTPut1:STATe?").strip())))
+        output_errors.extend(self._read_awg_errors())
+        if output_enabled:
+            output_errors = self._accept_verified_local_warnings(
+                output_errors,
+                verified_warnings,
+                "output enable",
+            )
+        if output_errors:
+            awg.write("OUTPut1:STATe OFF")
+            raise RuntimeError(
+                "AFG1062 could not enable the ARB output: "
+                + " | ".join(output_errors)
+            )
+        if not output_enabled:
+            raise RuntimeError(
+                "AFG1062 did not enable channel 1; output-state readback remained OFF."
+            )
+        return tuple(verified_warnings)
+
+    @staticmethod
+    def _accept_verified_local_warnings(
+        errors: list[str],
+        warnings: list[str],
+        operation: str,
+    ) -> list[str]:
+        """Demote -201 only after the associated operation was read back."""
+
+        remaining: list[str] = []
+        for error in errors:
+            match = re.match(r"\s*([+-]?\d+)", error)
+            if match is not None and int(match.group(1)) == -201:
+                warnings.append(f"{operation}: {error}")
+            else:
+                remaining.append(error)
+        return remaining
+
+    def _verify_arbitrary_setup(self, waveform: RectangularRampWaveform) -> None:
+        awg = self._require_awg()
+        function = str(awg.query("SOURce1:FUNCtion?")).strip().upper()
+        amplitude_vpp = float(
+            awg.query("SOURce1:VOLTage:LEVel:IMMediate:AMPLitude?").strip()
+        )
+        offset_v = float(
+            awg.query("SOURce1:VOLTage:LEVel:IMMediate:OFFSet?").strip()
+        )
+        frequency_hz = float(awg.query("SOURce1:FREQuency:FIXed?").strip())
+
+        mismatches: list[str] = []
+        if not function.startswith("EMEM"):
+            mismatches.append(f"function={function!r}, expected EMEMory")
+        if not math.isclose(
+            amplitude_vpp,
+            waveform.total_waveform_vpp,
+            rel_tol=5e-6,
+            abs_tol=1.1e-3,
+        ):
+            mismatches.append(
+                f"amplitude={amplitude_vpp:g} Vpp, expected "
+                f"{waveform.total_waveform_vpp:g} Vpp"
+            )
+        if not math.isclose(
+            offset_v,
+            waveform.afg_offset_v,
+            rel_tol=5e-6,
+            abs_tol=1.1e-3,
+        ):
+            mismatches.append(
+                f"offset={offset_v:g} V, expected {waveform.afg_offset_v:g} V"
+            )
+        if not math.isclose(
+            frequency_hz,
+            waveform.arb_repetition_hz,
+            rel_tol=2e-11,
+            abs_tol=1e-6,
+        ):
+            mismatches.append(
+                f"frequency={frequency_hz:g} Hz, expected "
+                f"{waveform.arb_repetition_hz:g} Hz"
+            )
+        if mismatches:
+            raise RuntimeError(
+                "AFG1062 ARB setup readback did not match: "
+                + "; ".join(mismatches)
+            )
+
+    def _read_awg_errors(self) -> list[str]:
+        awg = self._require_awg()
+        errors: list[str] = []
+        for _ in range(16):
+            response = str(awg.query("SYSTem:ERRor:NEXT?")).strip()
+            match = re.match(r"\s*([+-]?\d+)", response)
+            if match is None:
+                errors.append(response or "Unparseable empty error response")
+                break
+            if int(match.group(1)) == 0:
+                break
+            errors.append(response)
+        return errors
+
     def _require_awg(self):
         if self.awg is None:
             raise RuntimeError("AWG is not connected.")
@@ -202,7 +502,8 @@ class TektronixVisaClient:
 
     def configure_awg_output(self, config: ScanConfig) -> None:
         awg = self._require_awg()
-        awg.write("SOURce1:FUNCtion:SHAPe SINusoid")
+        waveform = normalize_awg_waveform(config.awg_waveform)
+        awg.write(f"SOURce1:FUNCtion:SHAPe {waveform}")
         self.set_awg_offset_v(config.awg_offset_v)
         self.set_awg_amplitude_vpp(config.awg_vpp)
         awg.write("OUTPut1:STATe ON")
@@ -394,15 +695,22 @@ class MockClient:
     """Synthetic resonance used for UI development and automated smoke tests."""
 
     def __init__(self) -> None:
+        self.awg_idn = "TEKTRONIX,AFG1062,MOCK,V1.1.0"
         self.current_awg_hz = 0.0
         self.current_awg_vpp = 0.0
         self.current_awg_offset = 0.0
+        self.current_awg_waveform = "SINusoid"
         self.current_center_hz = 0.0
         self.current_span_hz = 0.0
         self.current_rbw_hz = 0.0
+        self.arbitrary_waveform: RectangularRampWaveform | None = None
 
     def connect(self, config: ScanConfig) -> None:
         self.current_awg_hz = 0.0
+
+    def connect_awg(self, resource: str, timeout_ms: int = 10000) -> str:
+        del resource, timeout_ms
+        return self.awg_idn
 
     def disconnect(self) -> None:
         return
@@ -410,6 +718,17 @@ class MockClient:
     def configure_awg_output(self, config: ScanConfig) -> None:
         self.current_awg_vpp = config.awg_vpp
         self.current_awg_offset = config.awg_offset_v
+        self.current_awg_waveform = normalize_awg_waveform(config.awg_waveform)
+
+    def upload_arbitrary_waveform(
+        self, waveform: RectangularRampWaveform
+    ) -> tuple[str, ...]:
+        self.arbitrary_waveform = waveform
+        self.current_awg_hz = waveform.arb_repetition_hz
+        self.current_awg_vpp = waveform.total_waveform_vpp
+        self.current_awg_offset = waveform.afg_offset_v
+        self.current_awg_waveform = RECTANGULAR_RAMP_WAVEFORM
+        return ()
 
     def set_awg_frequency_hz(self, frequency_hz: float) -> None:
         self.current_awg_hz = frequency_hz
@@ -481,6 +800,13 @@ class SpectrumScanner:
 
     @staticmethod
     def _validate_config(config: ScanConfig) -> None:
+        if is_rectangular_ramp_waveform(config.awg_waveform):
+            raise ValueError(
+                "Rectangular + Ramp is a fixed ARB record. Use its Upload / Apply "
+                "button; frequency, amplitude, and offset sweeps remain available "
+                "for the standard waveform modes."
+            )
+        waveform = normalize_awg_waveform(config.awg_waveform)
         if not config.awg_resource.strip() and not config.use_mock:
             raise ValueError("Select an AWG VISA resource.")
         if not config.scope_resource.strip() and not config.use_mock:
@@ -513,6 +839,24 @@ class SpectrumScanner:
             not math.isfinite(config.fixed_frequency_hz) or config.fixed_frequency_hz <= 0
         ):
             raise ValueError("Fixed frequency must be greater than zero.")
+
+        requested_frequency_hz: float | None = None
+        if config.sweep_mode == "frequency":
+            requested_frequency_hz = max(config.total_start_hz, config.total_stop_hz)
+        elif config.sweep_mode in {"amplitude", "offset"}:
+            requested_frequency_hz = config.fixed_frequency_hz
+
+        maximum_frequency_hz = _AFG1062_MAX_FREQUENCY_HZ[waveform]
+        if (
+            requested_frequency_hz is not None
+            and math.isfinite(requested_frequency_hz)
+            and requested_frequency_hz > maximum_frequency_hz
+        ):
+            waveform_label = _AWG_WAVEFORM_LABELS[waveform]
+            raise ValueError(
+                f"AFG1062 {waveform_label} output supports frequencies up to "
+                f"{maximum_frequency_hz:g} Hz."
+            )
 
     def run(
         self,

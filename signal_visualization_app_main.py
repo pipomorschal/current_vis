@@ -7,7 +7,7 @@ from plot_panel_widget import setup_plot_style
 def main():
     setup_plot_style()
     app = QtWidgets.QApplication([])
-    app.setApplicationName("Reusable Signal Visualization App")
+    app.setApplicationName("Signal Visualization App")
     win = MainWindow()
     win.show()
     return app.exec()
