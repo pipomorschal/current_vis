@@ -1,7 +1,9 @@
 numpy
+scipy
 pyqtgraph
 PySide6
 pyvisa
 pyvisa-py
+pyserial
 h5py
 tm_data_types>=0.4.1,<0.5

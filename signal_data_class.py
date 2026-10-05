@@ -12,6 +12,7 @@ class SignalData:
     sampling_rate: float = 1.0
     metadata: dict[str, str] = field(default_factory=dict)
     column_names: tuple[str, str] = ("TIME", "AMPLITUDE")
+    reference: SignalData | None = None
 
     def __post_init__(self):
         self.time = np.asarray(self.time, dtype=float)

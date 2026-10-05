@@ -17,6 +17,10 @@ from rectangular_ramp import (
     RectangularRampSettings,
     generate_rectangular_ramp,
 )
+from serrodyne_dither import (
+    SerrodyneDitherSettings,
+    generate_serrodyne_dither,
+)
 
 
 class RectangularRampGenerationTests(unittest.TestCase):
@@ -261,6 +265,23 @@ class AfgUploadTests(unittest.TestCase):
             fake.commands,
         )
         self.assertEqual(fake.commands[-1], "OUTPut1:STATe ON")
+
+    def test_same_direct_upload_path_accepts_serrodyne_dither(self) -> None:
+        waveform = generate_serrodyne_dither(
+            SerrodyneDitherSettings(dither_frequency_hz=1_000.0, v_pi=-1.2)
+        )
+        fake = _FakeAwg()
+        client = TektronixVisaClient()
+        client.awg = fake
+
+        client.upload_arbitrary_waveform(waveform)
+
+        self.assertEqual(fake.binary_call[0], "DATA EMEMory,")
+        self.assertEqual(fake.binary_call[1], waveform.dac_codes.tolist())
+        self.assertEqual(fake.amplitude_vpp, 2.0 * abs(waveform.settings.v_pi))
+        self.assertEqual(fake.offset_v, 0.0)
+        self.assertEqual(fake.frequency_hz, waveform.arb_repetition_hz)
+        self.assertTrue(fake.output_enabled)
 
     def test_verified_local_warning_allows_negative_slope(self) -> None:
         waveform = generate_rectangular_ramp(

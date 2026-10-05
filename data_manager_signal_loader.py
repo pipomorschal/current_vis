@@ -265,6 +265,22 @@ class DataManager:
             except Exception:
                 pass
 
+        reference = None
+        reference_channel = metadata.get("reference_channel")
+        if reference_channel in header and "REFERENCE_TIME" in header and amplitude_column != reference_channel:
+            ri, ti = header.index(reference_channel), header.index("REFERENCE_TIME")
+            ref_samples = []
+            for row in rows:
+                try:
+                    ref_samples.append((float(row[ti]), float(row[ri])))
+                except (ValueError, IndexError):
+                    continue
+            if ref_samples:
+                ref_time, ref_amp = np.asarray(ref_samples, dtype=float).T
+                reference = SignalData(ref_time, ref_amp, source_name=path.name,
+                                       sampling_rate=cls.estimate_sampling_rate(ref_time),
+                                       column_names=("REFERENCE_TIME", reference_channel))
+
         return SignalData(
             time=time,
             amplitude=amplitude,
@@ -272,6 +288,7 @@ class DataManager:
             sampling_rate=fs,
             metadata=metadata,
             column_names=(time_column, amplitude_column),
+            reference=reference,
         )
 
     @classmethod
@@ -289,6 +306,17 @@ class DataManager:
 
             time_name = time_dataset or cls._to_text(h5.attrs.get("time_dataset", "")) or "time"
             amp_name = amplitude_dataset or cls._to_text(h5.attrs.get("amplitude_dataset", "")) or "amplitude"
+            reference = None
+            if amp_name == "amplitude" and "reference_time" in h5 and "reference_amplitude" in h5:
+                ref_metadata = {}
+                if "reference_metadata" in h5:
+                    ref_metadata = {str(k): cls._to_text(v) for k, v in h5["reference_metadata"].attrs.items()}
+                reference = SignalData(np.asarray(h5["reference_time"], dtype=float),
+                                       np.asarray(h5["reference_amplitude"], dtype=float),
+                                       source_name=source_name,
+                                       sampling_rate=float(h5.attrs.get("reference_sampling_rate", 1)),
+                                       metadata=ref_metadata,
+                                       column_names=("REFERENCE_TIME", cls._to_text(h5.attrs.get("reference_channel", "CH2"))))
             display_time_name = cls._to_text(h5.attrs.get("time_column", time_name)) or time_name
             display_amp_name = cls._to_text(h5.attrs.get("amplitude_column", amp_name)) or amp_name
 
@@ -335,6 +363,7 @@ class DataManager:
                     sampling_rate=fs,
                     metadata=metadata,
                     column_names=(display_time_name, display_amp_name),
+                    reference=reference,
                 )
 
             if "signal" in h5 and isinstance(h5["signal"], h5py.Dataset):
@@ -476,7 +505,7 @@ class DataManager:
         with open(file_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["time", "amplitude"])
-            writer.writerows(zip(data.time.tolist(), data.amplitude.tolist()))
+            writer.writerows(zip(data.time, data.amplitude))
 
     @classmethod
     def save_hdf5(cls, file_path: str, data: SignalData):
@@ -495,6 +524,15 @@ class DataManager:
 
             h5.create_dataset("time", data=np.asarray(data.time, dtype=float), compression="gzip", compression_opts=4)
             h5.create_dataset("amplitude", data=np.asarray(data.amplitude, dtype=float), compression="gzip", compression_opts=4)
+            if data.reference is not None:
+                ref = data.reference
+                h5.create_dataset("reference_time", data=ref.time, compression="gzip", compression_opts=4)
+                h5.create_dataset("reference_amplitude", data=ref.amplitude, compression="gzip", compression_opts=4)
+                h5.attrs["reference_channel"] = ref.column_names[1]
+                h5.attrs["reference_sampling_rate"] = float(ref.sampling_rate)
+                reference_metadata = h5.create_group("reference_metadata")
+                for key, value in ref.metadata.items():
+                    reference_metadata.attrs[str(key)] = cls._to_text(value)
 
             if data.metadata:
                 meta_group = h5.create_group("metadata")
@@ -513,11 +551,20 @@ class DataManager:
             if data.metadata:
                 for key, value in data.metadata.items():
                     writer.writerow([str(key), str(value)])
+            if data.reference is not None and "reference_channel" not in data.metadata:
+                writer.writerow(["reference_channel", data.reference.column_names[1]])
             if data.sampling_rate > 0:
                 writer.writerow(["Sample Interval", f"{1.0 / data.sampling_rate:.16g}"])
 
-            writer.writerow([time_col or "TIME", amp_col])
-            writer.writerows(zip(data.time.tolist(), data.amplitude.tolist()))
+            if data.reference is None:
+                writer.writerow([time_col or "TIME", amp_col])
+                writer.writerows(zip(data.time, data.amplitude))
+            else:
+                ref = data.reference
+                if ref.n_samples != data.n_samples:
+                    raise ValueError("Paired CSV channels must have equal sample counts. Use HDF5 for unequal lengths.")
+                writer.writerow([time_col or "TIME", amp_col, "REFERENCE_TIME", ref.column_names[1]])
+                writer.writerows(zip(data.time, data.amplitude, ref.time, ref.amplitude))
 
     @classmethod
     def save_scope_hdf5(cls, file_path: str, data: SignalData):

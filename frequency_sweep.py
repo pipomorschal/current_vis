@@ -15,8 +15,11 @@ from rectangular_ramp import (
     AFG1062_MAX_SAMPLE_RATE_SPS,
     RectangularRampWaveform,
 )
+from serrodyne_dither import SerrodyneDitherWaveform
 
 RECTANGULAR_RAMP_WAVEFORM = "RECTANGULAR_RAMP"
+SERRODYNE_DITHER_WAVEFORM = "SERRODYNE_DITHER"
+ArbitraryWaveform = RectangularRampWaveform | SerrodyneDitherWaveform
 STANDARD_AWG_WAVEFORM_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Sine", "SINusoid"),
     ("Square", "SQUare"),
@@ -25,6 +28,7 @@ STANDARD_AWG_WAVEFORM_OPTIONS: tuple[tuple[str, str], ...] = (
 AWG_WAVEFORM_OPTIONS: tuple[tuple[str, str], ...] = (
     *STANDARD_AWG_WAVEFORM_OPTIONS,
     ("Rectangular + Ramp", RECTANGULAR_RAMP_WAVEFORM),
+    ("Serrodyne Dither", SERRODYNE_DITHER_WAVEFORM),
 )
 _AWG_WAVEFORM_COMMANDS = {
     command.upper(): command for _label, command in STANDARD_AWG_WAVEFORM_OPTIONS
@@ -50,6 +54,15 @@ def normalize_awg_waveform(value: str) -> str:
 
 def is_rectangular_ramp_waveform(value: str) -> bool:
     return str(value).strip().upper() == RECTANGULAR_RAMP_WAVEFORM
+
+
+def is_serrodyne_dither_waveform(value: str) -> bool:
+    return str(value).strip().upper() == SERRODYNE_DITHER_WAVEFORM
+
+
+def is_arbitrary_waveform(value: str) -> bool:
+    normalized = str(value).strip().upper()
+    return normalized in {RECTANGULAR_RAMP_WAVEFORM, SERRODYNE_DITHER_WAVEFORM}
 
 
 @dataclass
@@ -248,7 +261,7 @@ class TektronixVisaClient:
         self.rm = None
 
     def upload_arbitrary_waveform(
-        self, waveform: RectangularRampWaveform
+        self, waveform: ArbitraryWaveform
     ) -> tuple[str, ...]:
         """Upload and apply an ARB record through AFG1062 edit memory."""
 
@@ -427,7 +440,7 @@ class TektronixVisaClient:
                 remaining.append(error)
         return remaining
 
-    def _verify_arbitrary_setup(self, waveform: RectangularRampWaveform) -> None:
+    def _verify_arbitrary_setup(self, waveform: ArbitraryWaveform) -> None:
         awg = self._require_awg()
         function = str(awg.query("SOURce1:FUNCtion?")).strip().upper()
         amplitude_vpp = float(
@@ -703,7 +716,7 @@ class MockClient:
         self.current_center_hz = 0.0
         self.current_span_hz = 0.0
         self.current_rbw_hz = 0.0
-        self.arbitrary_waveform: RectangularRampWaveform | None = None
+        self.arbitrary_waveform: ArbitraryWaveform | None = None
 
     def connect(self, config: ScanConfig) -> None:
         self.current_awg_hz = 0.0
@@ -721,13 +734,17 @@ class MockClient:
         self.current_awg_waveform = normalize_awg_waveform(config.awg_waveform)
 
     def upload_arbitrary_waveform(
-        self, waveform: RectangularRampWaveform
+        self, waveform: ArbitraryWaveform
     ) -> tuple[str, ...]:
         self.arbitrary_waveform = waveform
         self.current_awg_hz = waveform.arb_repetition_hz
         self.current_awg_vpp = waveform.total_waveform_vpp
         self.current_awg_offset = waveform.afg_offset_v
-        self.current_awg_waveform = RECTANGULAR_RAMP_WAVEFORM
+        self.current_awg_waveform = (
+            SERRODYNE_DITHER_WAVEFORM
+            if isinstance(waveform, SerrodyneDitherWaveform)
+            else RECTANGULAR_RAMP_WAVEFORM
+        )
         return ()
 
     def set_awg_frequency_hz(self, frequency_hz: float) -> None:
@@ -800,9 +817,14 @@ class SpectrumScanner:
 
     @staticmethod
     def _validate_config(config: ScanConfig) -> None:
-        if is_rectangular_ramp_waveform(config.awg_waveform):
+        if is_arbitrary_waveform(config.awg_waveform):
+            waveform_label = (
+                "Serrodyne Dither"
+                if is_serrodyne_dither_waveform(config.awg_waveform)
+                else "Rectangular + Ramp"
+            )
             raise ValueError(
-                "Rectangular + Ramp is a fixed ARB record. Use its Upload / Apply "
+                f"{waveform_label} is a fixed ARB record. Use its Upload / Apply "
                 "button; frequency, amplitude, and offset sweeps remain available "
                 "for the standard waveform modes."
             )

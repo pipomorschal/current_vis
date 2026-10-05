@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
+import time
+import logging
+from logging.handlers import RotatingFileHandler
+import threading
+
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
@@ -9,24 +15,57 @@ from data_manager_signal_loader import DataManager
 from file_preview_dialog import FilePreviewDialog
 from signal_analysis_utils import Analysis
 from signal_data_class import SignalData
-from signal_data_import import OscilloscopeImporter, ScopeCaptureConfig
+from signal_data_import import OscilloscopeImporter, ScopeCaptureConfig, ScopeCommunicationError
 from plot_panel_widget import PlotPanel
-from frequency_sweep_widget import FrequencySweepWidget
+from frequency_sweep_widget import FrequencyInput, FrequencySweepWidget
+from recording_plot_widget import RecordingPlotWidget
+from scope_capture_process import capture_isolated
+from recording_temperatures import read_optional_temperatures
 
 
 class ScopeAcquireWorker(QtCore.QObject):
     finished = QtCore.Signal(object)
     failed = QtCore.Signal(str)
+    communication_failed = QtCore.Signal(str)
 
-    def __init__(self, config: ScopeCaptureConfig):
+    def __init__(
+        self,
+        config: ScopeCaptureConfig,
+        output_path: Path | None = None,
+        extra_metadata: dict[str, str] | None = None,
+        isolated: bool = True,
+    ):
         super().__init__()
         self.config = config
+        self.output_path = output_path
+        self.extra_metadata = dict(extra_metadata or {})
+        self.isolated = isolated
+        self.cancelled = threading.Event()
+
+    def cancel(self):
+        self.cancelled.set()
 
     @QtCore.Slot()
     def run(self):
         try:
-            data = OscilloscopeImporter.capture_channel(self.config)
+            if self.isolated:
+                data = capture_isolated(self.config, self.output_path, self.extra_metadata, self.cancelled)
+            else:
+                data = OscilloscopeImporter.capture_channel(self.config)
+                if self.extra_metadata:
+                    data.metadata.update(self.extra_metadata)
+                data.metadata.update(read_optional_temperatures(self.config))
+                if self.output_path is not None:
+                    if self.output_path.suffix.lower() in {".h5", ".hdf5"}:
+                        DataManager.save_scope_hdf5(str(self.output_path), data)
+                    else:
+                        DataManager.save_scope_csv(str(self.output_path), data)
+        except ScopeCommunicationError as exc:
+            self.communication_failed.emit(str(exc))
+            self.failed.emit(str(exc))
+            return
         except Exception as exc:
+            logging.getLogger("scope_recording").exception("Capture or file save failed")
             self.failed.emit(str(exc))
             return
         self.finished.emit(data)
@@ -103,6 +142,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self._debug_enabled = True
         self._scope_thread: QtCore.QThread | None = None
         self._scope_worker: ScopeAcquireWorker | None = None
+        self._scope_capture_is_logging = False
+        self._scope_logging_active = False
+        self._scope_logging_started_monotonic = 0.0
+        self._scope_logging_deadline_monotonic = 0.0
+        self._scope_logging_capture_started_monotonic = 0.0
+        self._scope_logging_capture_count = 0
+        self._scope_logging_output_dir: Path | None = None
+        self._scope_logging_extension = ".h5"
+        self._scope_logging_session_id = ""
+        self._scope_logging_config: ScopeCaptureConfig | None = None
+        self._scope_logging_finish_message: str | None = None
+        self._scope_logging_current_path: Path | None = None
+        self._scope_logging_failures = 0
+        self._scope_retry_delay = 0.0
+        self._scope_failure_is_communication = False
+        self._scope_log_handler = None
+        self._scope_log_timer = QtCore.QTimer(self)
+        self._scope_log_timer.setSingleShot(True)
         self._demod_thread: QtCore.QThread | None = None
         self._demod_worker: DemodulationWorker | None = None
         self._demod_request_id = 0
@@ -113,6 +170,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_ui()
         self._connect_signals()
+        self._update_scope_logging_ui()
         self._update_demod_scale_toggle_ui()
         self._update_demod_mode_ui()
         self.refresh_all_views()
@@ -135,10 +193,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.freq_plot = PlotPanel("Frequency Domain")
         self.demo_plot = PlotPanel("Demodulation")
         self.sweep_widget = FrequencySweepWidget()
+        self.recording_widget = RecordingPlotWidget()
 
         self.sidebar_stack = QtWidgets.QStackedWidget()
         self.sidebar_stack.addWidget(self.controls)
         self.sidebar_stack.addWidget(self.sweep_widget.control_panel)
+        self.sidebar_stack.addWidget(self.recording_widget.control_panel)
         self.sidebar_stack.setMinimumWidth(340)
         self.sidebar_stack.setMaximumWidth(340)
         self.sidebar_stack.setSizePolicy(
@@ -152,6 +212,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.freq_plot, "Frequency")
         self.tabs.addTab(self.demo_plot, "Demodulation")
         self.tabs.addTab(self.sweep_widget, "Frequency Sweep")
+        self.tabs.addTab(self.recording_widget, "Recordings")
 
         self.statusBar().showMessage("Ready")
         self._build_menu()
@@ -225,15 +286,104 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_scope_acquire = QtWidgets.QPushButton("Acquire Oscilloscope")
         self.btn_scope_save = QtWidgets.QPushButton("Save Last Scope Capture")
         self.btn_scope_save.setEnabled(False)
+
+        self.group_scope_logging = QtWidgets.QGroupBox("Logging Mode")
+        self.group_scope_logging.setCheckable(True)
+        self.group_scope_logging.setChecked(False)
+        scope_log_form = QtWidgets.QFormLayout(self.group_scope_logging)
+        self.spin_scope_log_interval_s = QtWidgets.QDoubleSpinBox()
+        self.spin_scope_log_interval_s.setRange(0.0, 86400.0)
+        self.spin_scope_log_interval_s.setDecimals(3)
+        self.spin_scope_log_interval_s.setSingleStep(0.5)
+        self.spin_scope_log_interval_s.setValue(1.0)
+        self.spin_scope_log_interval_s.setSuffix(" s")
+        self.spin_scope_log_interval_s.setToolTip(
+            "Minimum interval between acquisition start times. If capture and save "
+            "take longer, the next acquisition starts as soon as they finish."
+        )
+        self.spin_scope_log_max_minutes = QtWidgets.QDoubleSpinBox()
+        self.spin_scope_log_max_minutes.setRange(0.01, 10080.0)
+        self.spin_scope_log_max_minutes.setDecimals(2)
+        self.spin_scope_log_max_minutes.setSingleStep(1.0)
+        self.spin_scope_log_max_minutes.setValue(10.0)
+        self.spin_scope_log_max_minutes.setSuffix(" min")
+        self.spin_scope_log_max_minutes.setToolTip(
+            "No new acquisition is started after this total logging time has elapsed."
+        )
+        self.combo_scope_log_format = QtWidgets.QComboBox()
+        self.combo_scope_log_format.addItem("HDF5 (.h5)", ".h5")
+        self.combo_scope_log_format.addItem("CSV (.csv)", ".csv")
+        self.edit_scope_log_folder = QtWidgets.QLineEdit()
+        self.edit_scope_log_folder.setReadOnly(True)
+        self.edit_scope_log_folder.setPlaceholderText("Select an output folder")
+        self.btn_scope_log_folder = QtWidgets.QPushButton("Browse...")
+        scope_log_folder = QtWidgets.QWidget()
+        scope_log_folder_layout = QtWidgets.QHBoxLayout(scope_log_folder)
+        scope_log_folder_layout.setContentsMargins(0, 0, 0, 0)
+        scope_log_folder_layout.setSpacing(6)
+        scope_log_folder_layout.addWidget(self.edit_scope_log_folder, 1)
+        scope_log_folder_layout.addWidget(self.btn_scope_log_folder, 0)
+        self.lbl_scope_logging_status = QtWidgets.QLabel("Logging is off.")
+        self.lbl_scope_logging_status.setWordWrap(True)
+        self.check_scope_log_update_plots = QtWidgets.QCheckBox("Update plots during recording")
+        self.check_scope_log_update_plots.setToolTip(
+            "Off by default to avoid full-resolution FFT and filtering blocking the GUI. "
+            "All recordings are still saved at full resolution.")
+        scope_log_form.addRow(self.check_scope_log_update_plots)
+        scope_log_form.addRow("Interval", self.spin_scope_log_interval_s)
+        scope_log_form.addRow("Maximum Time", self.spin_scope_log_max_minutes)
+        scope_log_form.addRow("File Format", self.combo_scope_log_format)
+        scope_log_form.addRow("Folder", scope_log_folder)
+        self.check_scope_reference = QtWidgets.QCheckBox("Record reference channel")
+        self.combo_scope_reference = QtWidgets.QComboBox()
+        self.combo_scope_reference.addItems(["CH1", "CH2", "CH3", "CH4"])
+        self.combo_scope_reference.setCurrentText("CH2")
+        self.combo_scope_reference.setEnabled(False)
+        self.check_scope_reference.toggled.connect(self.combo_scope_reference.setEnabled)
+        scope_log_form.addRow(self.check_scope_reference)
+        scope_log_form.addRow("Reference channel", self.combo_scope_reference)
+        self.check_itc_temperature = QtWidgets.QCheckBox("Read ITC4005 TEC temperature")
+        self.combo_itc_resource = QtWidgets.QComboBox()
+        self.combo_itc_resource.setEditable(True)
+        self.combo_itc_resource.setEnabled(False)
+        self.combo_itc_resource.lineEdit().setPlaceholderText("USB VISA resource")
+        self.check_itc_temperature.toggled.connect(self.combo_itc_resource.setEnabled)
+        scope_log_form.addRow(self.check_itc_temperature)
+        scope_log_form.addRow("ITC4005 VISA", self.combo_itc_resource)
+        self.check_ambient_temperature = QtWidgets.QCheckBox("Read T4200 ambient temperature")
+        self.edit_t4200_port = QtWidgets.QLineEdit()
+        self.edit_t4200_port.setPlaceholderText("e.g. COM4")
+        self.combo_t4200_channel = QtWidgets.QComboBox()
+        self.combo_t4200_channel.addItems(["A (1)", "B (2)"])
+        self.spin_t4200_float_offset = QtWidgets.QSpinBox()
+        self.spin_t4200_float_offset.setRange(0, 5)
+        self.spin_t4200_float_offset.setValue(1)
+        self.spin_t4200_float_offset.setToolTip(
+            "Position of the 4-byte little-endian float in the 9-byte response. "
+            "Default 1 assumes a one-byte prefix; verify against your T4200 response. "
+            "The raw response is saved as ambient_response_hex.")
+        for widget in (self.edit_t4200_port, self.combo_t4200_channel, self.spin_t4200_float_offset):
+            widget.setEnabled(False)
+            self.check_ambient_temperature.toggled.connect(widget.setEnabled)
+        scope_log_form.addRow(self.check_ambient_temperature)
+        scope_log_form.addRow("T4200 serial port", self.edit_t4200_port)
+        scope_log_form.addRow("T4200 channel", self.combo_t4200_channel)
+        scope_log_form.addRow("T4200 float offset", self.spin_t4200_float_offset)
+        self.lbl_recording_temperatures = QtWidgets.QLabel("")
+        self.lbl_recording_temperatures.setWordWrap(True)
+        scope_log_form.addRow(self.lbl_recording_temperatures)
+        scope_log_form.addRow(self.lbl_scope_logging_status)
+
         self.combo_time_column = QtWidgets.QComboBox()
         self.combo_amplitude_column = QtWidgets.QComboBox()
         form_data.addRow(self.path_edit)
         form_data.addRow(_button_grid(self.btn_browse, self.btn_load, self.btn_demo, self.btn_save_loaded))
         form_data.addRow(QtWidgets.QLabel("Oscilloscope Input"))
         form_data.addRow("Resource", self.combo_scope_resource)
-        form_data.addRow("Channel", self.combo_scope_channel)
+        form_data.addRow("Channel (optical)", self.combo_scope_channel)
         form_data.addRow("Sample Points", self.spin_scope_points)
         form_data.addRow("Timeout", self.spin_scope_timeout_ms)
+        form_data.addRow(self.group_scope_logging)
         form_data.addRow(_button_grid(self.btn_scope_refresh, self.btn_scope_acquire, self.btn_scope_save))
         form_data.addRow("Time Column", self.combo_time_column)
         form_data.addRow("Amplitude Column", self.combo_amplitude_column)
@@ -259,17 +409,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.group_time = QtWidgets.QGroupBox("Time Domain Settings")
         form_time = QtWidgets.QFormLayout(self.group_time)
-        self.spin_time_lowpass_cutoff = QtWidgets.QDoubleSpinBox()
-        self.spin_time_lowpass_cutoff.setRange(0.0, 1e12)
-        self.spin_time_lowpass_cutoff.setDecimals(6)
-        self.spin_time_lowpass_cutoff.setSingleStep(1.0)
-        self.spin_time_lowpass_cutoff.setSuffix(" Hz")
-        self.spin_time_lowpass_cutoff.setSpecialValueText("Off (0 Hz)")
-        self.spin_time_lowpass_cutoff.setValue(0.0)
-        self.spin_time_lowpass_cutoff.setToolTip(
+        self.time_lowpass_input = FrequencyInput(0.0, "Hz", minimum=0.0)
+        self.spin_time_lowpass_cutoff = self.time_lowpass_input.value_spin
+        self.combo_time_lowpass_unit = self.time_lowpass_input.unit_combo
+        self.spin_time_lowpass_cutoff.setSpecialValueText("Off")
+        self.time_lowpass_input.setToolTip(
             "Zero disables the time-domain display filter. FFT and demodulation continue to use raw data."
         )
-        form_time.addRow("Low-pass Cutoff", self.spin_time_lowpass_cutoff)
+        form_time.addRow("Low-pass Cutoff", self.time_lowpass_input)
 
         self.group_fft = QtWidgets.QGroupBox("FFT Settings")
         form_fft = QtWidgets.QFormLayout(self.group_fft)
@@ -285,11 +432,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.group_demod = QtWidgets.QGroupBox("Lock-in Demodulation")
         form_demod = QtWidgets.QFormLayout(self.group_demod)
 
-        self.spin_demod_frequency = QtWidgets.QDoubleSpinBox()
-        self.spin_demod_frequency.setRange(-1e12, 1e12)
-        self.spin_demod_frequency.setDecimals(6)
-        self.spin_demod_frequency.setSingleStep(1.0)
-        self.spin_demod_frequency.setSuffix(" Hz")
+        self.demod_frequency_input = FrequencyInput(0.0, "Hz", minimum=-1e12)
+        self.spin_demod_frequency = self.demod_frequency_input.value_spin
+        self.combo_demod_frequency_unit = self.demod_frequency_input.unit_combo
 
         self.combo_demod_voltage_unit = QtWidgets.QComboBox()
         self.combo_demod_voltage_unit.addItems(["V", "mV"])
@@ -316,11 +461,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.group_lockin = QtWidgets.QGroupBox("Lock-in Settings")
         form_lockin = QtWidgets.QFormLayout(self.group_lockin)
-        self.spin_lockin_lowpass_cutoff = QtWidgets.QDoubleSpinBox()
-        self.spin_lockin_lowpass_cutoff.setRange(1e-9, 1e12)
-        self.spin_lockin_lowpass_cutoff.setDecimals(6)
-        self.spin_lockin_lowpass_cutoff.setValue(1000.0)
-        self.spin_lockin_lowpass_cutoff.setSuffix(" Hz")
+        self.lockin_lowpass_input = FrequencyInput(1.0, "kHz", minimum=1e-9)
+        self.spin_lockin_lowpass_cutoff = self.lockin_lowpass_input.value_spin
+        self.combo_lockin_lowpass_unit = self.lockin_lowpass_input.unit_combo
         self.spin_lockin_lowpass_order = QtWidgets.QSpinBox()
         self.spin_lockin_lowpass_order.setRange(1, 10)
         self.spin_lockin_lowpass_order.setValue(2)
@@ -332,14 +475,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.check_lockin_show_phase_separately.setChecked(False)
         self.check_lockin_skip_transient = QtWidgets.QCheckBox("Skip Transient")
         self.check_lockin_skip_transient.setChecked(True)
-        form_lockin.addRow("Lowpass Cutoff", self.spin_lockin_lowpass_cutoff)
+        form_lockin.addRow("Lowpass Cutoff", self.lockin_lowpass_input)
         form_lockin.addRow("Lowpass Order", self.spin_lockin_lowpass_order)
         form_lockin.addRow(self.check_lockin_use_iq)
         form_lockin.addRow(self.check_lockin_reconstruct_phase)
         form_lockin.addRow(self.check_lockin_show_phase_separately)
         form_lockin.addRow(self.check_lockin_skip_transient)
 
-        form_demod.addRow("Frequency", self.spin_demod_frequency)
+        form_demod.addRow("Frequency", self.demod_frequency_input)
         form_demod.addRow("Raw Data Unit", self.combo_demod_voltage_unit)
         form_demod.addRow("Max Amplitude", self.spin_demod_target_max_amplitude)
         form_demod.addRow("Mode", self.btn_demod_scale_toggle)
@@ -366,6 +509,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         sidebar_forms = (
             form_data,
+            scope_log_form,
             form_range,
             form_time,
             form_fft,
@@ -388,6 +532,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QSizePolicy.Policy.Preferred,
             )
         for editor in content.findChildren(QtWidgets.QWidget):
+            if isinstance(editor.parentWidget(), FrequencyInput) and isinstance(
+                editor, QtWidgets.QComboBox
+            ):
+                continue
             if isinstance(
                 editor,
                 (
@@ -454,8 +602,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_scope_refresh.clicked.connect(self._refresh_scope_resources)
         self.btn_scope_acquire.clicked.connect(self._acquire_scope_data)
         self.btn_scope_save.clicked.connect(self._save_scope_capture)
+        self.btn_scope_log_folder.clicked.connect(self._select_scope_logging_folder)
+        self.group_scope_logging.toggled.connect(self._update_scope_logging_ui)
+        self._scope_log_timer.timeout.connect(self._start_next_scope_log_capture)
         self.btn_apply_range.clicked.connect(self.refresh_all_views)
         self.spin_time_lowpass_cutoff.valueChanged.connect(self._on_time_lowpass_changed)
+        self.combo_time_lowpass_unit.currentTextChanged.connect(self._on_time_lowpass_changed)
 
         self.btn_update_fft.clicked.connect(self._update_frequency_plot)
         self.btn_use_fft_frequency.clicked.connect(self._use_selected_fft_frequency)
@@ -463,10 +615,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_demod_scale_toggle.toggled.connect(self._on_demod_scale_toggled)
         self.combo_demod_voltage_unit.currentIndexChanged.connect(self._on_demod_voltage_unit_changed)
         self.spin_demod_frequency.valueChanged.connect(self._on_demod_settings_changed)
+        self.combo_demod_frequency_unit.currentTextChanged.connect(self._on_demod_settings_changed)
         self.spin_demod_target_max_amplitude.valueChanged.connect(self._on_demod_target_max_changed)
         self.check_lockin_reconstruct_phase.stateChanged.connect(self._on_lockin_reconstruct_mode_changed)
         self.check_lockin_show_phase_separately.stateChanged.connect(self._on_lockin_reconstruct_mode_changed)
         self.spin_lockin_lowpass_cutoff.valueChanged.connect(self._on_demod_settings_changed)
+        self.combo_lockin_lowpass_unit.currentTextChanged.connect(self._on_demod_settings_changed)
         self.spin_lockin_lowpass_order.valueChanged.connect(self._on_demod_settings_changed)
         self.check_lockin_use_iq.stateChanged.connect(self._on_demod_settings_changed)
         self.check_lockin_skip_transient.stateChanged.connect(self._on_demod_settings_changed)
@@ -500,6 +654,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_scope_controls_enabled(self, enabled: bool):
         for control in self._scope_controls():
             control.setEnabled(enabled)
+        self._update_scope_logging_ui()
 
     def _scope_controls(self) -> list[QtWidgets.QWidget]:
         return [
@@ -508,8 +663,44 @@ class MainWindow(QtWidgets.QMainWindow):
             self.combo_scope_channel,
             self.spin_scope_points,
             self.spin_scope_timeout_ms,
+            self.group_scope_logging,
             self.btn_scope_acquire,
         ]
+
+    @QtCore.Slot()
+    def _select_scope_logging_folder(self) -> bool:
+        start_folder = self.edit_scope_log_folder.text().strip()
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select oscilloscope logging folder",
+            start_folder,
+        )
+        if not folder:
+            return False
+        self.edit_scope_log_folder.setText(folder)
+        return True
+
+    @QtCore.Slot()
+    def _update_scope_logging_ui(self, _checked: bool | None = None):
+        logging_selected = self.group_scope_logging.isChecked()
+        if self._scope_logging_active:
+            self.btn_scope_acquire.setText("Stop Logging")
+            self.btn_scope_acquire.setEnabled(True)
+            return
+        if self._scope_capture_is_logging and self._scope_thread is not None:
+            self.btn_scope_acquire.setText("Stopping Logging...")
+            self.btn_scope_acquire.setEnabled(False)
+            return
+
+        self.btn_scope_acquire.setText(
+            "Start Logging" if logging_selected else "Acquire Oscilloscope"
+        )
+        if not logging_selected:
+            self.lbl_scope_logging_status.setText("Logging is off.")
+        elif self.lbl_scope_logging_status.text() == "Logging is off.":
+            self.lbl_scope_logging_status.setText(
+                "Ready. Select a folder, then start logging."
+            )
 
     @QtCore.Slot(bool)
     def _on_sweep_hardware_busy_changed(self, busy: bool):
@@ -529,6 +720,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_sidebar_visibility(self):
         current = self.tabs.currentWidget()
         self.sidebar_stack.setCurrentWidget(
+            self.recording_widget.control_panel if current == self.recording_widget else
             self.sweep_widget.control_panel if current == self.sweep_widget else self.controls
         )
         self.group_data.setVisible(current == self.time_plot)
@@ -540,7 +732,7 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(float)
     def _on_sweep_frequency_selected(self, frequency_hz: float):
         self._selected_fft_frequency = frequency_hz
-        self.spin_demod_frequency.setValue(frequency_hz)
+        self.demod_frequency_input.set_value_hz(frequency_hz)
         self.lbl_selected_freq.setText(f"Selected sweep frequency: {frequency_hz:.6f} Hz")
         self.tabs.setCurrentWidget(self.demo_plot)
         self.statusBar().showMessage(
@@ -651,34 +843,211 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self.combo_scope_resource.addItems(list(resources))
+        selected_itc = self.combo_itc_resource.currentText()
+        self.combo_itc_resource.clear()
+        self.combo_itc_resource.addItems([r for r in resources if r.upper().startswith("USB")])
+        if selected_itc:
+            self.combo_itc_resource.setEditText(selected_itc)
         self.combo_scope_resource.setEnabled(True)
         self.btn_scope_acquire.setEnabled(True)
         self.statusBar().showMessage(f"{len(resources)} VISA-Ressource(n) gefunden", 4000)
 
     def _acquire_scope_data(self):
+        if self._scope_logging_active:
+            self._stop_scope_logging()
+            return
+
         if self._scope_thread is not None:
             QtWidgets.QMessageBox.information(self, "Oszilloskop", "Akquise laeuft bereits.")
             return
 
+        config = self._scope_config_from_controls()
+        if config is None:
+            return
+
+        if self.group_scope_logging.isChecked():
+            self._start_scope_logging(config)
+            return
+
+        self._begin_scope_capture(config)
+
+    def _scope_config_from_controls(self) -> ScopeCaptureConfig | None:
         resource = self.combo_scope_resource.currentText().strip()
         if not resource or resource in {"No VISA resource", "pyvisa not installed"}:
             QtWidgets.QMessageBox.warning(self, "Oszilloskop", "Bitte zuerst eine gueltige VISA-Ressource waehlen.")
-            return
+            return None
 
-        config = ScopeCaptureConfig(
+        reference = None
+        itc_resource = None
+        ambient_port = None
+        if self.group_scope_logging.isChecked():
+            if self.check_scope_reference.isChecked():
+                reference = self.combo_scope_reference.currentText()
+                if reference == self.combo_scope_channel.currentText():
+                    QtWidgets.QMessageBox.warning(self, "Recording", "Optical and reference channels must be different.")
+                    return None
+            if self.check_itc_temperature.isChecked():
+                itc_resource = self.combo_itc_resource.currentText().strip()
+                if not itc_resource or itc_resource == resource:
+                    QtWidgets.QMessageBox.warning(self, "Recording", "Select a separate ITC4005 VISA resource.")
+                    return None
+            if self.check_ambient_temperature.isChecked():
+                ambient_port = self.edit_t4200_port.text().strip()
+                if not ambient_port:
+                    QtWidgets.QMessageBox.warning(self, "Recording", "Enter the T4200 serial port.")
+                    return None
+        return ScopeCaptureConfig(
             resource_name=resource,
             channel=self.combo_scope_channel.currentText().strip(),
             point_count=int(self.spin_scope_points.value()),
             timeout_ms=int(self.spin_scope_timeout_ms.value()),
+            reference_channel=reference,
+            itc4005_resource=itc_resource,
+            t4200_port=ambient_port,
+            t4200_channel=self.combo_t4200_channel.currentIndex() + 1,
+            t4200_float_offset=self.spin_t4200_float_offset.value(),
         )
 
-        self._scope_worker = ScopeAcquireWorker(config)
+    def _start_scope_logging(self, config: ScopeCaptureConfig):
+        if not self.edit_scope_log_folder.text().strip():
+            if not self._select_scope_logging_folder():
+                return
+
+        output_dir = Path(self.edit_scope_log_folder.text().strip())
+        if not output_dir.is_dir():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Oscilloscope Logging",
+                "Please select an existing output folder.",
+            )
+            return
+
+        started_at = datetime.now().astimezone()
+        self._scope_logging_active = True
+        self._scope_logging_started_monotonic = time.monotonic()
+        self._scope_logging_deadline_monotonic = (
+            self._scope_logging_started_monotonic
+            + float(self.spin_scope_log_max_minutes.value()) * 60.0
+        )
+        self._scope_logging_capture_count = 0
+        self._scope_logging_capture_started_monotonic = 0.0
+        self._scope_logging_output_dir = output_dir
+        self._scope_logging_extension = str(
+            self.combo_scope_log_format.currentData() or ".h5"
+        )
+        self._scope_logging_session_id = started_at.isoformat(timespec="milliseconds")
+        self._scope_logging_config = config
+        self._scope_logging_finish_message = None
+        self._scope_logging_current_path = None
+
+        self._scope_logging_failures = 0
+        self._scope_retry_delay = 0.0
+        logger = logging.getLogger("scope_recording")
+        logger.setLevel(logging.INFO)
+        try:
+            self._scope_log_handler = RotatingFileHandler(
+                output_dir / "scope_recording.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+            self._scope_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            logger.addHandler(self._scope_log_handler)
+        except OSError as exc:
+            self._scope_logging_active = False
+            QtWidgets.QMessageBox.warning(self, "Oscilloscope Logging", f"Cannot create diagnostic log: {exc}")
+            return
+        logger.info("Recording started: resource=%s channel=%s points=%s timeout_ms=%s interval_s=%s",
+                    config.resource_name, config.channel, config.point_count, config.timeout_ms,
+                    self.spin_scope_log_interval_s.value())
+        logger.info("Optional inputs: reference=%s ITC4005=%s T4200=%s channel=%s float_offset=%s",
+                    config.reference_channel, config.itc4005_resource, config.t4200_port,
+                    config.t4200_channel, config.t4200_float_offset)
+        self.lbl_recording_temperatures.clear()
+
+        self._set_scope_controls_enabled(False)
+        self.sweep_widget.set_external_hardware_busy(True)
+        self.lbl_scope_logging_status.setText("Logging started; acquiring first capture...")
+        self.statusBar().showMessage("Oscilloscope logging started.", 3000)
+        self._start_next_scope_log_capture()
+
+    @QtCore.Slot()
+    def _start_next_scope_log_capture(self):
+        if not self._scope_logging_active or self._scope_thread is not None:
+            return
+        if time.monotonic() >= self._scope_logging_deadline_monotonic:
+            self._finish_scope_logging(self._scope_logging_complete_message())
+            return
+        if self._scope_logging_config is None or self._scope_logging_output_dir is None:
+            self._finish_scope_logging("Logging stopped because its configuration was lost.")
+            return
+
+        capture_index = self._scope_logging_capture_count + 1
+        captured_at = datetime.now().astimezone()
+        self._scope_logging_capture_started_monotonic = time.monotonic()
+        output_path = self._next_scope_logging_path(
+            self._scope_logging_output_dir,
+            captured_at,
+            self._scope_logging_config.channel,
+            capture_index,
+            self._scope_logging_extension,
+        )
+        metadata = {
+            "logging_mode": "true",
+            "logging_session_started_at": self._scope_logging_session_id,
+            "logging_capture_started_at": captured_at.isoformat(timespec="milliseconds"),
+            "logging_capture_index": str(capture_index),
+            "logging_interval_seconds": f"{self.spin_scope_log_interval_s.value():.9g}",
+            "logging_maximum_minutes": f"{self.spin_scope_log_max_minutes.value():.9g}",
+            "logging_output_file": output_path.name,
+        }
+        self._scope_logging_current_path = output_path
+        self.lbl_scope_logging_status.setText(
+            f"Acquiring capture {capture_index}..."
+        )
+        self._begin_scope_capture(
+            self._scope_logging_config,
+            output_path=output_path,
+            extra_metadata=metadata,
+            is_logging=True,
+        )
+
+    @staticmethod
+    def _next_scope_logging_path(
+        output_dir: Path,
+        captured_at: datetime,
+        channel: str,
+        capture_index: int,
+        extension: str,
+    ) -> Path:
+        safe_channel = "".join(
+            character if character.isalnum() else "_" for character in channel
+        ).strip("_") or "channel"
+        extension = extension if extension.startswith(".") else f".{extension}"
+        timestamp = captured_at.strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        stem = f"scope_{timestamp}_{safe_channel}_{capture_index:06d}"
+        candidate = output_dir / f"{stem}{extension}"
+        collision_index = 1
+        while candidate.exists():
+            candidate = output_dir / f"{stem}_{collision_index:02d}{extension}"
+            collision_index += 1
+        return candidate
+
+    def _begin_scope_capture(
+        self,
+        config: ScopeCaptureConfig,
+        *,
+        output_path: Path | None = None,
+        extra_metadata: dict[str, str] | None = None,
+        is_logging: bool = False,
+    ):
+        self._scope_capture_is_logging = is_logging
+        self._scope_failure_is_communication = False
+        logging.getLogger("scope_recording").info("Starting capture: %s", output_path or "manual acquisition")
+        self._scope_worker = ScopeAcquireWorker(config, output_path, extra_metadata)
         self._scope_thread = QtCore.QThread(self)
         self._scope_worker.moveToThread(self._scope_thread)
 
         self._scope_thread.started.connect(self._scope_worker.run)
         self._scope_worker.finished.connect(self._on_scope_capture_finished)
         self._scope_worker.failed.connect(self._on_scope_capture_failed)
+        self._scope_worker.communication_failed.connect(self._on_scope_communication_failed)
         self._scope_worker.finished.connect(self._scope_thread.quit)
         self._scope_worker.failed.connect(self._scope_thread.quit)
         self._scope_worker.finished.connect(self._scope_worker.deleteLater)
@@ -688,8 +1057,59 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._set_scope_controls_enabled(False)
         self.sweep_widget.set_external_hardware_busy(True)
-        self.statusBar().showMessage("Oszilloskop-Akquise gestartet...", 3000)
+        if not is_logging:
+            self.statusBar().showMessage("Oszilloskop-Akquise gestartet...", 3000)
         self._scope_thread.start()
+
+    def _stop_scope_logging(self):
+        if not self._scope_logging_active:
+            return
+        self._scope_logging_active = False
+        self._scope_log_timer.stop()
+        if self._scope_thread is not None:
+            if self._scope_worker is not None:
+                self._scope_worker.cancel()
+            self.lbl_scope_logging_status.setText(
+                "Stopping the current acquisition..."
+            )
+            self.statusBar().showMessage(
+                "Oscilloscope logging is stopping.", 4000
+            )
+            self._update_scope_logging_ui()
+            return
+        self._finish_scope_logging(self._scope_logging_stopped_message())
+
+    def _scope_logging_complete_message(self) -> str:
+        folder = str(self._scope_logging_output_dir or "")
+        return (
+            f"Logging finished: {self._scope_logging_capture_count} capture(s) "
+            f"saved in {folder}."
+        )
+
+    def _scope_logging_stopped_message(self) -> str:
+        folder = str(self._scope_logging_output_dir or "")
+        return (
+            f"Logging stopped: {self._scope_logging_capture_count} capture(s) "
+            f"saved in {folder}."
+        )
+
+    def _finish_scope_logging(self, message: str):
+        logger = logging.getLogger("scope_recording")
+        logger.info(message)
+        if self._scope_log_handler is not None:
+            logger.removeHandler(self._scope_log_handler)
+            self._scope_log_handler.close()
+            self._scope_log_handler = None
+        self._scope_log_timer.stop()
+        self._scope_logging_active = False
+        self._scope_capture_is_logging = False
+        self._scope_logging_config = None
+        self._scope_logging_current_path = None
+        self._scope_logging_finish_message = None
+        self._set_scope_controls_enabled(True)
+        self.sweep_widget.set_external_hardware_busy(False)
+        self.lbl_scope_logging_status.setText(message)
+        self.statusBar().showMessage(message, 8000)
 
     @QtCore.Slot(object)
     def _on_scope_capture_finished(self, data: SignalData):
@@ -697,25 +1117,103 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_scope_save.setEnabled(True)
         self.btn_save_loaded.setEnabled(True)
 
-        self.data = data
-        self._sync_column_choices_from_data()
-        self._range_initialized = False
-        self.refresh_all_views()
-        self.tabs.setCurrentWidget(self.time_plot)
-        self._update_sidebar_visibility()
-        self.statusBar().showMessage("Oszilloskop-Daten eingelesen", 5000)
+        if not self._scope_capture_is_logging or self.check_scope_log_update_plots.isChecked():
+            self.data = data
+            self._sync_column_choices_from_data()
+            self._range_initialized = False
+            self.refresh_all_views()
+            self.tabs.setCurrentWidget(self.time_plot)
+            self._update_sidebar_visibility()
+        if self._scope_capture_is_logging:
+            self._scope_logging_failures = 0
+            self._scope_retry_delay = 0.0
+            self._scope_logging_capture_count += 1
+            saved_path = self._scope_logging_current_path
+            saved_name = saved_path.name if saved_path is not None else "capture"
+            readings = []
+            for prefix, label in (("tec", "TEC"), ("ambient", "Ambient")):
+                if data.metadata.get(f"{prefix}_temperature_status") == "ok":
+                    readings.append(f"{label}: {float(data.metadata[f'{prefix}_temperature']):.3f} °C")
+                elif data.metadata.get(f"{prefix}_temperature_status") == "error":
+                    readings.append(f"{label}: reading failed (see log)")
+            self.lbl_recording_temperatures.setText(" | ".join(readings))
+            logging.getLogger("scope_recording").info("Saved %s (%s samples)", saved_name, data.n_samples)
+            self.lbl_scope_logging_status.setText(
+                f"Saved capture {self._scope_logging_capture_count}: {saved_name}"
+            )
+            self.statusBar().showMessage(
+                f"Oscilloscope logging saved {saved_name}", 5000
+            )
+        else:
+            self.statusBar().showMessage("Oszilloskop-Daten eingelesen", 5000)
+
+    @QtCore.Slot(str)
+    def _on_scope_communication_failed(self, message: str):
+        self._scope_failure_is_communication = True
 
     @QtCore.Slot(str)
     def _on_scope_capture_failed(self, message: str):
+        if self._scope_capture_is_logging:
+            self._scope_logging_failures += 1
+            if self._scope_logging_active and self._scope_failure_is_communication and self._scope_logging_failures <= 3:
+                self._scope_retry_delay = min(30.0, 5.0 * 2 ** (self._scope_logging_failures - 1))
+                text = (f"Communication failed: {message}. Reconnecting in {self._scope_retry_delay:g} s "
+                        f"(retry {self._scope_logging_failures}/3).")
+                logging.getLogger("scope_recording").warning(text)
+                self.lbl_scope_logging_status.setText(text)
+                self.statusBar().showMessage(text)
+                return
+            self._scope_logging_active = False
+            self._scope_log_timer.stop()
+            self._scope_logging_finish_message = (
+                f"Logging stopped after {self._scope_logging_capture_count} saved "
+                f"capture(s): {message}"
+            )
+            logging.getLogger("scope_recording").error(self._scope_logging_finish_message)
+            self.lbl_scope_logging_status.setText(self._scope_logging_finish_message)
+            self.statusBar().showMessage(self._scope_logging_finish_message)
+            return
         QtWidgets.QMessageBox.critical(self, "Oszilloskop Fehler", message)
         self.statusBar().showMessage("Oszilloskop-Akquise fehlgeschlagen", 5000)
 
     @QtCore.Slot()
     def _on_scope_thread_finished(self):
+        was_logging = self._scope_capture_is_logging
         self._scope_thread = None
         self._scope_worker = None
-        self._set_scope_controls_enabled(True)
-        self.sweep_widget.set_external_hardware_busy(False)
+        self._scope_logging_current_path = None
+
+        if not was_logging:
+            self._set_scope_controls_enabled(True)
+            self.sweep_widget.set_external_hardware_busy(False)
+            return
+
+        self._scope_capture_is_logging = False
+        if not self._scope_logging_active:
+            message = (
+                self._scope_logging_finish_message
+                or self._scope_logging_stopped_message()
+            )
+            self._finish_scope_logging(message)
+            return
+
+        now = time.monotonic()
+        interval_seconds = float(self.spin_scope_log_interval_s.value())
+        capture_elapsed = max(
+            0.0, now - self._scope_logging_capture_started_monotonic
+        )
+        delay_seconds = max(self._scope_retry_delay, interval_seconds - capture_elapsed, 0.0)
+        if now + delay_seconds >= self._scope_logging_deadline_monotonic:
+            self._finish_scope_logging(self._scope_logging_complete_message())
+            return
+
+        delay_ms = max(0, int(round(delay_seconds * 1000.0)))
+        self.lbl_scope_logging_status.setText(
+            f"{self._scope_logging_capture_count} capture(s) saved. "
+            f"Next acquisition in {delay_seconds:.3g} s."
+        )
+        self._scope_log_timer.start(delay_ms)
+        self._update_scope_logging_ui()
 
     def _save_scope_capture(self):
         if self._last_scope_data is None or self._last_scope_data.n_samples == 0:
@@ -980,7 +1478,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         scale = self._time_unit_scale()
         x = self.selected_data.time / scale
-        cutoff_hz = float(self.spin_time_lowpass_cutoff.value())
+        cutoff_hz = self.time_lowpass_input.value_hz()
         y = Analysis.lowpass_filter(self.selected_data, cutoff_hz=cutoff_hz)
 
         self.time_plot.set_pen(pg.mkPen("b", width=1.2))
@@ -1063,7 +1561,7 @@ class MainWindow(QtWidgets.QMainWindow):
         selected_freq = float(xf[idx])
 
         self._selected_fft_frequency = selected_freq
-        self.spin_demod_frequency.setValue(selected_freq)
+        self.demod_frequency_input.set_value_hz(selected_freq)
         self.lbl_selected_freq.setText(f"Selected FFT frequency: {selected_freq:.6f} Hz")
         self.statusBar().showMessage(f"Selected frequency: {selected_freq:.6f} Hz", 3000)
         self._debug(f"Clicked FFT frequency selected: {selected_freq:.6f} Hz")
@@ -1073,7 +1571,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "Frequency", "No FFT frequency selected yet.")
             return
 
-        self.spin_demod_frequency.setValue(self._selected_fft_frequency)
+        self.demod_frequency_input.set_value_hz(self._selected_fft_frequency)
         self.lbl_selected_freq.setText(f"Selected FFT frequency: {self._selected_fft_frequency:.6f} Hz")
         self.tabs.setCurrentWidget(self.demo_plot)
 
@@ -1181,8 +1679,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _demodulation_config(self) -> dict:
         return {
-            "reference_frequency": float(self.spin_demod_frequency.value()),
-            "lowpass_cutoff_hz": float(self.spin_lockin_lowpass_cutoff.value()),
+            "reference_frequency": self.demod_frequency_input.value_hz(),
+            "lowpass_cutoff_hz": self.lockin_lowpass_input.value_hz(),
             "lowpass_order": int(self.spin_lockin_lowpass_order.value()),
             "use_iq": self.check_lockin_use_iq.isChecked(),
             "skip_transient": self.check_lockin_skip_transient.isChecked(),
@@ -1192,12 +1690,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_demod_controls_enabled(self, enabled: bool):
         controls = [
-            self.spin_demod_frequency,
+            self.demod_frequency_input,
             self.btn_demod_scale_toggle,
             self.spin_demod_target_max_amplitude,
             self.btn_use_fft_frequency,
             self.btn_update_demod,
-            self.spin_lockin_lowpass_cutoff,
+            self.lockin_lowpass_input,
             self.spin_lockin_lowpass_order,
             self.check_lockin_use_iq,
             self.check_lockin_reconstruct_phase,
@@ -1371,6 +1869,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_scope_resources()
 
     def closeEvent(self, event: QtGui.QCloseEvent):
+        if not self.recording_widget.shutdown():
+            self.statusBar().showMessage("Recording analysis is stopping. Close again when it has finished.")
+            event.ignore()
+            return
+        if self._scope_logging_active:
+            self._stop_scope_logging()
+        if self._scope_thread is not None:
+            if self._scope_worker is not None:
+                self._scope_worker.cancel()
+            QtWidgets.QMessageBox.information(
+                self,
+                "Oscilloscope Acquisition",
+                "The current oscilloscope capture is stopping. Close the "
+                "application again after it has stopped.",
+            )
+            event.ignore()
+            return
         if not self.sweep_widget.shutdown():
             QtWidgets.QMessageBox.information(
                 self,

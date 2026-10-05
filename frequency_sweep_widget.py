@@ -10,14 +10,16 @@ import pyqtgraph.exporters
 
 from frequency_sweep import (
     AWG_WAVEFORM_OPTIONS,
+    ArbitraryWaveform,
     MeasurementPoint,
     MockClient,
-    RECTANGULAR_RAMP_WAVEFORM,
     ScanConfig,
     SpectrumScanner,
     TektronixVisaClient,
     inspect_visa_resources,
+    is_arbitrary_waveform,
     is_rectangular_ramp_waveform,
+    is_serrodyne_dither_waveform,
     list_visa_resources,
 )
 from plot_panel_widget import PlotPanel
@@ -26,6 +28,11 @@ from rectangular_ramp import (
     RectangularRampSettings,
     RectangularRampWaveform,
     generate_rectangular_ramp,
+)
+from serrodyne_dither import (
+    SerrodyneDitherSettings,
+    SerrodyneDitherWaveform,
+    generate_serrodyne_dither,
 )
 
 
@@ -70,6 +77,16 @@ class FrequencyInput(QtWidgets.QWidget):
         self.unit_combo = QtWidgets.QComboBox()
         self.unit_combo.addItems(list(self.UNIT_FACTORS))
         self.unit_combo.setCurrentText(unit)
+        self.unit_combo.setMinimumWidth(64)
+        self.unit_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self.unit_combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Minimum,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self._unit_factor = self.UNIT_FACTORS[unit]
+        self.unit_combo.currentTextChanged.connect(self._convert_displayed_unit)
         layout.addWidget(self.value_spin, 1)
         layout.addWidget(self.unit_combo, 0)
         self.setMinimumWidth(0)
@@ -79,6 +96,61 @@ class FrequencyInput(QtWidgets.QWidget):
         )
 
     def value_hz(self) -> float:
+        return float(self.value_spin.value()) * self.UNIT_FACTORS[self.unit_combo.currentText()]
+
+    def set_value_hz(self, value_hz: float) -> None:
+        factor = self.UNIT_FACTORS[self.unit_combo.currentText()]
+        self.value_spin.setValue(float(value_hz) / factor)
+
+    @QtCore.Slot(str)
+    def _convert_displayed_unit(self, unit: str) -> None:
+        """Change the prefix without changing the represented frequency."""
+        value_hz = float(self.value_spin.value()) * self._unit_factor
+        self._unit_factor = self.UNIT_FACTORS[unit]
+        blocker = QtCore.QSignalBlocker(self.value_spin)
+        self.value_spin.setValue(value_hz / self._unit_factor)
+        del blocker
+
+
+class TimeInput(QtWidgets.QWidget):
+    UNIT_FACTORS = {"ns": 1e-9, "us": 1e-6, "ms": 1e-3, "s": 1.0}
+
+    def __init__(self, value: float, unit: str = "us", parent=None):
+        super().__init__(parent)
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.value_spin = QtWidgets.QDoubleSpinBox()
+        self.value_spin.setRange(0.0, 1e12)
+        self.value_spin.setDecimals(9)
+        self.value_spin.setValue(value)
+        self.value_spin.setKeyboardTracking(False)
+        self.value_spin.setMinimumWidth(0)
+        self.value_spin.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self.unit_combo = QtWidgets.QComboBox()
+        self.unit_combo.addItems(list(self.UNIT_FACTORS))
+        self.unit_combo.setCurrentText(unit)
+        self.unit_combo.setMinimumWidth(64)
+        self.unit_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self.unit_combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Minimum,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        layout.addWidget(self.value_spin, 1)
+        layout.addWidget(self.unit_combo, 0)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+
+    def value_s(self) -> float:
         return float(self.value_spin.value()) * self.UNIT_FACTORS[self.unit_combo.currentText()]
 
 
@@ -120,7 +192,7 @@ class ArbitraryUploadWorker(QtCore.QObject):
         self,
         resource: str,
         timeout_ms: int,
-        waveform: RectangularRampWaveform,
+        waveform: ArbitraryWaveform,
         use_mock: bool,
     ):
         super().__init__()
@@ -167,7 +239,10 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         self._scan_worker: SweepWorker | None = None
         self._upload_thread: QtCore.QThread | None = None
         self._upload_worker: ArbitraryUploadWorker | None = None
-        self._arb_waveform: RectangularRampWaveform | None = None
+        self._arb_waveform: ArbitraryWaveform | None = None
+        self._rectangular_ramp_waveform: RectangularRampWaveform | None = None
+        self._serrodyne_dither_waveform: SerrodyneDitherWaveform | None = None
+        self._upload_mode_label = "Arbitrary waveform"
         self._points: list[MeasurementPoint] = []
         self._active_mode = "frequency"
         self._expected_points = 0
@@ -176,8 +251,9 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         self._build_ui()
         self._connect_signals()
         self._update_mode_controls()
-        self._update_waveform_controls()
         self._update_rectangular_ramp_preview()
+        self._update_serrodyne_dither_preview()
+        self._update_waveform_controls()
         self._update_plot_axes()
 
     @property
@@ -239,8 +315,8 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         self.awg_waveform.setCurrentIndex(0)
         self.awg_waveform.setToolTip(
             "AFG1062 frequency-sweep carrier. Limits: Sine 60 MHz, "
-            "Square 30 MHz, Ramp 2 MHz. Rectangular + Ramp is generated "
-            "as a directly uploaded arbitrary waveform."
+            "Square 30 MHz, Ramp 2 MHz. Rectangular + Ramp and Serrodyne "
+            "Dither are generated as directly uploaded arbitrary waveforms."
         )
         self.awg_vpp = self._double_spin(2.7, 0.0, 1000.0, 6, " Vpp")
         self.awg_offset = self._double_spin(0.0, -1000.0, 1000.0, 6, " V")
@@ -409,6 +485,94 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         arb_form.addRow(self.arb_input_note)
         arb_form.addRow(self.upload_arb_button)
 
+        self.serrodyne_group = QtWidgets.QGroupBox("Serrodyne Dither ARB")
+        serrodyne_form = QtWidgets.QFormLayout(self.serrodyne_group)
+        self.serrodyne_center_frequency = FrequencyInput(
+            250.0, "kHz", minimum=1e-9
+        )
+        self.serrodyne_center_frequency.setToolTip(
+            "Center repetition frequency f_Q of the serrodyne sawtooth."
+        )
+        self.serrodyne_deviation = FrequencyInput(8.0, "kHz", minimum=0.0)
+        self.serrodyne_deviation.setToolTip(
+            "Peak frequency deviation. This modulates the sawtooth phase increment, "
+            "not the output voltage additively."
+        )
+        self.serrodyne_dither_frequency = FrequencyInput(
+            7.3, "Hz", minimum=1e-9
+        )
+        self.serrodyne_dither_frequency.setToolTip(
+            "Slow sinusoidal dither frequency f_d."
+        )
+        self.serrodyne_v_pi = self._double_spin(1.2, -10.0, 10.0, 6, " V")
+        self.serrodyne_v_pi.setToolTip(
+            "Signed EOM half-wave voltage: positive produces a rising sawtooth, "
+            "negative produces a falling sawtooth. The AFG amplitude is applied "
+            "as the positive magnitude 2*abs(V_pi)."
+        )
+        self.serrodyne_dither_periods = QtWidgets.QSpinBox()
+        self.serrodyne_dither_periods.setRange(1, 1000)
+        self.serrodyne_dither_periods.setValue(1)
+        self.serrodyne_dither_periods.setSuffix(" periods")
+        self.serrodyne_dither_periods.setToolTip(
+            "Integer number of slow dither periods stored in the repeating ARB record."
+        )
+        self.serrodyne_optical_delay = TimeInput(0.0, "us")
+        self.serrodyne_optical_delay.setToolTip(
+            "Optional optical delay tau. Leave at zero when unavailable."
+        )
+
+        self.serrodyne_frequency_range_value = QtWidgets.QLabel("—")
+        self.serrodyne_amplitude_value = QtWidgets.QLabel("—")
+        self.serrodyne_beta_value = QtWidgets.QLabel("—")
+        self.serrodyne_duration_value = QtWidgets.QLabel("—")
+        self.serrodyne_arb_repetition_value = QtWidgets.QLabel("—")
+        self.serrodyne_sample_rate_value = QtWidgets.QLabel("—")
+        self.serrodyne_points_value = QtWidgets.QLabel("—")
+        self.serrodyne_density_value = QtWidgets.QLabel("—")
+        for label in (
+            self.serrodyne_frequency_range_value,
+            self.serrodyne_amplitude_value,
+            self.serrodyne_beta_value,
+            self.serrodyne_duration_value,
+            self.serrodyne_arb_repetition_value,
+            self.serrodyne_sample_rate_value,
+            self.serrodyne_points_value,
+            self.serrodyne_density_value,
+        ):
+            label.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            label.setWordWrap(True)
+        self.upload_serrodyne_button = QtWidgets.QPushButton("Upload / Apply")
+        self.upload_serrodyne_button.setToolTip(
+            "Generate the phase-accumulated record, upload it directly to AFG1062 "
+            "edit memory, and apply 2*abs(V_pi) amplitude with zero DC offset."
+        )
+        self.serrodyne_input_note = QtWidgets.QLabel(
+            "Pure wrapped-phase sawtooth: the slow sine changes repetition "
+            "frequency only; no low-frequency sine voltage is added."
+        )
+        self.serrodyne_input_note.setWordWrap(True)
+        self.serrodyne_input_note.setStyleSheet("color: #245b78;")
+
+        serrodyne_form.addRow("Center Frequency f_Q", self.serrodyne_center_frequency)
+        serrodyne_form.addRow("Frequency Deviation", self.serrodyne_deviation)
+        serrodyne_form.addRow("Dither Frequency f_d", self.serrodyne_dither_frequency)
+        serrodyne_form.addRow("Signed V_pi", self.serrodyne_v_pi)
+        serrodyne_form.addRow("Dither Record Length", self.serrodyne_dither_periods)
+        serrodyne_form.addRow("Optical Delay tau", self.serrodyne_optical_delay)
+        serrodyne_form.addRow("Frequency Range", self.serrodyne_frequency_range_value)
+        serrodyne_form.addRow("Amplitude / Direction", self.serrodyne_amplitude_value)
+        serrodyne_form.addRow("Phase Dither beta_d", self.serrodyne_beta_value)
+        serrodyne_form.addRow("Record Duration", self.serrodyne_duration_value)
+        serrodyne_form.addRow("ARB Repetition", self.serrodyne_arb_repetition_value)
+        serrodyne_form.addRow("Effective Sample Rate", self.serrodyne_sample_rate_value)
+        serrodyne_form.addRow("Record Samples", self.serrodyne_points_value)
+        serrodyne_form.addRow("Samples / Fast Cycle", self.serrodyne_density_value)
+        serrodyne_form.addRow(self.serrodyne_input_note)
+        serrodyne_form.addRow(self.upload_serrodyne_button)
+
         output_group = QtWidgets.QGroupBox("Run and Output")
         output_form = QtWidgets.QFormLayout(output_group)
         self.mock_mode = QtWidgets.QCheckBox("Mock (no hardware)")
@@ -457,6 +621,7 @@ class FrequencySweepWidget(QtWidgets.QWidget):
             amplitude_form,
             offset_form,
             arb_form,
+            serrodyne_form,
             output_form,
         )
         for form in sidebar_forms:
@@ -468,7 +633,13 @@ class FrequencySweepWidget(QtWidgets.QWidget):
             )
             form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
 
-        sidebar_groups = (instrument_group, scan_group, self.arb_group, output_group)
+        sidebar_groups = (
+            instrument_group,
+            scan_group,
+            self.arb_group,
+            self.serrodyne_group,
+            output_group,
+        )
         for group in sidebar_groups:
             group.setMinimumWidth(0)
             group.setSizePolicy(
@@ -481,8 +652,9 @@ class FrequencySweepWidget(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Policy.Preferred,
         )
         for editor in control_content.findChildren(QtWidgets.QWidget):
-            if isinstance(editor.parentWidget(), FrequencyInput) and isinstance(
-                editor, QtWidgets.QComboBox
+            if (
+                isinstance(editor.parentWidget(), (FrequencyInput, TimeInput))
+                and isinstance(editor, QtWidgets.QComboBox)
             ):
                 continue
             if isinstance(
@@ -508,10 +680,16 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         control_layout.addWidget(instrument_group)
         control_layout.addWidget(scan_group)
         control_layout.addWidget(self.arb_group)
+        control_layout.addWidget(self.serrodyne_group)
         control_layout.addWidget(output_group)
         control_layout.addStretch(1)
 
-        self._settings_groups = (instrument_group, scan_group, self.arb_group)
+        self._settings_groups = (
+            instrument_group,
+            scan_group,
+            self.arb_group,
+            self.serrodyne_group,
+        )
         self.control_panel = QtWidgets.QScrollArea()
         self.control_panel.setWidgetResizable(True)
         self.control_panel.setWidget(control_content)
@@ -561,6 +739,50 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         arb_preview_layout.addWidget(self.arb_reset_description)
         self.arb_preview_group.setMinimumHeight(280)
 
+        self.serrodyne_preview_group = QtWidgets.QGroupBox(
+            "Serrodyne Dither — Phase-Accumulated ARB Record"
+        )
+        serrodyne_preview_layout = QtWidgets.QVBoxLayout(
+            self.serrodyne_preview_group
+        )
+        self.serrodyne_voltage_plot = pg.PlotWidget()
+        self.serrodyne_frequency_plot = pg.PlotWidget()
+        for plot in (
+            self.serrodyne_voltage_plot,
+            self.serrodyne_frequency_plot,
+        ):
+            plot.setBackground("w")
+            plot.showGrid(x=True, y=True, alpha=0.3)
+            for axis_name in ("left", "bottom"):
+                axis = plot.getAxis(axis_name)
+                axis.setPen(pg.mkPen("k"))
+                axis.setTextPen(pg.mkPen("k"))
+        self.serrodyne_voltage_plot.setLabel("bottom", "Time", units="s")
+        self.serrodyne_voltage_plot.setLabel("left", "EOM Voltage", units="V")
+        self.serrodyne_voltage_plot.setTitle(
+            "Actual high-frequency sawtooth (start-of-record zoom)"
+        )
+        self.serrodyne_frequency_plot.setLabel("bottom", "Time", units="s")
+        self.serrodyne_frequency_plot.setLabel(
+            "left", "Instantaneous Frequency", units="Hz"
+        )
+        self.serrodyne_frequency_plot.setTitle(
+            "Instantaneous sawtooth frequency over the complete ARB record"
+        )
+        self.serrodyne_voltage_curve = self.serrodyne_voltage_plot.plot(
+            [], [], pen=pg.mkPen("#1769aa", width=1.5)
+        )
+        self.serrodyne_frequency_curve = self.serrodyne_frequency_plot.plot(
+            [], [], pen=pg.mkPen("#8e3b9c", width=1.8)
+        )
+        self.serrodyne_preview_description = QtWidgets.QLabel()
+        self.serrodyne_preview_description.setWordWrap(True)
+        self.serrodyne_preview_description.setStyleSheet("color: #245b78;")
+        serrodyne_preview_layout.addWidget(self.serrodyne_voltage_plot, 1)
+        serrodyne_preview_layout.addWidget(self.serrodyne_frequency_plot, 1)
+        serrodyne_preview_layout.addWidget(self.serrodyne_preview_description)
+        self.serrodyne_preview_group.setMinimumHeight(420)
+
         self.plot_panel = PlotPanel("Amplitude at the Current Sweep Step")
         self.plot_panel.set_pen(pg.mkPen("#1769aa", width=2.0))
         self.last_point_label = QtWidgets.QLabel("No measurements yet.")
@@ -568,6 +790,7 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         self.best_point_label = QtWidgets.QLabel("Best: n/a")
         self.best_point_label.setWordWrap(True)
         result_layout.addWidget(self.arb_preview_group, 1)
+        result_layout.addWidget(self.serrodyne_preview_group, 1)
         result_layout.addWidget(self.plot_panel, 1)
         result_layout.addWidget(self.last_point_label)
         result_layout.addWidget(self.best_point_label)
@@ -644,6 +867,30 @@ class FrequencySweepWidget(QtWidgets.QWidget):
                 )
             )
         self.upload_arb_button.clicked.connect(self.upload_rectangular_ramp)
+        for frequency_input in (
+            self.serrodyne_center_frequency,
+            self.serrodyne_deviation,
+            self.serrodyne_dither_frequency,
+        ):
+            frequency_input.value_spin.valueChanged.connect(
+                self._update_serrodyne_dither_preview
+            )
+            frequency_input.unit_combo.currentTextChanged.connect(
+                self._update_serrodyne_dither_preview
+            )
+        self.serrodyne_v_pi.valueChanged.connect(
+            self._update_serrodyne_dither_preview
+        )
+        self.serrodyne_dither_periods.valueChanged.connect(
+            self._update_serrodyne_dither_preview
+        )
+        self.serrodyne_optical_delay.value_spin.valueChanged.connect(
+            self._update_serrodyne_dither_preview
+        )
+        self.serrodyne_optical_delay.unit_combo.currentTextChanged.connect(
+            self._update_serrodyne_dither_preview
+        )
+        self.upload_serrodyne_button.clicked.connect(self.upload_serrodyne_dither)
         self.refresh_resources_button.clicked.connect(self.refresh_resources)
         self.inspect_resources_button.clicked.connect(self.inspect_resources)
         self.debug_scope_button.clicked.connect(self.debug_scope)
@@ -666,23 +913,41 @@ class FrequencySweepWidget(QtWidgets.QWidget):
     def _rectangular_ramp_selected(self) -> bool:
         return is_rectangular_ramp_waveform(str(self.awg_waveform.currentData()))
 
+    def _serrodyne_dither_selected(self) -> bool:
+        return is_serrodyne_dither_waveform(str(self.awg_waveform.currentData()))
+
+    def _arbitrary_waveform_selected(self) -> bool:
+        return is_arbitrary_waveform(str(self.awg_waveform.currentData()))
+
     @QtCore.Slot()
     def _update_waveform_controls(self, *_args) -> None:
-        selected = self._rectangular_ramp_selected()
+        rectangular_selected = self._rectangular_ramp_selected()
+        serrodyne_selected = self._serrodyne_dither_selected()
+        selected = rectangular_selected or serrodyne_selected
         self.scan_group.setTitle("AFG Waveform" if selected else "Sweep Settings")
         for row_widget in self._standard_sweep_rows:
             self.scan_form.setRowVisible(row_widget, not selected)
-        self.arb_group.setVisible(selected)
-        self.arb_preview_group.setVisible(selected)
+        self.arb_group.setVisible(rectangular_selected)
+        self.serrodyne_group.setVisible(serrodyne_selected)
+        self.arb_preview_group.setVisible(rectangular_selected)
+        self.serrodyne_preview_group.setVisible(serrodyne_selected)
         self.plot_panel.setVisible(not selected)
         self.last_point_label.setVisible(not selected)
         self.best_point_label.setVisible(not selected)
-        if selected:
+        if rectangular_selected:
+            self._arb_waveform = self._rectangular_ramp_waveform
             self.start_button.setToolTip(
                 "Rectangular + Ramp is applied as a fixed ARB record. Select a "
                 "standard carrier to run the existing sweep modes."
             )
+        elif serrodyne_selected:
+            self._arb_waveform = self._serrodyne_dither_waveform
+            self.start_button.setToolTip(
+                "Serrodyne Dither is applied as a fixed ARB record. Select a "
+                "standard carrier to run the existing sweep modes."
+            )
         else:
+            self._arb_waveform = None
             self.start_button.setToolTip("")
         self._update_external_hardware_state()
 
@@ -692,6 +957,17 @@ class FrequencySweepWidget(QtWidgets.QWidget):
             rectangular_vpp=float(self.rectangular_vpp.value()),
             ramp_slope_mv_per_period=float(self.ramp_slope.value()),
             periods=int(self.arb_periods.value()),
+        )
+
+    def _current_serrodyne_dither_settings(self) -> SerrodyneDitherSettings:
+        optical_delay_s = self.serrodyne_optical_delay.value_s()
+        return SerrodyneDitherSettings(
+            center_frequency_hz=self.serrodyne_center_frequency.value_hz(),
+            frequency_deviation_hz=self.serrodyne_deviation.value_hz(),
+            dither_frequency_hz=self.serrodyne_dither_frequency.value_hz(),
+            v_pi=float(self.serrodyne_v_pi.value()),
+            dither_periods=int(self.serrodyne_dither_periods.value()),
+            optical_delay_s=optical_delay_s if optical_delay_s > 0.0 else None,
         )
 
     @staticmethod
@@ -723,7 +999,9 @@ class FrequencySweepWidget(QtWidgets.QWidget):
                 self._current_rectangular_ramp_settings()
             )
         except Exception as exc:
-            self._arb_waveform = None
+            self._rectangular_ramp_waveform = None
+            if self._rectangular_ramp_selected():
+                self._arb_waveform = None
             for label in (
                 self.arb_repetition_value,
                 self.arb_sample_rate_value,
@@ -740,7 +1018,9 @@ class FrequencySweepWidget(QtWidgets.QWidget):
             self._update_external_hardware_state()
             return
 
-        self._arb_waveform = waveform
+        self._rectangular_ramp_waveform = waveform
+        if self._rectangular_ramp_selected():
+            self._arb_waveform = waveform
         self.arb_repetition_value.setText(
             self._format_engineering(waveform.arb_repetition_hz, "Hz")
         )
@@ -804,6 +1084,136 @@ class FrequencySweepWidget(QtWidgets.QWidget):
             f"{self._format_engineering(waveform.record_wrap_jump_v, 'V', signed=True)}. "
             "The record then repeats at "
             f"{self._format_engineering(waveform.arb_repetition_hz, 'Hz')}."
+        )
+        self._update_external_hardware_state()
+
+    @QtCore.Slot()
+    def _update_serrodyne_dither_preview(self, *_args) -> None:
+        try:
+            waveform = generate_serrodyne_dither(
+                self._current_serrodyne_dither_settings()
+            )
+        except Exception as exc:
+            self._serrodyne_dither_waveform = None
+            if self._serrodyne_dither_selected():
+                self._arb_waveform = None
+            for label in (
+                self.serrodyne_frequency_range_value,
+                self.serrodyne_amplitude_value,
+                self.serrodyne_beta_value,
+                self.serrodyne_duration_value,
+                self.serrodyne_arb_repetition_value,
+                self.serrodyne_sample_rate_value,
+                self.serrodyne_points_value,
+                self.serrodyne_density_value,
+            ):
+                label.setText("Invalid")
+            self.serrodyne_voltage_curve.setData([], [])
+            self.serrodyne_frequency_curve.setData([], [])
+            self.serrodyne_preview_description.setText(str(exc))
+            self.serrodyne_input_note.setText(str(exc))
+            self.serrodyne_input_note.setStyleSheet("color: #b00020;")
+            self._update_external_hardware_state()
+            return
+
+        self._serrodyne_dither_waveform = waveform
+        if self._serrodyne_dither_selected():
+            self._arb_waveform = waveform
+        self.serrodyne_frequency_range_value.setText(
+            f"{self._format_engineering(waveform.minimum_frequency_hz, 'Hz')} to "
+            f"{self._format_engineering(waveform.maximum_frequency_hz, 'Hz')}"
+        )
+        sawtooth_direction = (
+            "rising" if waveform.settings.v_pi > 0.0 else "falling"
+        )
+        signed_span_v = 2.0 * waveform.settings.v_pi
+        self.serrodyne_amplitude_value.setText(
+            f"{self._format_engineering(waveform.total_waveform_vpp, 'Vpp')} "
+            f"({sawtooth_direction}; signed span "
+            f"{self._format_engineering(signed_span_v, 'V', signed=True)})"
+        )
+        if waveform.phase_dither_amplitude_rad is None:
+            self.serrodyne_beta_value.setText("n/a (set optical delay tau)")
+        else:
+            self.serrodyne_beta_value.setText(
+                f"{waveform.phase_dither_amplitude_rad:.9g} rad"
+            )
+        self.serrodyne_duration_value.setText(
+            self._format_engineering(waveform.record_duration_s, "s")
+        )
+        self.serrodyne_arb_repetition_value.setText(
+            self._format_engineering(waveform.arb_repetition_hz, "Hz")
+        )
+        self.serrodyne_sample_rate_value.setText(
+            self._format_engineering(waveform.effective_sample_rate_sps, "S/s")
+        )
+        self.serrodyne_points_value.setText(f"{waveform.point_count:,}")
+        self.serrodyne_density_value.setText(
+            f"{waveform.samples_per_max_frequency_cycle:.4g} at f_max"
+        )
+        self.serrodyne_input_note.setText(
+            "Pure wrapped-phase sawtooth; no low-frequency sine voltage is added. "
+            f"The fast ramp is {sawtooth_direction}. AFG amplitude "
+            f"{self._format_engineering(waveform.total_waveform_vpp, 'Vpp')}, "
+            "DC offset 0 V."
+        )
+        self.serrodyne_input_note.setStyleSheet("color: #245b78;")
+
+        # Showing the whole record would visually merge tens of thousands of
+        # fast ramps. Plot the actual generated samples for the first ten
+        # center-frequency cycles, while the second plot shows the complete
+        # slow frequency dither.
+        zoom_duration_s = min(
+            waveform.record_duration_s,
+            10.0 / waveform.settings.center_frequency_hz,
+        )
+        zoom_count = int(np.searchsorted(waveform.time_s, zoom_duration_s, side="right"))
+        zoom_count = min(max(zoom_count, 2), waveform.point_count)
+        zoom_time = waveform.time_s[:zoom_count]
+        zoom_voltage = waveform.voltage_v[:zoom_count]
+        self.serrodyne_voltage_curve.setData(zoom_time, zoom_voltage)
+        self.serrodyne_voltage_plot.setRange(
+            xRange=(0.0, max(float(zoom_time[-1]), 1e-15)),
+            yRange=(
+                -1.1 * abs(waveform.settings.v_pi),
+                1.1 * abs(waveform.settings.v_pi),
+            ),
+            padding=0.01,
+        )
+
+        frequency_stride = max(1, waveform.point_count // 5000)
+        frequency_time = waveform.time_s[::frequency_stride]
+        frequency_values = waveform.instantaneous_frequency_hz[::frequency_stride]
+        self.serrodyne_frequency_curve.setData(frequency_time, frequency_values)
+        frequency_padding_hz = max(
+            0.05 * waveform.settings.frequency_deviation_hz,
+            0.01 * waveform.settings.center_frequency_hz,
+            1e-6,
+        )
+        self.serrodyne_frequency_plot.setRange(
+            xRange=(0.0, waveform.record_duration_s),
+            yRange=(
+                waveform.minimum_frequency_hz - frequency_padding_hz,
+                waveform.maximum_frequency_hz + frequency_padding_hz,
+            ),
+            padding=0.01,
+        )
+
+        phase_error = waveform.boundary_phase_error_rad
+        if math.isclose(phase_error, 0.0, abs_tol=1e-9):
+            boundary_text = "carrier phase closes at the ARB boundary"
+        else:
+            boundary_text = (
+                "the exact requested frequencies leave a carrier-phase mismatch of "
+                f"{phase_error:+.6g} rad at the ARB boundary"
+            )
+        self.serrodyne_preview_description.setText(
+            "Top: actual generated EOM samples for the first ten "
+            f"{sawtooth_direction} fast cycles. "
+            "Bottom: complete instantaneous-frequency dither. The record contains "
+            f"{waveform.accumulated_cycles:.9g} accumulated sawtooth cycles; "
+            f"{boundary_text}, producing a record-wrap voltage jump of "
+            f"{self._format_engineering(waveform.record_wrap_jump_v, 'V', signed=True)}."
         )
         self._update_external_hardware_state()
 
@@ -953,28 +1363,60 @@ class FrequencySweepWidget(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def upload_rectangular_ramp(self) -> None:
-        if self.is_busy or not self._rectangular_ramp_selected():
-            return
-        if self._external_hardware_busy and not self.mock_mode.isChecked():
-            QtWidgets.QMessageBox.information(
-                self,
-                "Rectangular + Ramp",
-                "The oscilloscope is currently capturing a waveform. Wait for it "
-                "to finish before changing the AFG output, or enable mock mode.",
-            )
+        if not self._rectangular_ramp_selected() or not self._can_begin_arb_upload(
+            "Rectangular + Ramp"
+        ):
             return
         try:
             waveform = generate_rectangular_ramp(
                 self._current_rectangular_ramp_settings()
             )
-            resource = self.awg_resource.currentText().strip()
-            if not resource and not self.mock_mode.isChecked():
-                raise ValueError("Select an AFG1062 VISA resource.")
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "ARB Input", str(exc))
+            QtWidgets.QMessageBox.critical(self, "Rectangular + Ramp Input", str(exc))
             return
+        self._rectangular_ramp_waveform = waveform
+        self._start_arb_upload(waveform, "Rectangular + Ramp")
 
+    @QtCore.Slot()
+    def upload_serrodyne_dither(self) -> None:
+        if not self._serrodyne_dither_selected() or not self._can_begin_arb_upload(
+            "Serrodyne Dither"
+        ):
+            return
+        try:
+            waveform = generate_serrodyne_dither(
+                self._current_serrodyne_dither_settings()
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Serrodyne Dither Input", str(exc))
+            return
+        self._serrodyne_dither_waveform = waveform
+        self._start_arb_upload(waveform, "Serrodyne Dither")
+
+    def _can_begin_arb_upload(self, mode_label: str) -> bool:
+        if self.is_busy:
+            return False
+        if self._external_hardware_busy and not self.mock_mode.isChecked():
+            QtWidgets.QMessageBox.information(
+                self,
+                mode_label,
+                "The oscilloscope is currently capturing a waveform. Wait for it "
+                "to finish before changing the AFG output, or enable mock mode.",
+            )
+            return False
+        return True
+
+    def _start_arb_upload(
+        self, waveform: ArbitraryWaveform, mode_label: str
+    ) -> None:
+        resource = self.awg_resource.currentText().strip()
+        if not resource and not self.mock_mode.isChecked():
+            QtWidgets.QMessageBox.critical(
+                self, f"{mode_label} Input", "Select an AFG1062 VISA resource."
+            )
+            return
         self._arb_waveform = waveform
+        self._upload_mode_label = mode_label
         self._upload_worker = ArbitraryUploadWorker(
             resource=resource,
             timeout_ms=int(self.timeout_ms.value()),
@@ -996,18 +1438,45 @@ class FrequencySweepWidget(QtWidgets.QWidget):
         if self._using_hardware:
             self.hardware_busy_changed.emit(True)
         self._set_status(
-            "Uploading Rectangular + Ramp record and applying AFG1062 scaling...", 0
+            f"Uploading {mode_label} record and applying AFG1062 scaling...", 0
         )
         self._upload_thread.start()
 
     @QtCore.Slot(object, str, object)
     def _on_arb_upload_completed(
         self,
-        waveform: RectangularRampWaveform,
+        waveform: ArbitraryWaveform,
         identity: str,
         warnings: tuple[str, ...],
     ) -> None:
         self._arb_waveform = waveform
+        if isinstance(waveform, SerrodyneDitherWaveform):
+            self._serrodyne_dither_waveform = waveform
+            sawtooth_direction = (
+                "rising" if waveform.settings.v_pi > 0.0 else "falling"
+            )
+            detail = (
+                "Serrodyne Dither applied: "
+                f"{waveform.point_count:,} samples, "
+                f"f_ARB={self._format_engineering(waveform.arb_repetition_hz, 'Hz')}, "
+                "f_saw="
+                f"{self._format_engineering(waveform.minimum_frequency_hz, 'Hz')} to "
+                f"{self._format_engineering(waveform.maximum_frequency_hz, 'Hz')}, "
+                f"amplitude={self._format_engineering(waveform.total_waveform_vpp, 'Vpp')}, "
+                f"direction={sawtooth_direction}, "
+                "offset=0 V "
+                f"({identity})."
+            )
+        else:
+            self._rectangular_ramp_waveform = waveform
+            detail = (
+                "Rectangular + Ramp applied: "
+                f"{waveform.point_count} samples, "
+                f"f_ARB={self._format_engineering(waveform.arb_repetition_hz, 'Hz')}, "
+                f"amplitude={self._format_engineering(waveform.total_waveform_vpp, 'Vpp')}, "
+                f"offset={self._format_engineering(waveform.afg_offset_v, 'V', signed=True)} "
+                f"({identity})."
+            )
         warning_text = ""
         if warnings:
             warning_text = (
@@ -1015,21 +1484,14 @@ class FrequencySweepWidget(QtWidgets.QWidget):
                 + " | ".join(warnings)
                 + "."
             )
-        self._set_status(
-            "Rectangular + Ramp applied: "
-            f"{waveform.point_count} samples, "
-            f"f_ARB={self._format_engineering(waveform.arb_repetition_hz, 'Hz')}, "
-            f"amplitude={self._format_engineering(waveform.total_waveform_vpp, 'Vpp')}, "
-            f"offset={self._format_engineering(waveform.afg_offset_v, 'V', signed=True)} "
-            f"({identity})."
-            + warning_text,
-            8000,
-        )
+        self._set_status(detail + warning_text, 8000)
 
     @QtCore.Slot(str)
     def _on_arb_upload_failed(self, message: str) -> None:
-        QtWidgets.QMessageBox.critical(self, "AFG1062 ARB Upload", message)
-        self._set_status(f"ARB upload failed: {message}", 10000)
+        QtWidgets.QMessageBox.critical(
+            self, f"AFG1062 {self._upload_mode_label} Upload", message
+        )
+        self._set_status(f"{self._upload_mode_label} upload failed: {message}", 10000)
 
     @QtCore.Slot()
     def _on_arb_upload_thread_finished(self) -> None:
@@ -1045,10 +1507,11 @@ class FrequencySweepWidget(QtWidgets.QWidget):
     def start_scan(self) -> None:
         if self.is_busy:
             return
-        if self._rectangular_ramp_selected():
+        if self._arbitrary_waveform_selected():
+            mode_label = self.awg_waveform.currentText()
             QtWidgets.QMessageBox.information(
                 self,
-                "Rectangular + Ramp",
+                mode_label,
                 "Use Upload / Apply for this fixed arbitrary waveform. Select Sine, "
                 "Square, or Ramp to run a standard sweep.",
             )
@@ -1344,19 +1807,25 @@ class FrequencySweepWidget(QtWidgets.QWidget):
     @QtCore.Slot()
     def _update_external_hardware_state(self) -> None:
         hardware_blocked = self._external_hardware_busy and not self.mock_mode.isChecked()
-        arb_apply_enabled = (
-            not self.is_busy
-            and not hardware_blocked
+        can_apply = not self.is_busy and not hardware_blocked
+        rectangular_apply_enabled = (
+            can_apply
             and self._rectangular_ramp_selected()
-            and self._arb_waveform is not None
+            and self._rectangular_ramp_waveform is not None
+        )
+        serrodyne_apply_enabled = (
+            can_apply
+            and self._serrodyne_dither_selected()
+            and self._serrodyne_dither_waveform is not None
         )
         if not self.is_busy:
             self.start_button.setEnabled(
-                not hardware_blocked and not self._rectangular_ramp_selected()
+                not hardware_blocked and not self._arbitrary_waveform_selected()
             )
-        self.upload_arb_button.setEnabled(arb_apply_enabled)
+        self.upload_arb_button.setEnabled(rectangular_apply_enabled)
         for button in self.ramp_preset_buttons.values():
-            button.setEnabled(arb_apply_enabled)
+            button.setEnabled(rectangular_apply_enabled)
+        self.upload_serrodyne_button.setEnabled(serrodyne_apply_enabled)
         self.debug_scope_button.setEnabled(
             not self._external_hardware_busy and not self.is_busy
         )
