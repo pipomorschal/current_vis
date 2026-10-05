@@ -359,8 +359,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_t4200_float_offset.setRange(0, 5)
         self.spin_t4200_float_offset.setValue(1)
         self.spin_t4200_float_offset.setToolTip(
-            "Position of the 4-byte little-endian float in the 9-byte response. "
-            "Default 1 assumes a one-byte prefix; verify against your T4200 response. "
+            "Position of the 4-byte little-endian float in the response. "
+            "Default 1 reads the observed five-byte response: one prefix byte and four float bytes. "
             "The raw response is saved as ambient_response_hex.")
         for widget in (self.edit_t4200_port, self.combo_t4200_channel, self.spin_t4200_float_offset):
             widget.setEnabled(False)

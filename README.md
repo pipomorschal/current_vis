@@ -144,10 +144,10 @@ off. The main oscilloscope channel is the optical channel (normally CH1).
   temperature and `UNIT:TEMP?` identifies its unit; results are converted to °C.
 - **Read T4200 ambient temperature**: enter its COM port and select A or B.
   Serial settings are 9600 baud, RTS on and DTR off, following the supplied
-  class. Set the instrument to °C. The parser expects a 9-byte response and a
-  four-byte little-endian float at the configured byte offset (default 1).
-  Verify this offset against your instrument: the supplied code removes one
-  byte from nine, leaving eight bytes, which cannot be unpacked as one float.
+  class. Set the instrument to °C. The observed response contains five bytes:
+  one prefix byte (`06`) and a four-byte little-endian float. The float offset
+  defaults to 1. The reader waits only for the prefix plus the four float bytes,
+  with bounded reads that also handle fragmented responses.
   Each raw response is saved as `ambient_response_hex` for inspection.
 
 Each recording remains a single file. HDF5 stores the optical waveform in

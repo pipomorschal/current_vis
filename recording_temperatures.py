@@ -36,12 +36,12 @@ def read_itc4005(resource: str, timeout_ms: int = 5000) -> tuple[float, str]:
 
 
 class T4200:
-    """Use the supplied serial protocol with bounded reads and explicit framing."""
+    """Read a prefix and four-byte float using the observed T4200 framing."""
 
     def __init__(self, comport: str, float_offset: int = 1):
         import serial
         if not 0 <= float_offset <= 5:
-            raise ValueError("Float offset must be between 0 and 5 for a 9-byte response")
+            raise ValueError("Float offset must be between 0 and 5")
         self.float_offset = float_offset
         self.o = serial.Serial(comport, 9600, timeout=0.05, write_timeout=1)
         try:
@@ -62,12 +62,13 @@ class T4200:
         self.o.write(b"h" + bytes([channel - 1]))
         time.sleep(0.8)
         frame = bytearray()
+        expected_bytes = self.float_offset + struct.calcsize("<f")
         deadline = time.monotonic() + 1.5
-        while len(frame) < 9 and time.monotonic() < deadline:
-            frame.extend(self.o.read(9 - len(frame)))
+        while len(frame) < expected_bytes and time.monotonic() < deadline:
+            frame.extend(self.o.read(expected_bytes - len(frame)))
         self.last_response = bytes(frame)
-        if len(frame) != 9:
-            raise TimeoutError(f"T4200 response has {len(frame)} bytes, expected 9: {frame.hex()}")
+        if len(frame) < expected_bytes:
+            raise TimeoutError(f"T4200 response has {len(frame)} bytes, expected at least {expected_bytes}: {frame.hex()}")
         value = struct.unpack_from("<f", frame, self.float_offset)[0]
         if not math.isfinite(value):
             raise ValueError(f"Non-finite T4200 reading: {frame.hex()}")
