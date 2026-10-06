@@ -129,6 +129,18 @@ verifizierten AFG1062-VISA-Upload wie `Rectangular + Ramp`.
 
 # Recording visualization
 
+The **Recordings** sidebar has independent plot toggles for optical amplitude,
+ambient temperature, TEC temperature and reference current. All enabled series
+share the capture-time graph. Temperatures use a separate °C axis and their
+individual reading timestamps when available. Reference current has its own
+axis and is computed from the reference waveform's 50 Hz peak voltage using
+**Reference scale (A/V)**; enter your current probe's calibration (default 1 A/V).
+The optional waveform filters apply to both optical and reference amplitude
+extraction. Normalization divides optical and reference values by their own
+respective maxima; temperatures remain in °C. Missing readings appear as gaps
+and unavailable series are reported in the sidebar. The table includes all
+available values. Toggle and scale changes reuse loaded data.
+
 ## Optional recording inputs
 
 In **Logging Mode**, each additional input has its own checkbox and defaults to

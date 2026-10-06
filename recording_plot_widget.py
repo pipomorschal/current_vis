@@ -38,6 +38,30 @@ def recording_timestamp(path: Path, metadata: dict) -> float | None:
     return None
 
 
+def optional_recording_values(data, highpass, lowpass):
+    values = {"ambient": np.nan, "tec": np.nan, "reference": np.nan, "warnings": []}
+    for prefix, key in (("ambient", "ambient"), ("tec", "tec")):
+        try:
+            if data.metadata.get(f"{prefix}_temperature_status", "ok") != "ok":
+                continue
+            value = float(data.metadata[f"{prefix}_temperature"])
+            if np.isfinite(value):
+                values[key] = value
+        except (KeyError, ValueError, TypeError):
+            pass
+        try:
+            values[f"{key}_timestamp"] = datetime.fromisoformat(
+                data.metadata[f"{prefix}_temperature_read_at"]).timestamp()
+        except (KeyError, ValueError, TypeError, OverflowError):
+            pass
+    if data.reference is not None:
+        try:
+            values["reference"] = recording_amplitude(data.reference, highpass, lowpass)
+        except Exception as exc:
+            values["warnings"].append(f"Reference amplitude: {exc}")
+    return values
+
+
 class RecordingTimeAxis(pg.AxisItem):
     """Display the local capture date and time stored in recording filenames."""
 
@@ -109,7 +133,8 @@ class RecordingWorker(QtCore.QObject):
                 amplitude = recording_amplitude(data, self.highpass, self.lowpass)
                 timestamp = recording_timestamp(path, data.metadata)
                 rows.append((path, amplitude, timestamp,
-                             data.metadata.get("amplitude_unit", ""), index + 1))
+                             data.metadata.get("amplitude_unit", ""), index + 1,
+                             optional_recording_values(data, self.highpass, self.lowpass)))
             except Exception as exc:
                 errors.append(f"{path.name}: {exc}")
             self.progress.emit(index + 1, len(self.paths))
@@ -150,6 +175,23 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self.normalize = QtWidgets.QCheckBox("Normalize amplitude (divide by maximum)")
         controls.addWidget(self.normalize)
         self.normalize.toggled.connect(self._refresh_normalization)
+        self.show_optical = QtWidgets.QCheckBox("Optical 50 Hz amplitude")
+        self.show_optical.setChecked(True)
+        self.show_ambient = QtWidgets.QCheckBox("Ambient temperature")
+        self.show_tec = QtWidgets.QCheckBox("TEC temperature")
+        self.show_reference = QtWidgets.QCheckBox("Reference current (50 Hz peak)")
+        for toggle in (self.show_optical, self.show_ambient, self.show_tec, self.show_reference):
+            controls.addWidget(toggle)
+            toggle.toggled.connect(self._refresh_normalization)
+        current_form = QtWidgets.QFormLayout()
+        self.reference_amps_per_volt = QtWidgets.QDoubleSpinBox()
+        self.reference_amps_per_volt.setDecimals(6)
+        self.reference_amps_per_volt.setRange(0.000001, 1e9)
+        self.reference_amps_per_volt.setValue(1)
+        self.reference_amps_per_volt.setToolTip("Current probe conversion: peak current = reference peak voltage × A/V. Set your probe's calibration.")
+        self.reference_amps_per_volt.valueChanged.connect(self._refresh_normalization)
+        current_form.addRow("Reference scale (A/V)", self.reference_amps_per_volt)
+        controls.addLayout(current_form)
         self.status = QtWidgets.QLabel("Select a folder containing CSV, H5 or HDF5 recordings.")
         self.status.setWordWrap(True)
         controls.addWidget(self.status)
@@ -160,9 +202,27 @@ class RecordingPlotWidget(QtWidgets.QWidget):
                                   axisItems={"bottom": self.time_axis})
         self.plot.setBackground("w")
         self.plot.showGrid(x=True, y=True, alpha=0.3)
+        self.legend = self.plot.addLegend()
+        self.temperature_view = pg.ViewBox()
+        self.current_view = pg.ViewBox()
+        self.plot.scene().addItem(self.temperature_view)
+        self.plot.scene().addItem(self.current_view)
+        self.plot.showAxis("right")
+        self.temperature_axis = self.plot.getAxis("right")
+        self.temperature_axis.linkToView(self.temperature_view)
+        self.current_axis = pg.AxisItem("right")
+        self.plot.plotItem.layout.addItem(self.current_axis, 2, 3)
+        self.current_axis.linkToView(self.current_view)
+        self.temperature_view.setXLink(self.plot.getViewBox())
+        self.current_view.setXLink(self.plot.getViewBox())
+        self.plot.getViewBox().sigResized.connect(self._sync_overlay_views)
+        self._curves = {}
+        self._sync_overlay_views()
+        self.temperature_axis.hide()
+        self.current_axis.hide()
         layout.addWidget(self.plot, 3)
-        self.table = QtWidgets.QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["File", "Capture time", "50 Hz peak amplitude"])
+        self.table = QtWidgets.QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["File", "Capture time", "50 Hz peak amplitude", "Ambient (°C)", "TEC (°C)", "Reference peak (A)"])
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         layout.addWidget(self.table, 1)
@@ -181,6 +241,28 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         spin.setDecimals(3)
         spin.setSpecialValueText("0 (disabled)")
         return spin
+
+    def _sync_overlay_views(self):
+        main = self.plot.getViewBox()
+        for view in (self.temperature_view, self.current_view):
+            view.setGeometry(main.sceneBoundingRect())
+            view.linkedViewChanged(main, view.XAxis)
+
+    def _clear_curves(self):
+        self.plot.clear()
+        self.temperature_view.clear()
+        self.current_view.clear()
+        self.legend.clear()
+        self._curves = {}
+        self.temperature_axis.hide()
+        self.current_axis.hide()
+
+    def _add_overlay(self, key, x, y, view, color, label):
+        curve = pg.PlotDataItem(x, y, pen=pg.mkPen(color, width=1.5),
+                               symbol="o", symbolSize=5, symbolBrush=color, symbolPen=color, connect="finite")
+        view.addItem(curve)
+        self.legend.addItem(curve, label)
+        self._curves[key] = curve
 
     def _browse(self):
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Recording directory", self.directory.text())
@@ -204,7 +286,7 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         except OSError as exc:
             self.status.setText(str(exc))
             return
-        self.plot.clear()
+        self._clear_curves()
         self.table.setRowCount(0)
         self._rows = []
         self._errors = []
@@ -236,11 +318,10 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self._errors = list(errors)
         self._refresh_normalization()
 
-    @QtCore.Slot()
     def _refresh_normalization(self):
         rows = list(self._rows)
         errors = list(self._errors)
-        self.plot.clear()
+        self._clear_curves()
         timed = bool(rows) and all(row[2] is not None for row in rows)
         if timed:
             rows.sort(key=lambda row: row[2])
@@ -259,23 +340,64 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self.time_axis.set_capture_time(timed)
         self.plot.setLabel("left", "Normalized 50 Hz peak amplitude" if normalized else "50 Hz peak amplitude",
                            units="" if normalized else unit)
-        self.plot.plot(x, y, pen=pg.mkPen("b", width=1.5), symbol="o", symbolSize=6)
+        self.plot.getAxis("left").setVisible(self.show_optical.isChecked())
+        if self.show_optical.isChecked():
+            self._curves["optical"] = self.plot.plot(x, y, pen=pg.mkPen("b", width=1.5), symbol="o", symbolSize=6,
+                                                     name="Optical amplitude")
+        aux = [row[5] if len(row) > 5 else {} for row in rows]
+        ambient = np.array([v.get("ambient", np.nan) for v in aux])
+        tec = np.array([v.get("tec", np.nan) for v in aux])
+        reference = np.array([v.get("reference", np.nan) for v in aux]) * self.reference_amps_per_volt.value()
+        if normalized and np.any(np.isfinite(reference)):
+            maximum = np.nanmax(reference)
+            if maximum > 0:
+                reference = reference / maximum
+        missing = []
+        for key, values, toggle, color, label in (
+                ("ambient", ambient, self.show_ambient, "#d97706", "Ambient (°C)"),
+                ("tec", tec, self.show_tec, "#15803d", "TEC (°C)"),
+                ("reference", reference, self.show_reference, "#9333ea", "Reference current")):
+            if toggle.isChecked():
+                if np.any(np.isfinite(values)):
+                    overlay_x = np.array([v.get(f"{key}_timestamp", row[2]) for row, v in zip(rows, aux)]) if timed else x
+                    self._add_overlay(key, overlay_x, values,
+                                      self.current_view if key == "reference" else self.temperature_view, color, label)
+                else:
+                    missing.append(key)
+        self.temperature_axis.setLabel("Temperature", units="°C")
+        self.current_axis.setLabel("Normalized reference peak" if normalized else "Reference 50 Hz peak current",
+                                   units="" if normalized else "A")
+        self.temperature_axis.setVisible("ambient" in self._curves or "tec" in self._curves)
+        self.current_axis.setVisible("reference" in self._curves)
         self.plot.autoRange()
+        visible_x = [curve.xData[np.isfinite(curve.xData)] for curve in self._curves.values()
+                     if curve.xData is not None]
+        if visible_x and any(values.size for values in visible_x):
+            all_x = np.concatenate(visible_x)
+            self.plot.setXRange(float(np.min(all_x)), float(np.max(all_x)), padding=0.02)
+        self.temperature_view.enableAutoRange(axis=pg.ViewBox.YAxis)
+        self.current_view.enableAutoRange(axis=pg.ViewBox.YAxis)
+        self._sync_overlay_views()
         self.table.setRowCount(len(rows))
         self.table.setHorizontalHeaderLabels([
-            "File", "Capture time", "Normalized amplitude" if normalized else "50 Hz peak amplitude"])
-        for i, (path, amplitude, timestamp, unit, _) in enumerate(rows):
+            "File", "Capture time", "Normalized amplitude" if normalized else "50 Hz peak amplitude",
+            "Ambient (°C)", "TEC (°C)", "Normalized reference" if normalized else "Reference peak (A)"])
+        for i, row in enumerate(rows):
+            path, amplitude, timestamp, unit, _ = row[:5]
             values = [path.name, datetime.fromtimestamp(timestamp).isoformat(timespec="milliseconds")
                       if timestamp is not None else "—", f"{y[i]:.9g}" if normalized else f"{amplitude:.9g} {unit}".strip()]
+            values.extend(f"{series[i]:.9g}" if np.isfinite(series[i]) else "—" for series in (ambient, tec, reference))
             for j, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
                 item.setToolTip(str(path))
                 self.table.setItem(i, j, item)
-        self.errors.setPlainText("\n".join(errors))
-        self.errors.setVisible(bool(errors))
+        warnings = [f"{row[0].name}: {warning}" for row, v in zip(rows, aux) for warning in v.get("warnings", [])]
+        self.errors.setPlainText("\n".join(errors + warnings))
+        self.errors.setVisible(bool(errors or warnings))
         self.status.setText(f"Plotted {len(rows)} recordings; skipped {len(errors)} files." +
                             (" Using filename order (capture timestamps unavailable)." if rows and not timed else "") +
-                            (" Maximum amplitude is zero; values remain zero." if zero_maximum else ""))
+                            (" Maximum amplitude is zero; values remain zero." if zero_maximum else "") +
+                            (f" No recorded data for: {', '.join(missing)}." if missing else ""))
 
     @QtCore.Slot()
     def _cleanup(self):
