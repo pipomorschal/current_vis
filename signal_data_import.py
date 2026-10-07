@@ -25,6 +25,7 @@ class ScopeCaptureConfig:
 	t4200_port: str | None = None
 	t4200_channel: int = 1
 	t4200_float_offset: int = 1
+	tec_setpoint_deg_c: float | None = None
 
 
 class ScopeCommunicationError(RuntimeError):

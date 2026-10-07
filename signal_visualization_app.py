@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from dataclasses import replace
 from pathlib import Path
 import time
 import logging
@@ -20,7 +21,8 @@ from plot_panel_widget import PlotPanel
 from frequency_sweep_widget import FrequencyInput, FrequencySweepWidget
 from recording_plot_widget import RecordingPlotWidget
 from scope_capture_process import capture_isolated
-from recording_temperatures import read_optional_temperatures
+from recording_temperatures import read_optional_temperatures, apply_tec_sweep_setpoint
+from tec_temperature_sweep import TecTemperatureSweep
 
 
 class ScopeAcquireWorker(QtCore.QObject):
@@ -51,9 +53,11 @@ class ScopeAcquireWorker(QtCore.QObject):
             if self.isolated:
                 data = capture_isolated(self.config, self.output_path, self.extra_metadata, self.cancelled)
             else:
+                sweep_metadata = apply_tec_sweep_setpoint(self.config)
                 data = OscilloscopeImporter.capture_channel(self.config)
                 if self.extra_metadata:
                     data.metadata.update(self.extra_metadata)
+                data.metadata.update(sweep_metadata)
                 data.metadata.update(read_optional_temperatures(self.config))
                 if self.output_path is not None:
                     if self.output_path.suffix.lower() in {".h5", ".hdf5"}:
@@ -158,6 +162,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scope_retry_delay = 0.0
         self._scope_failure_is_communication = False
         self._scope_log_handler = None
+        self._tec_sweep_plan = None
         self._scope_log_timer = QtCore.QTimer(self)
         self._scope_log_timer.setSingleShot(True)
         self._demod_thread: QtCore.QThread | None = None
@@ -347,9 +352,47 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_itc_resource.setEditable(True)
         self.combo_itc_resource.setEnabled(False)
         self.combo_itc_resource.lineEdit().setPlaceholderText("USB VISA resource")
-        self.check_itc_temperature.toggled.connect(self.combo_itc_resource.setEnabled)
+        self.check_itc_temperature.toggled.connect(self._update_tec_sweep_ui)
         scope_log_form.addRow(self.check_itc_temperature)
         scope_log_form.addRow("ITC4005 VISA", self.combo_itc_resource)
+        self.group_tec_sweep = QtWidgets.QGroupBox("TEC temperature sweep")
+        self.group_tec_sweep.setCheckable(True)
+        self.group_tec_sweep.setChecked(False)
+        tec_form = QtWidgets.QFormLayout(self.group_tec_sweep)
+        self.spin_tec_sweep_min = QtWidgets.QDoubleSpinBox()
+        self.spin_tec_sweep_max = QtWidgets.QDoubleSpinBox()
+        for spin in (self.spin_tec_sweep_min, self.spin_tec_sweep_max):
+            spin.setRange(-273.15, 1000)
+            spin.setDecimals(3)
+            spin.setSuffix(" °C")
+        self.spin_tec_sweep_min.setValue(20)
+        self.spin_tec_sweep_max.setValue(30)
+        self.spin_tec_sweep_increment = QtWidgets.QDoubleSpinBox()
+        self.spin_tec_sweep_increment.setRange(0.001, 1000)
+        self.spin_tec_sweep_increment.setDecimals(3)
+        self.spin_tec_sweep_increment.setValue(1)
+        self.spin_tec_sweep_increment.setSuffix(" °C")
+        self.spin_tec_sweep_minutes = QtWidgets.QDoubleSpinBox()
+        self.spin_tec_sweep_minutes.setRange(0.001, 10080)
+        self.spin_tec_sweep_minutes.setDecimals(3)
+        self.spin_tec_sweep_minutes.setValue(60)
+        self.spin_tec_sweep_minutes.setSuffix(" min")
+        tec_form.addRow("Minimum", self.spin_tec_sweep_min)
+        tec_form.addRow("Maximum", self.spin_tec_sweep_max)
+        tec_form.addRow("Increment", self.spin_tec_sweep_increment)
+        tec_form.addRow("Time per step", self.spin_tec_sweep_minutes)
+        self.lbl_tec_sweep_summary = QtWidgets.QLabel()
+        self.lbl_tec_sweep_summary.setWordWrap(True)
+        tec_form.addRow(self.lbl_tec_sweep_summary)
+        note = QtWidgets.QLabel("Sweep duration replaces Maximum Time. TEC must already be on in temperature mode. The final setpoint is held after stopping.")
+        note.setWordWrap(True)
+        tec_form.addRow(note)
+        scope_log_form.addRow(self.group_tec_sweep)
+        self.group_tec_sweep.toggled.connect(self._update_tec_sweep_ui)
+        for spin in (self.spin_tec_sweep_min, self.spin_tec_sweep_max,
+                     self.spin_tec_sweep_increment, self.spin_tec_sweep_minutes):
+            spin.valueChanged.connect(self._update_tec_sweep_ui)
+        self._update_tec_sweep_ui()
         self.check_ambient_temperature = QtWidgets.QCheckBox("Read T4200 ambient temperature")
         self.edit_t4200_port = QtWidgets.QLineEdit()
         self.edit_t4200_port.setPlaceholderText("e.g. COM4")
@@ -871,6 +914,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._begin_scope_capture(config)
 
+    def _tec_sweep_from_controls(self):
+        return TecTemperatureSweep(self.spin_tec_sweep_min.value(), self.spin_tec_sweep_max.value(),
+                                   self.spin_tec_sweep_increment.value(), self.spin_tec_sweep_minutes.value() * 60)
+
+    def _update_tec_sweep_ui(self, *_args):
+        enabled = self.group_tec_sweep.isChecked()
+        if enabled and not self.check_itc_temperature.isChecked():
+            self.check_itc_temperature.setChecked(True)
+        self.check_itc_temperature.setEnabled(not enabled)
+        self.combo_itc_resource.setEnabled(enabled or self.check_itc_temperature.isChecked())
+        self.spin_scope_log_max_minutes.setEnabled(not enabled)
+        try:
+            plan = self._tec_sweep_from_controls()
+            self.lbl_tec_sweep_summary.setText(f"{plan.step_count} setpoints; total {plan.duration_seconds / 60:g} min, including a full dwell at maximum.")
+        except ValueError as exc:
+            self.lbl_tec_sweep_summary.setText(str(exc))
+
     def _scope_config_from_controls(self) -> ScopeCaptureConfig | None:
         resource = self.combo_scope_resource.currentText().strip()
         if not resource or resource in {"No VISA resource", "pyvisa not installed"}:
@@ -886,11 +946,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 if reference == self.combo_scope_channel.currentText():
                     QtWidgets.QMessageBox.warning(self, "Recording", "Optical and reference channels must be different.")
                     return None
-            if self.check_itc_temperature.isChecked():
+            if self.check_itc_temperature.isChecked() or self.group_tec_sweep.isChecked():
                 itc_resource = self.combo_itc_resource.currentText().strip()
                 if not itc_resource or itc_resource == resource:
                     QtWidgets.QMessageBox.warning(self, "Recording", "Select a separate ITC4005 VISA resource.")
                     return None
+                if self.group_tec_sweep.isChecked():
+                    try:
+                        self._tec_sweep_from_controls()
+                    except ValueError as exc:
+                        QtWidgets.QMessageBox.warning(self, "TEC Sweep", str(exc))
+                        return None
             if self.check_ambient_temperature.isChecked():
                 ambient_port = self.edit_t4200_port.text().strip()
                 if not ambient_port:
@@ -923,11 +989,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         started_at = datetime.now().astimezone()
+        self._tec_sweep_plan = self._tec_sweep_from_controls() if self.group_tec_sweep.isChecked() else None
         self._scope_logging_active = True
         self._scope_logging_started_monotonic = time.monotonic()
         self._scope_logging_deadline_monotonic = (
             self._scope_logging_started_monotonic
-            + float(self.spin_scope_log_max_minutes.value()) * 60.0
+            + (self._tec_sweep_plan.duration_seconds if self._tec_sweep_plan is not None else
+               float(self.spin_scope_log_max_minutes.value()) * 60.0)
         )
         self._scope_logging_capture_count = 0
         self._scope_logging_capture_started_monotonic = 0.0
@@ -959,6 +1027,8 @@ class MainWindow(QtWidgets.QMainWindow):
         logger.info("Optional inputs: reference=%s ITC4005=%s T4200=%s channel=%s float_offset=%s",
                     config.reference_channel, config.itc4005_resource, config.t4200_port,
                     config.t4200_channel, config.t4200_float_offset)
+        if self._tec_sweep_plan is not None:
+            logger.info("TEC sweep: %s", self._tec_sweep_plan)
         self.lbl_recording_temperatures.clear()
 
         self._set_scope_controls_enabled(False)
@@ -997,12 +1067,22 @@ class MainWindow(QtWidgets.QMainWindow):
             "logging_maximum_minutes": f"{self.spin_scope_log_max_minutes.value():.9g}",
             "logging_output_file": output_path.name,
         }
+        capture_config = self._scope_logging_config
+        if self._tec_sweep_plan is not None:
+            plan = self._tec_sweep_plan
+            elapsed = self._scope_logging_capture_started_monotonic - self._scope_logging_started_monotonic
+            target = plan.target_at(elapsed)
+            capture_config = replace(capture_config, tec_setpoint_deg_c=target)
+            metadata.update(tec_sweep_step=str(plan.step_at(elapsed) + 1), tec_sweep_steps=str(plan.step_count),
+                            tec_sweep_min_deg_c=str(plan.minimum), tec_sweep_max_deg_c=str(plan.maximum),
+                            tec_sweep_increment_deg_c=str(plan.increment), tec_sweep_step_seconds=str(plan.step_seconds),
+                            logging_maximum_minutes=str(plan.duration_seconds / 60))
         self._scope_logging_current_path = output_path
         self.lbl_scope_logging_status.setText(
             f"Acquiring capture {capture_index}..."
         )
         self._begin_scope_capture(
-            self._scope_logging_config,
+            capture_config,
             output_path=output_path,
             extra_metadata=metadata,
             is_logging=True,
@@ -1104,6 +1184,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scope_logging_active = False
         self._scope_capture_is_logging = False
         self._scope_logging_config = None
+        self._tec_sweep_plan = None
         self._scope_logging_current_path = None
         self._scope_logging_finish_message = None
         self._set_scope_controls_enabled(True)
@@ -1131,6 +1212,9 @@ class MainWindow(QtWidgets.QMainWindow):
             saved_path = self._scope_logging_current_path
             saved_name = saved_path.name if saved_path is not None else "capture"
             readings = []
+            if "tec_sweep_setpoint_deg_c" in data.metadata:
+                readings.append(f"TEC target: {float(data.metadata['tec_sweep_setpoint_deg_c']):g} °C "
+                                f"(step {data.metadata.get('tec_sweep_step', '?')}/{data.metadata.get('tec_sweep_steps', '?')})")
             for prefix, label in (("tec", "TEC"), ("ambient", "Ambient")):
                 if data.metadata.get(f"{prefix}_temperature_status") == "ok":
                     readings.append(f"{label}: {float(data.metadata[f'{prefix}_temperature']):.3f} °C")
@@ -1203,7 +1287,17 @@ class MainWindow(QtWidgets.QMainWindow):
             0.0, now - self._scope_logging_capture_started_monotonic
         )
         delay_seconds = max(self._scope_retry_delay, interval_seconds - capture_elapsed, 0.0)
+        if self._tec_sweep_plan is not None and not self._scope_retry_delay:
+            plan = self._tec_sweep_plan
+            elapsed = now - self._scope_logging_started_monotonic
+            next_step = (plan.step_at(elapsed) + 1) * plan.step_seconds
+            delay_seconds = min(delay_seconds, max(0.0, next_step - elapsed))
         if now + delay_seconds >= self._scope_logging_deadline_monotonic:
+            if self._tec_sweep_plan is not None and now < self._scope_logging_deadline_monotonic:
+                remaining = self._scope_logging_deadline_monotonic - now
+                self.lbl_scope_logging_status.setText(f"Final TEC dwell; recording finishes in {remaining / 60:.3g} min.")
+                self._scope_log_timer.start(max(1, int(np.ceil(remaining * 1000))))
+                return
             self._finish_scope_logging(self._scope_logging_complete_message())
             return
 

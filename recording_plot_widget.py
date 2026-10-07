@@ -172,9 +172,16 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         controls.addWidget(note)
         self.load_button = QtWidgets.QPushButton("Plot recordings / Refresh")
         controls.addWidget(self.load_button)
-        self.normalize = QtWidgets.QCheckBox("Normalize amplitude (divide by maximum)")
+        self.normalize = QtWidgets.QCheckBox("Normalize displayed optical values")
+        self.normalize.setToolTip(
+            "Divide the displayed optical series by its maximum. When optical/reference "
+            "division is enabled, normalize the resulting ratios. Recalculate when that option changes.")
         controls.addWidget(self.normalize)
         self.normalize.toggled.connect(self._refresh_normalization)
+        self.divide_by_reference = QtWidgets.QCheckBox("Divide optical current by reference")
+        self.divide_by_reference.setToolTip("Divide each optical peak current by the corresponding reference peak current, before optional normalization. Missing or zero references produce gaps.")
+        controls.addWidget(self.divide_by_reference)
+        self.divide_by_reference.toggled.connect(self._refresh_normalization)
         self.show_optical = QtWidgets.QCheckBox("Optical 50 Hz amplitude")
         self.show_optical.setChecked(True)
         self.show_ambient = QtWidgets.QCheckBox("Ambient temperature")
@@ -191,6 +198,13 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self.reference_amps_per_volt.setToolTip("Current probe conversion: peak current = reference peak voltage × A/V. Set your probe's calibration.")
         self.reference_amps_per_volt.valueChanged.connect(self._refresh_normalization)
         current_form.addRow("Reference scale (A/V)", self.reference_amps_per_volt)
+        self.optical_amps_per_volt = QtWidgets.QDoubleSpinBox()
+        self.optical_amps_per_volt.setDecimals(6)
+        self.optical_amps_per_volt.setRange(0.000001, 1e9)
+        self.optical_amps_per_volt.setValue(1)
+        self.optical_amps_per_volt.setToolTip("Optical current conversion used for the optical/reference ratio. Default 1 A/V; set your optical channel's calibration.")
+        self.optical_amps_per_volt.valueChanged.connect(self._refresh_normalization)
+        current_form.addRow("Optical ratio scale (A/V)", self.optical_amps_per_volt)
         controls.addLayout(current_form)
         self.status = QtWidgets.QLabel("Select a folder containing CSV, H5 or HDF5 recordings.")
         self.status.setWordWrap(True)
@@ -327,10 +341,21 @@ class RecordingPlotWidget(QtWidgets.QWidget):
             rows.sort(key=lambda row: row[2])
         x = np.array([row[2] if timed else row[4] for row in rows])
         y = np.array([row[1] for row in rows])
+        aux = [row[5] if len(row) > 5 else {} for row in rows]
+        reference = np.array([v.get("reference", np.nan) for v in aux]) * self.reference_amps_per_volt.value()
+        ratio = self.divide_by_reference.isChecked()
+        invalid_ratios = 0
+        if ratio:
+            optical_scale = np.array([1 if row[3] == "A" else self.optical_amps_per_volt.value() for row in rows])
+            valid = np.isfinite(reference) & (reference != 0) & np.isfinite(y)
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                y = np.divide(y * optical_scale, reference, out=np.full(y.shape, np.nan), where=valid)
+            y[~np.isfinite(y)] = np.nan
+            invalid_ratios = int(np.count_nonzero(~np.isfinite(y)))
         normalized = self.normalize.isChecked()
         zero_maximum = False
-        if normalized and y.size:
-            maximum = float(np.max(y))
+        if normalized and np.any(np.isfinite(y)):
+            maximum = float(np.nanmax(y))
             if maximum > 0:
                 y = y / maximum
             else:
@@ -338,16 +363,16 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         units = {row[3] for row in rows}
         unit = next(iter(units)) if len(units) == 1 else "mixed units"
         self.time_axis.set_capture_time(timed)
-        self.plot.setLabel("left", "Normalized 50 Hz peak amplitude" if normalized else "50 Hz peak amplitude",
-                           units="" if normalized else unit)
+        optical_label = "Optical / reference current" if ratio else "50 Hz peak amplitude"
+        if normalized:
+            optical_label = "Normalized " + optical_label
+        self.plot.setLabel("left", optical_label, units="" if normalized or ratio else unit)
         self.plot.getAxis("left").setVisible(self.show_optical.isChecked())
         if self.show_optical.isChecked():
             self._curves["optical"] = self.plot.plot(x, y, pen=pg.mkPen("b", width=1.5), symbol="o", symbolSize=6,
-                                                     name="Optical amplitude")
-        aux = [row[5] if len(row) > 5 else {} for row in rows]
+                                                     name="Optical / reference" if ratio else "Optical amplitude", connect="finite")
         ambient = np.array([v.get("ambient", np.nan) for v in aux])
         tec = np.array([v.get("tec", np.nan) for v in aux])
-        reference = np.array([v.get("reference", np.nan) for v in aux]) * self.reference_amps_per_volt.value()
         if normalized and np.any(np.isfinite(reference)):
             maximum = np.nanmax(reference)
             if maximum > 0:
@@ -380,12 +405,13 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self._sync_overlay_views()
         self.table.setRowCount(len(rows))
         self.table.setHorizontalHeaderLabels([
-            "File", "Capture time", "Normalized amplitude" if normalized else "50 Hz peak amplitude",
+            "File", "Capture time", optical_label,
             "Ambient (°C)", "TEC (°C)", "Normalized reference" if normalized else "Reference peak (A)"])
         for i, row in enumerate(rows):
             path, amplitude, timestamp, unit, _ = row[:5]
             values = [path.name, datetime.fromtimestamp(timestamp).isoformat(timespec="milliseconds")
-                      if timestamp is not None else "—", f"{y[i]:.9g}" if normalized else f"{amplitude:.9g} {unit}".strip()]
+                      if timestamp is not None else "—", (f"{y[i]:.9g}" if np.isfinite(y[i]) else "—")
+                      if normalized or ratio else f"{amplitude:.9g} {unit}".strip()]
             values.extend(f"{series[i]:.9g}" if np.isfinite(series[i]) else "—" for series in (ambient, tec, reference))
             for j, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
@@ -397,7 +423,9 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self.status.setText(f"Plotted {len(rows)} recordings; skipped {len(errors)} files." +
                             (" Using filename order (capture timestamps unavailable)." if rows and not timed else "") +
                             (" Maximum amplitude is zero; values remain zero." if zero_maximum else "") +
-                            (f" No recorded data for: {', '.join(missing)}." if missing else ""))
+                            (f" No recorded data for: {', '.join(missing)}." if missing else "") +
+                            (f" Optical/reference ratio unavailable for {invalid_ratios} recording(s) (missing or zero reference)."
+                             if invalid_ratios else ""))
 
     @QtCore.Slot()
     def _cleanup(self):

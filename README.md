@@ -130,6 +130,14 @@ verifizierten AFG1062-VISA-Upload wie `Rectangular + Ramp`.
 # Recording visualization
 
 The **Recordings** sidebar has independent plot toggles for optical amplitude,
+and a **Divide optical current by reference** checkbox. This divides each
+optical 50 Hz peak current by the corresponding reference peak current before
+optional normalization. Set **Optical ratio scale (A/V)** and **Reference scale
+(A/V)** to the channel calibrations; both default to 1. The ratio is unitless.
+Missing or zero references produce gaps and blank table values. Unchecking
+restores optical amplitudes.
+
+The overlay toggles also include
 ambient temperature, TEC temperature and reference current. All enabled series
 share the capture-time graph. Temperatures use a separate °C axis and their
 individual reading timestamps when available. Reference current has its own
@@ -142,6 +150,25 @@ and unavailable series are reported in the sidebar. The table includes all
 available values. Toggle and scale changes reuse loaded data.
 
 ## Optional recording inputs
+
+**TEC temperature sweep** in Logging Mode optionally sets an ascending ITC4005
+temperature sequence using **Minimum**, **Maximum**, **Increment** (°C), and
+**Time per step** (minutes). For example, 20–30 °C with a 1 °C increment and
+60 minutes per step records 11 setpoints over 660 minutes, including a full
+60-minute dwell at 30 °C. Sweep duration replaces **Maximum Time**; the ordinary
+recording interval still controls captures, with an extra capture at each step
+boundary when needed. The maximum is included even if the increment does not
+divide the range exactly.
+
+Setpoints are applied between captures in the isolated VISA process using
+`SOUR2:TEMP`, with readback verification before waveform acquisition. A long
+capture or retry can delay a transition; the next target follows elapsed session
+time. The TEC must already be enabled in temperature-control mode. Controller
+temperature limits are respected. Failed setpoint application stops logging.
+The final commanded temperature is retained after completion or Stop. This is
+a timed setpoint sweep, not a wait-for-stabilization mode. Every saved file
+includes the commanded target, step number and schedule, alongside measured
+TEC temperature. All setpoint writes are disabled when the sweep is unchecked.
 
 In **Logging Mode**, each additional input has its own checkbox and defaults to
 off. The main oscilloscope channel is the optical channel (normally CH1).

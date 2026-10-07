@@ -15,7 +15,7 @@ import numpy as np
 from data_manager_signal_loader import DataManager
 from signal_data_class import SignalData
 from signal_data_import import OscilloscopeImporter, ScopeCaptureConfig, ScopeCommunicationError
-from recording_temperatures import read_optional_temperatures
+from recording_temperatures import read_optional_temperatures, apply_tec_sweep_setpoint
 
 
 def capture_isolated(config, output_path=None, extra_metadata=None, cancelled=None,
@@ -88,8 +88,10 @@ def run_capture(root):
     try:
         request = json.loads((root / "request.json").read_text(encoding="utf-8"))
         config = ScopeCaptureConfig(**request["config"])
+        sweep_metadata = apply_tec_sweep_setpoint(config)
         data = OscilloscopeImporter.capture_channel(config)
         data.metadata.update(request["metadata"])
+        data.metadata.update(sweep_metadata)
         data.metadata.update(read_optional_temperatures(config))
         if request["output_path"]:
             target = Path(request["output_path"])
