@@ -81,10 +81,10 @@ class SnakeBoard(QtWidgets.QWidget):
         self.direction = self.pending_direction
         x, y = self.snake[0]
         dx, dy = self.direction
-        head = (x + dx, y + dy)
+        head = ((x + dx) % self.size, (y + dy) % self.size)
         eating = head == self.food
         body = self.snake if eating else self.snake[:-1]
-        if not (0 <= head[0] < self.size and 0 <= head[1] < self.size) or head in body:
+        if head in body:
             self.timer.stop()
             self.finished = True
             self.message = "Game over — press R to restart"
@@ -104,10 +104,14 @@ class SnakeBoard(QtWidgets.QWidget):
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
-        painter.fillRect(self.rect(), QtGui.QColor("#18212b"))
+        painter.fillRect(self.rect(), self.palette().window())
         cell = min(self.width(), self.height()) / self.size
         left = (self.width() - cell * self.size) / 2
         top = (self.height() - cell * self.size) / 2
+        field = QtCore.QRectF(left, top, cell * self.size, cell * self.size)
+        painter.fillRect(field, QtGui.QColor("#18212b"))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#657586"), 1))
+        painter.drawRect(field.adjusted(0.5, 0.5, -0.5, -0.5))
         painter.setPen(QtCore.Qt.PenStyle.NoPen)
         for index, (x, y) in enumerate(self.snake):
             painter.setBrush(QtGui.QColor("#b4ed79" if index == 0 else "#65b86a"))
@@ -119,9 +123,9 @@ class SnakeBoard(QtWidgets.QWidget):
             painter.drawEllipse(QtCore.QRectF(left + x * cell + 3, top + y * cell + 3,
                                              cell - 6, cell - 6))
         if self.message:
-            painter.fillRect(self.rect(), QtGui.QColor(0, 0, 0, 160))
+            painter.fillRect(field, QtGui.QColor(0, 0, 0, 160))
             painter.setPen(QtGui.QColor("white"))
-            painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, self.message)
+            painter.drawText(field, QtCore.Qt.AlignmentFlag.AlignCenter, self.message)
 
 
 class MiniGameWidget(QtWidgets.QWidget):
@@ -135,7 +139,8 @@ class MiniGameWidget(QtWidgets.QWidget):
         title = QtWidgets.QLabel("Snake")
         title.setStyleSheet("font-size: 22px; font-weight: bold;")
         controls.addWidget(title)
-        instructions = QtWidgets.QLabel("Collect the red dots. Avoid the walls and your tail.\n\n"
+        instructions = QtWidgets.QLabel("Collect the red dots. Avoid your tail.\n"
+                                      "Cross an edge to appear on the opposite side.\n\n"
                                       "Arrow keys / WASD: move\nSpace: start or pause\nR: restart\n\n"
                                       "The game pauses when you leave this tab.")
         instructions.setWordWrap(True)
