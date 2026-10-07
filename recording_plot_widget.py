@@ -9,7 +9,7 @@ from PySide6 import QtCore, QtWidgets
 import pyqtgraph as pg
 
 from data_manager_signal_loader import DataManager
-from recording_analysis import recording_amplitude
+from recording_analysis import recording_amplitude, recording_amplitudes
 
 
 def natural_key(path: Path):
@@ -118,9 +118,10 @@ class RecordingWorker(QtCore.QObject):
     finished = QtCore.Signal(object, object)
     progress = QtCore.Signal(int, int)
 
-    def __init__(self, paths, highpass, lowpass):
+    def __init__(self, paths, highpass, lowpass, frequencies=(50,)):
         super().__init__()
         self.paths, self.highpass, self.lowpass = paths, highpass, lowpass
+        self.frequencies = tuple(frequencies)
 
     @QtCore.Slot()
     def run(self):
@@ -130,11 +131,22 @@ class RecordingWorker(QtCore.QObject):
                 break
             try:
                 data = DataManager.load_file(str(path))
-                amplitude = recording_amplitude(data, self.highpass, self.lowpass)
+                optional = optional_recording_values(data, self.highpass, self.lowpass)
+                optional["optical_frequencies"] = self.frequencies
+                try:
+                    amplitudes = recording_amplitudes(data, self.frequencies, self.highpass, self.lowpass)
+                except ValueError as exc:
+                    if len(self.frequencies) == 1:
+                        raise
+                    amplitudes = [recording_amplitude(data, self.highpass, self.lowpass, self.frequencies[0]), np.nan]
+                    optional["warnings"].append(f"Second optical frequency: {exc}")
+                amplitude = amplitudes[0]
+                if len(amplitudes) > 1:
+                    optional["optical_secondary"] = amplitudes[1]
                 timestamp = recording_timestamp(path, data.metadata)
                 rows.append((path, amplitude, timestamp,
                              data.metadata.get("amplitude_unit", ""), index + 1,
-                             optional_recording_values(data, self.highpass, self.lowpass)))
+                             optional))
             except Exception as exc:
                 errors.append(f"{path.name}: {exc}")
             self.progress.emit(index + 1, len(self.paths))
@@ -148,8 +160,13 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self._worker = None
         self._rows = []
         self._errors = []
-        self.control_panel = QtWidgets.QWidget()
-        controls = QtWidgets.QVBoxLayout(self.control_panel)
+        self._loaded_frequencies = (50,)
+        self.control_panel = QtWidgets.QScrollArea()
+        self.control_panel.setWidgetResizable(True)
+        self.control_panel.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        control_content = QtWidgets.QWidget()
+        self.control_panel.setWidget(control_content)
+        controls = QtWidgets.QVBoxLayout(control_content)
         controls.addWidget(QtWidgets.QLabel("Recording directory"))
         self.directory = QtWidgets.QLineEdit()
         self.directory.setPlaceholderText("Select a recording folder")
@@ -158,6 +175,17 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         controls.addWidget(self.browse)
         self.recursive = QtWidgets.QCheckBox("Include nested subdirectories")
         controls.addWidget(self.recursive)
+        frequency_form = QtWidgets.QFormLayout()
+        self.optical_frequency = self._frequency(50)
+        self.optical_frequency_2 = self._frequency(100)
+        self.optical_frequency_2.setEnabled(False)
+        self.evaluate_second_frequency = QtWidgets.QCheckBox("Evaluate second optical frequency")
+        self.evaluate_second_frequency.toggled.connect(self.optical_frequency_2.setEnabled)
+        self.evaluate_second_frequency.toggled.connect(self._refresh_normalization)
+        frequency_form.addRow("Optical frequency 1", self.optical_frequency)
+        frequency_form.addRow(self.evaluate_second_frequency)
+        frequency_form.addRow("Optical frequency 2", self.optical_frequency_2)
+        controls.addLayout(frequency_form)
         form = QtWidgets.QFormLayout()
         self.highpass = self._cutoff()
         self.lowpass = self._cutoff()
@@ -166,8 +194,8 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         controls.addLayout(form)
         note = QtWidgets.QLabel(
             "0 disables a filter. Filters apply to each waveform before the "
-            "50 Hz peak amplitude is extracted (4th-order, zero-phase Butterworth). "
-            "Cutoffs near 50 Hz attenuate the measured amplitude.")
+            "selected sine amplitudes are extracted (4th-order, zero-phase Butterworth). "
+            "Click Plot / Refresh after changing evaluation frequencies. Reference current remains evaluated at 50 Hz.")
         note.setWordWrap(True)
         controls.addWidget(note)
         self.load_button = QtWidgets.QPushButton("Plot recordings / Refresh")
@@ -182,7 +210,7 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self.divide_by_reference.setToolTip("Divide each optical peak current by the corresponding reference peak current, before optional normalization. Missing or zero references produce gaps.")
         controls.addWidget(self.divide_by_reference)
         self.divide_by_reference.toggled.connect(self._refresh_normalization)
-        self.show_optical = QtWidgets.QCheckBox("Optical 50 Hz amplitude")
+        self.show_optical = QtWidgets.QCheckBox("Optical amplitudes")
         self.show_optical.setChecked(True)
         self.show_ambient = QtWidgets.QCheckBox("Ambient temperature")
         self.show_tec = QtWidgets.QCheckBox("TEC temperature")
@@ -212,7 +240,7 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         controls.addStretch()
         layout = QtWidgets.QVBoxLayout(self)
         self.time_axis = RecordingTimeAxis()
-        self.plot = pg.PlotWidget(title="50 Hz peak amplitude per recording",
+        self.plot = pg.PlotWidget(title="Optical peak amplitudes per recording",
                                   axisItems={"bottom": self.time_axis})
         self.plot.setBackground("w")
         self.plot.showGrid(x=True, y=True, alpha=0.3)
@@ -247,6 +275,15 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         layout.addWidget(self.errors)
         self.browse.clicked.connect(self._browse)
         self.load_button.clicked.connect(self.load_recordings)
+
+    @staticmethod
+    def _frequency(value):
+        spin = QtWidgets.QDoubleSpinBox()
+        spin.setRange(0.001, 1e12)
+        spin.setDecimals(3)
+        spin.setSuffix(" Hz")
+        spin.setValue(value)
+        return spin
 
     @staticmethod
     def _cutoff():
@@ -291,6 +328,12 @@ class RecordingPlotWidget(QtWidgets.QWidget):
             self.status.setText("Please select an existing recording directory.")
             return
         hp, lp = self.highpass.value(), self.lowpass.value()
+        frequencies = (self.optical_frequency.value(),)
+        if self.evaluate_second_frequency.isChecked():
+            frequencies += (self.optical_frequency_2.value(),)
+            if frequencies[0] == frequencies[1]:
+                self.status.setText("Choose two different optical frequencies.")
+                return
         if hp and lp and hp >= lp:
             self.status.setText("High-pass cutoff must be below low-pass cutoff.")
             return
@@ -309,7 +352,7 @@ class RecordingPlotWidget(QtWidgets.QWidget):
             self.status.setText("No CSV, H5 or HDF5 files found.")
             return
         self._thread = QtCore.QThread(self)
-        self._worker = RecordingWorker(paths, hp, lp)
+        self._worker = RecordingWorker(paths, hp, lp, frequencies)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._progress)
@@ -330,6 +373,8 @@ class RecordingPlotWidget(QtWidgets.QWidget):
     def _display(self, rows, errors):
         self._rows = list(rows)
         self._errors = list(errors)
+        if self._rows and len(self._rows[0]) > 5:
+            self._loaded_frequencies = self._rows[0][5].get("optical_frequencies", (50,))
         self._refresh_normalization()
 
     def _refresh_normalization(self):
@@ -343,6 +388,8 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         y = np.array([row[1] for row in rows])
         aux = [row[5] if len(row) > 5 else {} for row in rows]
         reference = np.array([v.get("reference", np.nan) for v in aux]) * self.reference_amps_per_volt.value()
+        second_enabled = self.evaluate_second_frequency.isChecked() and len(self._loaded_frequencies) > 1
+        secondary = np.array([v.get("optical_secondary", np.nan) for v in aux])
         ratio = self.divide_by_reference.isChecked()
         invalid_ratios = 0
         if ratio:
@@ -351,6 +398,10 @@ class RecordingPlotWidget(QtWidgets.QWidget):
             with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
                 y = np.divide(y * optical_scale, reference, out=np.full(y.shape, np.nan), where=valid)
             y[~np.isfinite(y)] = np.nan
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                secondary = np.divide(secondary * optical_scale, reference, out=np.full(secondary.shape, np.nan),
+                                      where=np.isfinite(reference) & (reference != 0) & np.isfinite(secondary))
+            secondary[~np.isfinite(secondary)] = np.nan
             invalid_ratios = int(np.count_nonzero(~np.isfinite(y)))
         normalized = self.normalize.isChecked()
         zero_maximum = False
@@ -360,17 +411,28 @@ class RecordingPlotWidget(QtWidgets.QWidget):
                 y = y / maximum
             else:
                 zero_maximum = True
+        if normalized and second_enabled and np.any(np.isfinite(secondary)):
+            maximum = float(np.nanmax(secondary))
+            if maximum > 0:
+                secondary = secondary / maximum
         units = {row[3] for row in rows}
         unit = next(iter(units)) if len(units) == 1 else "mixed units"
         self.time_axis.set_capture_time(timed)
-        optical_label = "Optical / reference current" if ratio else "50 Hz peak amplitude"
+        first_frequency = self._loaded_frequencies[0]
+        optical_label = "Optical / reference current" if ratio else "Optical peak amplitude"
         if normalized:
             optical_label = "Normalized " + optical_label
         self.plot.setLabel("left", optical_label, units="" if normalized or ratio else unit)
         self.plot.getAxis("left").setVisible(self.show_optical.isChecked())
         if self.show_optical.isChecked():
             self._curves["optical"] = self.plot.plot(x, y, pen=pg.mkPen("b", width=1.5), symbol="o", symbolSize=6,
-                                                     name="Optical / reference" if ratio else "Optical amplitude", connect="finite")
+                                                     name=f"Optical {first_frequency:g} Hz" + (" / reference" if ratio else ""), connect="finite")
+            if second_enabled:
+                second_frequency = self._loaded_frequencies[1]
+                self._curves["optical_secondary"] = self.plot.plot(
+                    x, secondary, pen=pg.mkPen("#dc2626", width=1.5), symbol="t", symbolSize=6,
+                    symbolBrush="#dc2626", symbolPen="#dc2626", connect="finite",
+                    name=f"Optical {second_frequency:g} Hz" + (" / reference" if ratio else ""))
         ambient = np.array([v.get("ambient", np.nan) for v in aux])
         tec = np.array([v.get("tec", np.nan) for v in aux])
         if normalized and np.any(np.isfinite(reference)):
@@ -404,15 +466,21 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self.current_view.enableAutoRange(axis=pg.ViewBox.YAxis)
         self._sync_overlay_views()
         self.table.setRowCount(len(rows))
-        self.table.setHorizontalHeaderLabels([
-            "File", "Capture time", optical_label,
-            "Ambient (°C)", "TEC (°C)", "Normalized reference" if normalized else "Reference peak (A)"])
+        headers = ["File", "Capture time", f"{optical_label} ({first_frequency:g} Hz)",
+                   "Ambient (°C)", "TEC (°C)", "Normalized reference" if normalized else "Reference peak (A)"]
+        if second_enabled:
+            headers.append(f"{optical_label} ({self._loaded_frequencies[1]:g} Hz)")
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
         for i, row in enumerate(rows):
             path, amplitude, timestamp, unit, _ = row[:5]
             values = [path.name, datetime.fromtimestamp(timestamp).isoformat(timespec="milliseconds")
                       if timestamp is not None else "—", (f"{y[i]:.9g}" if np.isfinite(y[i]) else "—")
                       if normalized or ratio else f"{amplitude:.9g} {unit}".strip()]
             values.extend(f"{series[i]:.9g}" if np.isfinite(series[i]) else "—" for series in (ambient, tec, reference))
+            if second_enabled:
+                values.append((f"{secondary[i]:.9g}" + (f" {unit}" if not normalized and not ratio else ""))
+                              if np.isfinite(secondary[i]) else "—")
             for j, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
                 item.setToolTip(str(path))

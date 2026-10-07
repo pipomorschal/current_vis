@@ -20,6 +20,7 @@ from signal_data_import import OscilloscopeImporter, ScopeCaptureConfig, ScopeCo
 from plot_panel_widget import PlotPanel
 from frequency_sweep_widget import FrequencyInput, FrequencySweepWidget
 from recording_plot_widget import RecordingPlotWidget
+from mini_game_widget import MiniGameWidget
 from scope_capture_process import capture_isolated
 from recording_temperatures import read_optional_temperatures, apply_tec_sweep_setpoint
 from tec_temperature_sweep import TecTemperatureSweep
@@ -193,17 +194,35 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.controls = self._build_controls()
         self.tabs = QtWidgets.QTabWidget()
+        logo_path = Path(__file__).resolve().parent / "Logo_png.png"
+        logo = QtGui.QPixmap(str(logo_path))
+        if not logo.isNull():
+            icon = QtGui.QIcon(logo)
+            self.setWindowIcon(icon)
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                app.setWindowIcon(icon)
+            self.logo_label = QtWidgets.QLabel()
+            self.logo_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.logo_label.setFixedSize(130, 60)
+            self.logo_label.setStyleSheet("background: white; border-radius: 4px;")
+            self.logo_label.setPixmap(logo.scaled(
+                120, 52, QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation))
+            self.tabs.setCornerWidget(self.logo_label, QtCore.Qt.Corner.TopRightCorner)
 
         self.time_plot = PlotPanel("Time Domain")
         self.freq_plot = PlotPanel("Frequency Domain")
         self.demo_plot = PlotPanel("Demodulation")
         self.sweep_widget = FrequencySweepWidget()
         self.recording_widget = RecordingPlotWidget()
+        self.mini_game_widget = MiniGameWidget()
 
         self.sidebar_stack = QtWidgets.QStackedWidget()
         self.sidebar_stack.addWidget(self.controls)
         self.sidebar_stack.addWidget(self.sweep_widget.control_panel)
         self.sidebar_stack.addWidget(self.recording_widget.control_panel)
+        self.sidebar_stack.addWidget(self.mini_game_widget.control_panel)
         self.sidebar_stack.setMinimumWidth(340)
         self.sidebar_stack.setMaximumWidth(340)
         self.sidebar_stack.setSizePolicy(
@@ -218,6 +237,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.demo_plot, "Demodulation")
         self.tabs.addTab(self.sweep_widget, "Frequency Sweep")
         self.tabs.addTab(self.recording_widget, "Recordings")
+        self.tabs.addTab(self.mini_game_widget, "Mini Game")
 
         self.statusBar().showMessage("Ready")
         self._build_menu()
@@ -763,6 +783,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_sidebar_visibility(self):
         current = self.tabs.currentWidget()
         self.sidebar_stack.setCurrentWidget(
+            self.mini_game_widget.control_panel if current == self.mini_game_widget else
             self.recording_widget.control_panel if current == self.recording_widget else
             self.sweep_widget.control_panel if current == self.sweep_widget else self.controls
         )

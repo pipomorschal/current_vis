@@ -129,6 +129,16 @@ verifizierten AFG1062-VISA-Upload wie `Rectangular + Ramp`.
 
 # Recording visualization
 
+Select **Optical frequency 1** (default 50 Hz). To evaluate a second component,
+enable **Evaluate second optical frequency**, enter **Optical frequency 2**, and
+click **Plot recordings / Refresh**. With both enabled, a joint sine/cosine fit
+extracts the two peak amplitudes from each waveform. They appear as separate
+curves with frequency labels and separate table columns. Optional filtering
+applies before the fit. Optical/reference division uses the recorded reference's
+50 Hz peak current for both optical components, and normalization divides each
+displayed optical curve by its own maximum. Frequency changes require Refresh;
+the second-frequency checkbox can hide a previously loaded second curve.
+
 The **Recordings** sidebar has independent plot toggles for optical amplitude,
 and a **Divide optical current by reference** checkbox. This divides each
 optical 50 Hz peak current by the corresponding reference peak current before
