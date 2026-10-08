@@ -237,7 +237,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.demo_plot, "Demodulation")
         self.tabs.addTab(self.sweep_widget, "Frequency Sweep")
         self.tabs.addTab(self.recording_widget, "Recordings")
-        self.tabs.addTab(self.mini_game_widget, "Mini Game")
+        self.tabs.addTab(self.mini_game_widget, " ")
 
         self.statusBar().showMessage("Ready")
         self._build_menu()
