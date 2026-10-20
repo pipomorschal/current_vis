@@ -20,9 +20,13 @@ from recording_temperatures import read_optional_temperatures, apply_tec_sweep_s
 
 def capture_isolated(config, output_path=None, extra_metadata=None, cancelled=None,
                      deadline_seconds=None):
+    if not np.isfinite(config.tec_settle_seconds) or config.tec_settle_seconds < 0:
+        raise ValueError("TEC settling time must be finite and non-negative")
     channels = 2 if config.reference_channel else 1
-    deadline_seconds = deadline_seconds if deadline_seconds is not None else max(
-        120, config.timeout_ms / 1000 * 12 * channels + 10 * bool(config.itc4005_resource) + 3 * bool(config.t4200_port))
+    deadline_seconds = deadline_seconds if deadline_seconds is not None else (
+        max(120, config.timeout_ms / 1000 * 12 * channels + 10 * bool(config.itc4005_resource)
+            + 3 * bool(config.t4200_port)) + config.tec_settle_seconds
+        + (config.trigger_wait_seconds if config.fresh_trigger else 0))
     with TemporaryDirectory(prefix="scope_capture_") as folder:
         root = Path(folder)
         request = {"config": asdict(config), "output_path": str(output_path) if output_path else None,
@@ -88,7 +92,11 @@ def run_capture(root):
     try:
         request = json.loads((root / "request.json").read_text(encoding="utf-8"))
         config = ScopeCaptureConfig(**request["config"])
+        if not np.isfinite(config.tec_settle_seconds) or config.tec_settle_seconds < 0:
+            raise ValueError("TEC settling time must be finite and non-negative")
         sweep_metadata = apply_tec_sweep_setpoint(config)
+        if config.tec_settle_seconds:
+            time.sleep(config.tec_settle_seconds)
         data = OscilloscopeImporter.capture_channel(config)
         data.metadata.update(request["metadata"])
         data.metadata.update(sweep_metadata)

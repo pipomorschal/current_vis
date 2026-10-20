@@ -159,6 +159,95 @@ respective maxima; temperatures remain in °C. Missing readings appear as gaps
 and unavailable series are reported in the sidebar. The table includes all
 available values. Toggle and scale changes reuse loaded data.
 
+## TEC temperature sine (USB only)
+
+The **TEC Sine** tab continuously sends
+`T(t) = center + amplitude * sin(2*pi*frequency*t)` to the ITC4005 over USB.
+Set the center temperature, amplitude (**peak**, in °C), and frequency in Hz,
+mHz or µHz. The preview shows one period and the last verified setpoint.
+Defaults are 25 °C center, ±1 °C amplitude, 1 mHz (1000 s period), and a 5 s
+setpoint update interval. The sine starts at the center and rises.
+
+Select or enter the USB VISA resource (or **Use Time tab TEC**) and press
+**Start sine**. No oscilloscope acquisition, temperature measurement or recording
+is performed. Readback only verifies accepted setpoints. The TEC must already
+be enabled in temperature-control mode, and the complete center ± amplitude
+range is checked against its configured limits before the first write.
+Choose an update interval giving at least 20 setpoints per period. Writes run
+sequentially in an isolated process; if USB is slow, missed updates are skipped
+and the sine phase follows elapsed time. The actual temperature follows the
+controller's thermal dynamics.
+
+It runs until **Stop**, a communication/verification error, or application
+shutdown. Stop retains the last commanded setpoint. Hardware access is shared
+with PID, scope logging and frequency sweeps. The tab does not save data files.
+
+## TEC PID working-point optimization
+
+The **TEC PID** tab, immediately before the mini-game, adjusts the ITC4005 TEC
+temperature to improve the transducer's measured 50 Hz current signal while
+suppressing its 100 Hz harmonic. It uses a bounded extremum-seeking loop:
+
+`J = (A50 - weight * A100) / initial_A50`
+
+Both amplitudes are **peak voltages at the scope input**, jointly fitted at
+50 and 100 Hz with a DC offset. Configure the current probe/transducer scale
+on the scope consistently. Weight defaults to 1; increase it to penalize 100 Hz
+more strongly. The objectives can compete, so the loop seeks a **local weighted
+optimum**, rather than guaranteeing both independent extrema or a global optimum.
+An ordinary amplitude-setpoint PID cannot determine the direction toward an
+unknown maximum. Instead, each cycle measures center-minus-probe and
+center-plus-probe, estimates the score gradient, applies a PID correction to
+the center, then commands and measures that new center. The ITC4005 continues
+to run its own internal temperature-control loop.
+
+1. Start with **Simulation** (default, no hardware; thermal time runs 60x faster).
+2. For hardware, choose separate scope and ITC4005 VISA resources, or use
+   **Use Time tab inputs**. Configure the scope timebase, input scale and trigger
+   source/level first. The transferred waveform must span at least 0.2 s with
+   a sample rate above 200 Hz. The harmonic fit uses up to the first two seconds,
+   with anti-alias filtering before reducing large records.
+3. Set suitable TEC bounds and starting temperature for your transducer.
+   The example defaults are 20–30 °C, starting at 25 °C; they are **not measured
+   device limits**. The center leaves room for symmetric ±0.2 °C probes.
+   The default maximum center move is 0.1 °C/cycle (probe transitions are separate).
+4. The initial gains are Kp=0.1 °C², Ki=0 °C²/s and Kd=0 °C²·s, acting on
+   the normalized gradient in 1/°C. They are conservative guesses. Integral
+   accumulation is conditional on the output and move limits; a gradient sign
+   change or deadband resets it. The time step uses actual elapsed cycle time.
+5. Set **Settle / step observation** (default 300 s) and **Minimum read interval**
+   (default 60 s). Each verified setpoint write is followed by the settling wait,
+   then a newly armed normal-triggered single acquisition. Missing triggers time
+   out; stale records and forced auto triggers are not used. Scope trigger source,
+   level and timebase remain those configured on the instrument. Acquisition/run
+   and trigger mode are restored after each completed read. A default cycle takes
+   at least 15 minutes plus I/O and analysis. Acquisition never overlaps another.
+6. Optionally run **Measure calibration** first. It measures the settled baseline,
+   samples a positive temperature step over the observation period, measures the
+   negative probe and returns to the start. Use at least four sampling intervals
+   and preferably enough observation time to see the response plateau. A resolved
+   63% response crossing suggests a dwell of at least five response times;
+   local concave score curvature suggests an initial Kp. These estimates include
+   communication/acquisition delay. Flat, drifting or unresolved responses are
+   reported rather than producing a timing estimate. **Use calibration estimates**
+   explicitly copies the proposed gains and dwell; simulation estimates cannot
+   be applied in hardware mode. Retune after changing the harmonic penalty.
+7. **Start optimization** runs the configured number of cycles (default 100).
+   Live plots show both harmonics, commanded/measured TEC temperature and score.
+   Every measurement is flushed to a unique CSV in the selected log folder;
+   adjacent JSON files preserve settings and calibration estimates. Raw waveforms
+   are analyzed but are not saved by this tab.
+
+Hardware access is shared with scope logging and frequency sweeps; a real PID
+run locks those operations until its worker has finished. TEC output must already
+be enabled in temperature mode, and every command respects controller limits.
+Bad signal, failed readback, a measured temperature outside the chosen bounds,
+or a settled temperature outside the configured tolerance stops the run.
+**Stop** cancels waits/acquisition and retains the last commanded setpoint,
+including a probe setpoint if stopped mid-cycle. VISA runs in a disposable
+process; cancelling during a scope transaction may leave the scope stopped or
+armed in single-sequence mode. A completed optimization ends at its final center.
+
 ## Optional recording inputs
 
 **TEC temperature sweep** in Logging Mode optionally sets an ascending ITC4005
@@ -168,7 +257,10 @@ temperature sequence using **Minimum**, **Maximum**, **Increment** (°C), and
 60-minute dwell at 30 °C. Sweep duration replaces **Maximum Time**; the ordinary
 recording interval still controls captures, with an extra capture at each step
 boundary when needed. The maximum is included even if the increment does not
-divide the range exactly.
+divide the range exactly. **Repeat count (N)** defaults to **1** and runs the
+complete range N times. Each repetition includes the full dwell at maximum
+before restarting at minimum. The displayed total duration and recording stop
+time include all repetitions; saved files also identify the repetition number.
 
 Setpoints are applied between captures in the isolated VISA process using
 `SOUR2:TEMP`, with readback verification before waveform acquisition. A long

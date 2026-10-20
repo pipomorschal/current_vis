@@ -24,6 +24,8 @@ from mini_game_widget import MiniGameWidget
 from scope_capture_process import capture_isolated
 from recording_temperatures import read_optional_temperatures, apply_tec_sweep_setpoint
 from tec_temperature_sweep import TecTemperatureSweep
+from tec_pid_widget import TecPidWidget
+from tec_sine_widget import TecSineWidget
 
 
 class ScopeAcquireWorker(QtCore.QObject):
@@ -216,12 +218,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.demo_plot = PlotPanel("Demodulation")
         self.sweep_widget = FrequencySweepWidget()
         self.recording_widget = RecordingPlotWidget()
+        self.tec_pid_widget = TecPidWidget()
+        self.tec_sine_widget = TecSineWidget()
         self.mini_game_widget = MiniGameWidget()
 
         self.sidebar_stack = QtWidgets.QStackedWidget()
         self.sidebar_stack.addWidget(self.controls)
         self.sidebar_stack.addWidget(self.sweep_widget.control_panel)
         self.sidebar_stack.addWidget(self.recording_widget.control_panel)
+        self.sidebar_stack.addWidget(self.tec_pid_widget.control_panel)
+        self.sidebar_stack.addWidget(self.tec_sine_widget.control_panel)
         self.sidebar_stack.addWidget(self.mini_game_widget.control_panel)
         self.sidebar_stack.setMinimumWidth(340)
         self.sidebar_stack.setMaximumWidth(340)
@@ -237,6 +243,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.demo_plot, "Demodulation")
         self.tabs.addTab(self.sweep_widget, "Frequency Sweep")
         self.tabs.addTab(self.recording_widget, "Recordings")
+        self.tabs.addTab(self.tec_sine_widget, "TEC Sine")
+        self.tabs.addTab(self.tec_pid_widget, "TEC PID")
         self.tabs.addTab(self.mini_game_widget, " ")
 
         self.statusBar().showMessage("Ready")
@@ -397,10 +405,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_tec_sweep_minutes.setDecimals(3)
         self.spin_tec_sweep_minutes.setValue(60)
         self.spin_tec_sweep_minutes.setSuffix(" min")
+        self.spin_tec_sweep_repeats = QtWidgets.QSpinBox()
+        self.spin_tec_sweep_repeats.setRange(1, 100000)
+        self.spin_tec_sweep_repeats.setValue(1)
+        self.spin_tec_sweep_repeats.setToolTip("Number of complete minimum-to-maximum sweeps, including a full dwell at each maximum.")
         tec_form.addRow("Minimum", self.spin_tec_sweep_min)
         tec_form.addRow("Maximum", self.spin_tec_sweep_max)
         tec_form.addRow("Increment", self.spin_tec_sweep_increment)
         tec_form.addRow("Time per step", self.spin_tec_sweep_minutes)
+        tec_form.addRow("Repeat count (N)", self.spin_tec_sweep_repeats)
         self.lbl_tec_sweep_summary = QtWidgets.QLabel()
         self.lbl_tec_sweep_summary.setWordWrap(True)
         tec_form.addRow(self.lbl_tec_sweep_summary)
@@ -410,7 +423,7 @@ class MainWindow(QtWidgets.QMainWindow):
         scope_log_form.addRow(self.group_tec_sweep)
         self.group_tec_sweep.toggled.connect(self._update_tec_sweep_ui)
         for spin in (self.spin_tec_sweep_min, self.spin_tec_sweep_max,
-                     self.spin_tec_sweep_increment, self.spin_tec_sweep_minutes):
+                     self.spin_tec_sweep_increment, self.spin_tec_sweep_minutes, self.spin_tec_sweep_repeats):
             spin.valueChanged.connect(self._update_tec_sweep_ui)
         self._update_tec_sweep_ui()
         self.check_ambient_temperature = QtWidgets.QCheckBox("Read T4200 ambient temperature")
@@ -695,6 +708,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sweep_widget.frequency_selected.connect(self._on_sweep_frequency_selected)
         self.sweep_widget.status_message.connect(self.statusBar().showMessage)
         self.sweep_widget.hardware_busy_changed.connect(self._on_sweep_hardware_busy_changed)
+        self.tec_pid_widget.hardware_busy_changed.connect(self._on_pid_hardware_busy_changed)
+        self.tec_pid_widget.use_time_inputs.connect(self._copy_pid_time_inputs)
+        self.tec_sine_widget.hardware_busy_changed.connect(self._on_pid_hardware_busy_changed)
+        self.tec_sine_widget.use_time_input.connect(self._copy_sine_time_input)
         self.combo_scope_resource.textActivated.connect(self.sweep_widget.set_scope_resource)
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -767,6 +784,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(bool)
     def _on_sweep_hardware_busy_changed(self, busy: bool):
+        self.tec_pid_widget.set_external_hardware_busy(busy)
+        self.tec_sine_widget.set_external_hardware_busy(busy)
         controls = self._scope_controls()
         if busy:
             self._scope_controls_before_sweep = [control.isEnabled() for control in controls]
@@ -780,9 +799,25 @@ class MainWindow(QtWidgets.QMainWindow):
             for control, enabled in zip(controls, previous):
                 control.setEnabled(enabled)
 
+    def _on_pid_hardware_busy_changed(self, busy: bool):
+        self._on_sweep_hardware_busy_changed(busy)
+        self.sweep_widget.set_external_hardware_busy(busy)
+
+    def _copy_pid_time_inputs(self):
+        self.tec_pid_widget.scope_resource.setEditText(self.combo_scope_resource.currentText())
+        self.tec_pid_widget.tec_resource.setEditText(self.combo_itc_resource.currentText())
+        self.tec_pid_widget.channel.setCurrentText(self.combo_scope_channel.currentText())
+        self.tec_pid_widget.points.setValue(self.spin_scope_points.value())
+        self.tec_pid_widget.timeout.setValue(self.spin_scope_timeout_ms.value())
+
+    def _copy_sine_time_input(self):
+        self.tec_sine_widget.resource.setEditText(self.combo_itc_resource.currentText())
+
     def _update_sidebar_visibility(self):
         current = self.tabs.currentWidget()
         self.sidebar_stack.setCurrentWidget(
+            self.tec_sine_widget.control_panel if current == self.tec_sine_widget else
+            self.tec_pid_widget.control_panel if current == self.tec_pid_widget else
             self.mini_game_widget.control_panel if current == self.mini_game_widget else
             self.recording_widget.control_panel if current == self.recording_widget else
             self.sweep_widget.control_panel if current == self.sweep_widget else self.controls
@@ -937,7 +972,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _tec_sweep_from_controls(self):
         return TecTemperatureSweep(self.spin_tec_sweep_min.value(), self.spin_tec_sweep_max.value(),
-                                   self.spin_tec_sweep_increment.value(), self.spin_tec_sweep_minutes.value() * 60)
+                                   self.spin_tec_sweep_increment.value(), self.spin_tec_sweep_minutes.value() * 60,
+                                   repeat_count=self.spin_tec_sweep_repeats.value())
 
     def _update_tec_sweep_ui(self, *_args):
         enabled = self.group_tec_sweep.isChecked()
@@ -948,7 +984,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_scope_log_max_minutes.setEnabled(not enabled)
         try:
             plan = self._tec_sweep_from_controls()
-            self.lbl_tec_sweep_summary.setText(f"{plan.step_count} setpoints; total {plan.duration_seconds / 60:g} min, including a full dwell at maximum.")
+            self.lbl_tec_sweep_summary.setText(
+                f"{plan.steps_per_sweep} setpoints per sweep × {plan.repeat_count} sweep(s); "
+                f"total {plan.duration_seconds / 60:g} min, including a full dwell at each maximum.")
         except ValueError as exc:
             self.lbl_tec_sweep_summary.setText(str(exc))
 
@@ -1054,6 +1092,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._set_scope_controls_enabled(False)
         self.sweep_widget.set_external_hardware_busy(True)
+        self.tec_pid_widget.set_external_hardware_busy(True)
+        self.tec_sine_widget.set_external_hardware_busy(True)
         self.lbl_scope_logging_status.setText("Logging started; acquiring first capture...")
         self.statusBar().showMessage("Oscilloscope logging started.", 3000)
         self._start_next_scope_log_capture()
@@ -1095,6 +1135,7 @@ class MainWindow(QtWidgets.QMainWindow):
             target = plan.target_at(elapsed)
             capture_config = replace(capture_config, tec_setpoint_deg_c=target)
             metadata.update(tec_sweep_step=str(plan.step_at(elapsed) + 1), tec_sweep_steps=str(plan.step_count),
+                            tec_sweep_repeat=str(plan.repeat_at(elapsed) + 1), tec_sweep_repeats=str(plan.repeat_count),
                             tec_sweep_min_deg_c=str(plan.minimum), tec_sweep_max_deg_c=str(plan.maximum),
                             tec_sweep_increment_deg_c=str(plan.increment), tec_sweep_step_seconds=str(plan.step_seconds),
                             logging_maximum_minutes=str(plan.duration_seconds / 60))
@@ -1158,6 +1199,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._set_scope_controls_enabled(False)
         self.sweep_widget.set_external_hardware_busy(True)
+        self.tec_pid_widget.set_external_hardware_busy(True)
+        self.tec_sine_widget.set_external_hardware_busy(True)
         if not is_logging:
             self.statusBar().showMessage("Oszilloskop-Akquise gestartet...", 3000)
         self._scope_thread.start()
@@ -1210,6 +1253,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scope_logging_finish_message = None
         self._set_scope_controls_enabled(True)
         self.sweep_widget.set_external_hardware_busy(False)
+        self.tec_pid_widget.set_external_hardware_busy(False)
+        self.tec_sine_widget.set_external_hardware_busy(False)
         self.lbl_scope_logging_status.setText(message)
         self.statusBar().showMessage(message, 8000)
 
@@ -1291,6 +1336,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not was_logging:
             self._set_scope_controls_enabled(True)
             self.sweep_widget.set_external_hardware_busy(False)
+            self.tec_pid_widget.set_external_hardware_busy(False)
+            self.tec_sine_widget.set_external_hardware_busy(False)
             return
 
         self._scope_capture_is_logging = False
@@ -1984,6 +2031,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_scope_resources()
 
     def closeEvent(self, event: QtGui.QCloseEvent):
+        if not self.tec_sine_widget.shutdown():
+            self.statusBar().showMessage("TEC sine is stopping. Close again after USB updates have stopped.")
+            event.ignore()
+            return
+        if not self.tec_pid_widget.shutdown():
+            self.statusBar().showMessage("TEC PID is stopping. Close again after the acquisition has stopped.")
+            event.ignore()
+            return
         if not self.recording_widget.shutdown():
             self.statusBar().showMessage("Recording analysis is stopping. Close again when it has finished.")
             event.ignore()

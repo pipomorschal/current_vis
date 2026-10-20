@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 import logging
+import time
 
 import numpy as np
 
@@ -26,6 +27,9 @@ class ScopeCaptureConfig:
 	t4200_channel: int = 1
 	t4200_float_offset: int = 1
 	tec_setpoint_deg_c: float | None = None
+	tec_settle_seconds: float = 0.0
+	fresh_trigger: bool = False
+	trigger_wait_seconds: float = 30.0
 
 
 class ScopeCommunicationError(RuntimeError):
@@ -82,6 +86,9 @@ class OscilloscopeImporter:
 			inst = rm.open_resource(config.resource_name)
 			inst.timeout = max(1000, int(config.timeout_ms))
 			stage = "configuring waveform transfer"
+			if config.fresh_trigger:
+				stage = "waiting for a fresh triggered waveform"
+				return cls._capture_triggered(inst, config)
 
 			if config.reference_channel:
 				if config.reference_channel.upper() == config.channel.upper():
@@ -118,6 +125,38 @@ class OscilloscopeImporter:
 					rm.close()
 				except Exception:
 					logging.getLogger("scope_recording").exception("Failed to close VISA resource manager")
+
+	@classmethod
+	def _capture_triggered(cls, inst, config):
+		"""Acquire a new single sequence using the scope's configured trigger source/level."""
+		if not np.isfinite(config.trigger_wait_seconds) or config.trigger_wait_seconds <= 0:
+			raise ValueError("Trigger wait must be finite and positive")
+		was_running = bool(cls._query_float(inst, "ACQUIRE:STATE?"))
+		stop_after = cls._parse_query_response(inst.query("ACQUIRE:STOPAFTER?")).upper()
+		trigger_mode = cls._parse_query_response(inst.query("TRIGGER:A:MODE?")).upper()
+		if stop_after not in {"RUNSTOP", "SEQUENCE", "SEQ"} or trigger_mode not in {"AUTO", "NORMAL", "NORM"}:
+			raise ValueError("Unsupported oscilloscope acquisition/trigger mode readback")
+		try:
+			inst.write("ACQUIRE:STATE STOP")
+			inst.write("TRIGGER:A:MODE NORMAL")
+			inst.write("ACQUIRE:STOPAFTER SEQUENCE")
+			inst.write("ACQUIRE:STATE RUN")
+			deadline = time.monotonic() + config.trigger_wait_seconds
+			while cls._query_float(inst, "ACQUIRE:STATE?") != 0:
+				if time.monotonic() >= deadline:
+					raise TimeoutError("No completed triggered acquisition before trigger timeout")
+				time.sleep(0.1)
+			data = cls._read_channel(inst, config, config.channel)
+			if config.reference_channel:
+				data.reference = cls._read_channel(inst, config, config.reference_channel)
+			data.metadata["fresh_trigger"] = "true"
+			return data
+		finally:
+			inst.write("ACQUIRE:STATE STOP")
+			inst.write(f"ACQUIRE:STOPAFTER {stop_after}")
+			inst.write(f"TRIGGER:A:MODE {trigger_mode}")
+			if was_running:
+				inst.write("ACQUIRE:STATE RUN")
 
 	@classmethod
 	def _read_channel(cls, inst, config, channel):

@@ -8,7 +8,7 @@ import struct
 import time
 
 
-def apply_tec_sweep_setpoint(config) -> dict[str, str]:
+def apply_tec_sweep_setpoint(config, *, required_range=None) -> dict[str, str]:
     """Apply and verify an explicitly enabled sweep target before acquisition."""
     target = config.tec_setpoint_deg_c
     if target is None:
@@ -25,13 +25,14 @@ def apply_tec_sweep_setpoint(config) -> dict[str, str]:
             return instrument.query(command).strip().split()[-1].upper().strip('"')
         unit = query("UNIT:TEMP?")
         if unit in {"C", "CEL", "CELSIUS"}:
-            native_target, tolerance = target, 1e-3
+            scale, offset, tolerance = 1, 0, 1e-3
         elif unit in {"K", "KEL", "KELVIN"}:
-            native_target, tolerance = target + 273.15, 1e-3
+            scale, offset, tolerance = 1, 273.15, 1e-3
         elif unit in {"F", "FAR", "FAHRENHEIT"}:
-            native_target, tolerance = target * 9 / 5 + 32, 1.8e-3
+            scale, offset, tolerance = 9 / 5, 32, 1.8e-3
         else:
             raise ValueError(f"Unsupported TEC temperature unit: {unit}")
+        native_target = target * scale + offset
         if query("SOUR2:FUNC?") not in {"TEMP", "TEMPERATURE"}:
             raise RuntimeError("ITC4005 must be in TEC temperature-control mode before starting a sweep")
         if query("OUTP2?") not in {"1", "ON"}:
@@ -39,6 +40,11 @@ def apply_tec_sweep_setpoint(config) -> dict[str, str]:
         low, high = float(query("SOUR2:TEMP:LIM:LOW?")), float(query("SOUR2:TEMP:LIM:HIGH?"))
         if not all(math.isfinite(v) for v in (low, high)) or not low <= native_target <= high:
             raise ValueError(f"Sweep target {target:g} °C is outside the controller's configured temperature limits")
+        if required_range is not None:
+            minimum, maximum = required_range
+            if (not all(math.isfinite(v) for v in (minimum, maximum)) or minimum > maximum
+                    or not low <= minimum * scale + offset <= maximum * scale + offset <= high):
+                raise ValueError("The complete temperature waveform must fit within the controller's configured limits")
         actual = float(query("SOUR2:TEMP?"))
         if not math.isclose(actual, native_target, rel_tol=0, abs_tol=tolerance):
             instrument.write(f"SOUR2:TEMP {native_target:.12g}")
