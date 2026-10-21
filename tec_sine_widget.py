@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import math
+from collections import deque
+from datetime import datetime
 import threading
 import time
 
@@ -11,6 +13,52 @@ import pyqtgraph as pg
 
 from tec_setpoint_process import set_tec_isolated, TecWriteCancelled
 from tec_sine import TecSineSettings
+from keithley2000 import Keithley2000, KeithleySettings, MeterCancelled, FUNCTIONS, BAUD_RATES
+
+
+class KeithleyReadWorker(QtCore.QThread):
+    reading = QtCore.Signal(object)
+    status = QtCore.Signal(str)
+    outcome = QtCore.Signal(str)
+
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.cancelled = threading.Event()
+
+    def cancel(self):
+        self.cancelled.set()
+
+    def run(self):
+        client = Keithley2000(self.settings, self.cancelled)
+        message = "Meter stopped. Front-panel control restored."
+        try:
+            client.connect()
+            self.status.emit(f"Connected: {client.identity}")
+            started = time.monotonic()
+            tick = 0
+            while not self.cancelled.is_set():
+                due = started + tick * self.settings.interval_seconds
+                if self.cancelled.wait(max(0, due - time.monotonic())):
+                    break
+                value = client.read()
+                if self.cancelled.is_set():
+                    break
+                now = time.monotonic()
+                self.reading.emit(dict(value=value, unit=self.settings.unit, function=self.settings.function,
+                                       elapsed_seconds=now - started, monotonic=now,
+                                       timestamp=datetime.now().astimezone().isoformat(timespec="milliseconds")))
+                tick = max(tick + 1, math.floor((now - started) / self.settings.interval_seconds) + 1)
+        except MeterCancelled:
+            pass
+        except Exception as exc:
+            message = f"Meter stopped on error: {exc}. TEC sine control is independent."
+        finally:
+            try:
+                client.close()
+            except Exception as exc:
+                message += f" Serial close failed: {exc}"
+        self.outcome.emit(message)
 
 
 class TecSineWorker(QtCore.QThread):
@@ -63,6 +111,9 @@ class TecSineWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.worker = None
+        self.meter_worker = None
+        self.meter_readings = deque(maxlen=5000)
+        self._meter_started_with_sine = False
         self.external_busy = False
         self._frequency_factor = 1e-3
         self._build_controls()
@@ -73,7 +124,8 @@ class TecSineWidget(QtWidgets.QWidget):
         description = QtWidgets.QLabel(
             "T(t) = center + amplitude × sin(2π × frequency × t). "
             "Amplitude is the peak deviation in °C. The sine starts at the center and rises. "
-            "Only temperature setpoints are sent to the ITC4005 over USB; no recording is performed.")
+            "Temperature setpoints are sent to the ITC4005 over USB. Optional Keithley 2000 readings "
+            "are displayed live; no data files are saved.")
         description.setWordWrap(True)
         layout.addWidget(description)
         self.status_label = QtWidgets.QLabel("Ready. Select the ITC4005 USB resource and press Start sine.")
@@ -96,6 +148,25 @@ class TecSineWidget(QtWidgets.QWidget):
         self.marker = self.plot.plot(pen=None, symbol="o", symbolSize=10,
                                      symbolBrush="#e6842a", symbolPen="#e6842a", name="Last verified setpoint")
         layout.addWidget(self.plot, 1)
+        self.meter_value = QtWidgets.QLabel("Keithley 2000: no reading")
+        self.meter_value.setStyleSheet("font-size: 17px; font-weight: bold;")
+        self.meter_value.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.meter_value)
+        self.meter_status = QtWidgets.QLabel("Meter is off. Choose the RS232 COM port and function in the sidebar.")
+        self.meter_status.setWordWrap(True)
+        layout.addWidget(self.meter_status)
+        self.meter_plot = pg.PlotWidget()
+        self.meter_plot.setBackground("w")
+        self.meter_plot.setTitle("Keithley 2000 readings", color="#222222")
+        self.meter_plot.setLabel("bottom", "Elapsed since meter start", "s")
+        self.meter_plot.setLabel("left", "DC voltage", "V")
+        for side in ("left", "bottom"):
+            self.meter_plot.getAxis(side).setPen(pg.mkPen("#333333"))
+            self.meter_plot.getAxis(side).setTextPen(pg.mkPen("#333333"))
+        self.meter_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.meter_curve = self.meter_plot.plot(pen=pg.mkPen("#279569", width=2))
+        layout.addWidget(self.meter_plot, 1)
+        self.meter_plot.hide()
         note = QtWidgets.QLabel(
             "The TEC must already be enabled in temperature-control mode. Its configured limits must contain "
             "the complete sine range. Actual temperature follows the TEC's thermal response. "
@@ -168,7 +239,13 @@ class TecSineWidget(QtWidgets.QWidget):
             "Runs continuously until Stop. Timing follows elapsed time; delayed updates are skipped.")
         instructions.setWordWrap(True)
         form.addRow(instructions)
-        scroll.setWidget(self.settings_panel)
+        body = QtWidgets.QWidget()
+        body_layout = QtWidgets.QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.addWidget(self.settings_panel)
+        self._build_meter_controls(body_layout)
+        body_layout.addStretch(1)
+        scroll.setWidget(body)
         outer.addWidget(scroll, 1)
         self.start_button = QtWidgets.QPushButton("Start sine")
         self.stop_button = QtWidgets.QPushButton("Stop")
@@ -180,6 +257,137 @@ class TecSineWidget(QtWidgets.QWidget):
         for spin in (self.center, self.amplitude, self.frequency, self.interval):
             spin.valueChanged.connect(self._update_preview)
         self.frequency_unit.currentTextChanged.connect(self._change_frequency_unit)
+
+    def _build_meter_controls(self, layout):
+        group = QtWidgets.QGroupBox("Keithley 2000 · RS232")
+        outer = QtWidgets.QVBoxLayout(group)
+        self.meter_with_sine = QtWidgets.QCheckBox("Start/stop meter with sine")
+        self.meter_with_sine.toggled.connect(self._show_meter_plot)
+        outer.addWidget(self.meter_with_sine)
+        self.meter_settings_panel = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(self.meter_settings_panel)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
+        self.meter_port = QtWidgets.QComboBox()
+        self.meter_port.setEditable(True)
+        self.meter_port.setMinimumWidth(0)
+        self.meter_port.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Fixed)
+        form.addRow("COM port", self.meter_port)
+        find = QtWidgets.QPushButton("Find serial ports")
+        find.clicked.connect(self._refresh_meter_ports)
+        form.addRow(find)
+        self.meter_baud = QtWidgets.QComboBox()
+        self.meter_baud.addItems([str(rate) for rate in BAUD_RATES])
+        self.meter_baud.setCurrentText("4800")
+        form.addRow("Baud rate (8N1)", self.meter_baud)
+        self.meter_flow = QtWidgets.QComboBox()
+        self.meter_flow.addItems(["None", "XON/XOFF"])
+        form.addRow("Flow control", self.meter_flow)
+        self.meter_function = QtWidgets.QComboBox()
+        self.meter_function.addItems(FUNCTIONS)
+        self.meter_function.setMinimumWidth(0)
+        self.meter_function.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Fixed)
+        form.addRow("Function", self.meter_function)
+        self.meter_interval = QtWidgets.QDoubleSpinBox()
+        self.meter_interval.setRange(0.1, 86400)
+        self.meter_interval.setValue(1)
+        self.meter_interval.setSuffix(" s")
+        form.addRow("Read interval", self.meter_interval)
+        self.meter_timeout = QtWidgets.QDoubleSpinBox()
+        self.meter_timeout.setRange(0.5, 60)
+        self.meter_timeout.setValue(5)
+        self.meter_timeout.setSuffix(" s")
+        form.addRow("Read timeout", self.meter_timeout)
+        note = QtWidgets.QLabel("Enable RS232 / SCPI on the meter and match baud/flow settings. "
+                                "The selected function uses its default measurement settings. "
+                                "AC readings are RMS. Live history holds the last 5000 points in memory.")
+        note.setWordWrap(True)
+        form.addRow(note)
+        outer.addWidget(self.meter_settings_panel)
+        buttons = QtWidgets.QHBoxLayout()
+        self.meter_start_button = QtWidgets.QPushButton("Start meter")
+        self.meter_stop_button = QtWidgets.QPushButton("Stop meter")
+        self.meter_stop_button.setEnabled(False)
+        self.meter_start_button.clicked.connect(self.start_meter)
+        self.meter_stop_button.clicked.connect(self.stop_meter)
+        buttons.addWidget(self.meter_start_button)
+        buttons.addWidget(self.meter_stop_button)
+        outer.addLayout(buttons)
+        layout.addWidget(group)
+
+    def _show_meter_plot(self, enabled):
+        if hasattr(self, "meter_plot"):
+            self.meter_plot.setVisible(enabled or self.meter_worker is not None or bool(self.meter_readings))
+
+    def _refresh_meter_ports(self):
+        try:
+            from serial.tools import list_ports
+            selected = self.meter_port.currentText()
+            self.meter_port.clear()
+            for port in list_ports.comports():
+                self.meter_port.addItem(port.device)
+                self.meter_port.setItemData(self.meter_port.count() - 1, port.description,
+                                            QtCore.Qt.ItemDataRole.ToolTipRole)
+            if selected:
+                self.meter_port.setEditText(selected)
+            if self.meter_port.count() == 0:
+                self.meter_status.setText("No serial ports found. Enter the adapter's COM port manually.")
+        except Exception as exc:
+            self.meter_status.setText(f"Serial port discovery failed: {exc}")
+
+    def meter_settings(self):
+        return KeithleySettings(port=self.meter_port.currentText().strip(),
+                                 baud_rate=int(self.meter_baud.currentText()),
+                                 function=self.meter_function.currentText(),
+                                 interval_seconds=self.meter_interval.value(),
+                                 timeout_seconds=self.meter_timeout.value(),
+                                 xonxoff=self.meter_flow.currentText() == "XON/XOFF")
+
+    def start_meter(self):
+        if self.meter_worker is not None:
+            return True
+        try:
+            settings = self.meter_settings()
+        except ValueError as exc:
+            self.meter_status.setText(str(exc))
+            return False
+        self.meter_readings.clear()
+        self.meter_curve.clear()
+        self.meter_value.setText("Keithley 2000: waiting for first reading…")
+        self.meter_plot.setLabel("left", settings.function, settings.unit)
+        self.meter_plot.show()
+        self.meter_settings_panel.setEnabled(False)
+        self.meter_start_button.setEnabled(False)
+        self.meter_stop_button.setEnabled(True)
+        self.meter_status.setText(f"Connecting to Keithley 2000 on {settings.port}…")
+        self.meter_worker = KeithleyReadWorker(settings, self)
+        self.meter_worker.reading.connect(self._on_meter_reading)
+        self.meter_worker.status.connect(self.meter_status.setText)
+        self.meter_worker.outcome.connect(self.meter_status.setText)
+        self.meter_worker.finished.connect(self._meter_finished)
+        self.meter_worker.start()
+        return True
+
+    def _on_meter_reading(self, row):
+        self.meter_readings.append(row)
+        self.meter_value.setText(f"{row['function']}: {row['value']:.9g} {row['unit']}   |   {row['timestamp']}")
+        self.meter_curve.setData([point["elapsed_seconds"] for point in self.meter_readings],
+                                 [point["value"] for point in self.meter_readings])
+
+    def stop_meter(self):
+        if self.meter_worker is not None:
+            self.meter_worker.cancel()
+            self.meter_stop_button.setEnabled(False)
+            self.meter_status.setText("Stopping meter reads…")
+
+    def _meter_finished(self):
+        worker = self.meter_worker
+        self.meter_worker = None
+        self.meter_settings_panel.setEnabled(True)
+        self.meter_start_button.setEnabled(True)
+        self.meter_stop_button.setEnabled(False)
+        if worker is not None:
+            worker.deleteLater()
 
     def settings(self):
         return TecSineSettings(center=self.center.value(), amplitude=self.amplitude.value(),
@@ -247,6 +455,13 @@ class TecSineWidget(QtWidgets.QWidget):
         except ValueError as exc:
             self.status_label.setText(str(exc))
             return
+        self._meter_started_with_sine = False
+        if self.meter_with_sine.isChecked() and self.meter_worker is None:
+            if not self.start_meter():
+                self.status_label.setText("Choose valid Keithley settings before starting the sine with meter readings.")
+                return
+            self._meter_started_with_sine = True
+        self.meter_with_sine.setEnabled(False)
         self.marker.clear()
         self._run_settings = settings
         self.settings_panel.setEnabled(False)
@@ -271,6 +486,8 @@ class TecSineWidget(QtWidgets.QWidget):
         self.status_label.setText(text)
 
     def stop(self):
+        if self._meter_started_with_sine:
+            self.stop_meter()
         if self.worker is not None:
             self.worker.cancel()
             self.stop_button.setEnabled(False)
@@ -280,6 +497,10 @@ class TecSineWidget(QtWidgets.QWidget):
         worker = self.worker
         self.worker = None
         self.settings_panel.setEnabled(True)
+        self.meter_with_sine.setEnabled(True)
+        if self._meter_started_with_sine:
+            self.stop_meter()
+            self._meter_started_with_sine = False
         self.stop_button.setEnabled(False)
         self.hardware_busy_changed.emit(False)
         self._update_preview()
@@ -291,7 +512,8 @@ class TecSineWidget(QtWidgets.QWidget):
         self._update_preview()
 
     def shutdown(self):
-        if self.worker is not None:
+        if self.worker is not None or self.meter_worker is not None:
             self.stop()
+            self.stop_meter()
             return False
         return True

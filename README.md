@@ -169,8 +169,8 @@ Defaults are 25 °C center, ±1 °C amplitude, 1 mHz (1000 s period), and a 5 s
 setpoint update interval. The sine starts at the center and rises.
 
 Select or enter the USB VISA resource (or **Use Time tab TEC**) and press
-**Start sine**. No oscilloscope acquisition, temperature measurement or recording
-is performed. Readback only verifies accepted setpoints. The TEC must already
+**Start sine**. No oscilloscope acquisition or recording is performed.
+TEC readback only verifies accepted setpoints. The TEC must already
 be enabled in temperature-control mode, and the complete center ± amplitude
 range is checked against its configured limits before the first write.
 Choose an update interval giving at least 20 setpoints per period. Writes run
@@ -181,6 +181,34 @@ controller's thermal dynamics.
 It runs until **Stop**, a communication/verification error, or application
 shutdown. Stop retains the last commanded setpoint. Hardware access is shared
 with PID, scope logging and frequency sweeps. The tab does not save data files.
+
+### Keithley 2000 readings via RS232
+
+The same tab can display live measurements from a **Keithley 2000** connected
+through a USB-to-RS232 adapter. In the sidebar's Keithley section, use **Find
+serial ports** or enter the COM port, and match the baud rate and flow control
+to the meter's RS232 menu. Defaults are **4800 baud, 8 data bits, no parity,
+one stop bit, no flow control**. XON/XOFF is also supported. Enable RS232 and
+SCPI on the meter; hardware RTS/CTS handshaking is disabled. Protocol details
+are in the [Keithley 2000 manual](https://download.tek.com/manual/2000-900_J-Aug2010_User.pdf).
+
+Select DC voltage (default), AC RMS voltage, DC current, AC RMS current,
+2/4-wire resistance or frequency, with the corresponding input connections.
+**Start meter** works independently of the temperature sine. Alternatively,
+check **Start/stop meter with sine** to start reading alongside the sine and
+stop that reading session when the sine stops. A meter session already running
+independently remains independent. Default read interval is 1 s and response
+timeout is 5 s; increase the timeout for slow measurement settings.
+
+The app verifies `*IDN?`, uses `CONF` to select the function with its default
+settings, and requests a fresh single measurement with `READ?`. CR, LF and
+combined response terminators are accepted. The numeric value, units and read
+completion timestamp appear above a trend plot; only the last 5000 points are
+kept in memory. No recording file is created. AC readings are meter RMS values,
+not separate 50/100 Hz amplitudes. Meter I/O runs separately from TEC updates;
+slow reads skip missed read slots. A timeout, invalid/overrange value or serial
+error stops the meter and shows the reason without stopping the sine. Stop
+cancels pending reads, returns local front-panel control and closes the port.
 
 ## TEC PID working-point optimization
 

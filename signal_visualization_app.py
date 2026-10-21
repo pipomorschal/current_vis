@@ -2032,7 +2032,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         if not self.tec_sine_widget.shutdown():
-            self.statusBar().showMessage("TEC sine is stopping. Close again after USB updates have stopped.")
+            self.statusBar().showMessage("TEC sine / meter is stopping. Close again after instrument communication has stopped.")
             event.ignore()
             return
         if not self.tec_pid_widget.shutdown():
