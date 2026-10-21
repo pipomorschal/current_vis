@@ -27,6 +27,7 @@ FUNCTIONS = {
     "Frequency": ("FREQ", "Hz", "HZ"),
 }
 BAUD_RATES = (300, 600, 1200, 2400, 4800, 9600, 19200)
+TERMINATORS = {"CR": b"\r", "CRLF": b"\r\n", "LF": b"\n"}
 
 
 class MeterCancelled(Exception):
@@ -41,12 +42,15 @@ class KeithleySettings:
     interval_seconds: float = 1.0
     timeout_seconds: float = 5.0
     xonxoff: bool = False
+    command_terminator: str = "Auto"
 
     def __post_init__(self):
         if not self.port.strip():
             raise ValueError("Select the Keithley USB-to-RS232 adapter's COM port")
         if self.baud_rate not in BAUD_RATES or self.function not in FUNCTIONS:
             raise ValueError("Unsupported Keithley baud rate or measurement function")
+        if self.command_terminator not in ("Auto", *TERMINATORS):
+            raise ValueError("Unsupported Keithley command terminator")
         if (not all(math.isfinite(v) for v in (self.interval_seconds, self.timeout_seconds))
                 or self.interval_seconds < 0.1 or self.timeout_seconds <= 0):
             raise ValueError("Read interval must be at least 0.1 s and timeout must be positive")
@@ -77,32 +81,36 @@ class Keithley2000:
         self.identity = None
         self.traffic = deque(maxlen=24)
         self._commands = deque(maxlen=16)
+        self._terminator = TERMINATORS.get(settings.command_terminator, b"\r")
 
     @property
     def diagnostics(self):
         s = self.settings
         return (f"Keithley 2000 serial session: {s.port}, {s.baud_rate} baud, 8N1, "
                 f"flow={'XON/XOFF' if s.xonxoff else 'None'}, timeout={s.timeout_seconds:g} s\n"
+                f"Command terminator: {s.command_terminator}; active bytes: {self._terminator!r}\n"
                 + "\n".join(self.traffic))
 
     def _check_cancelled(self):
         if self.cancelled.is_set():
             raise MeterCancelled()
 
-    def _write(self, command):
-        self._check_cancelled()
-        data = (command + "\r").encode("ascii")
+    def _send_raw(self, data, *, check_cancelled=True):
+        if check_cancelled:
+            self._check_cancelled()
         self.traffic.append(f"TX {data!r}")
-        self._commands.append(command.upper().lstrip(":"))
         if self.port.write(data) != len(data):
             raise TimeoutError("Incomplete Keithley serial command")
 
-    def query(self, command, *, accept=None):
-        self._write(command)
-        deadline = time.monotonic() + self.settings.timeout_seconds
+    def _write(self, command):
+        self._commands.append(command.upper().lstrip(":"))
+        self._send_raw(command.encode("ascii") + self._terminator)
+
+    def _read_line(self, deadline, *, check_cancelled=True):
         response = bytearray()
         while time.monotonic() < deadline:
-            self._check_cancelled()
+            if check_cancelled:
+                self._check_cancelled()
             byte = self.port.read(1)
             if byte in (b"\r", b"\n"):
                 if response:
@@ -114,10 +122,7 @@ class Keithley2000:
                     except UnicodeDecodeError as exc:
                         raise ValueError(
                             f"Non-ASCII serial response {raw[:80]!r}; check baud rate, 8N1 and the selected COM port") from exc
-                    # Some serial paths echo commands before the actual response.
-                    if line.upper().lstrip(":") in self._commands:
-                        continue
-                    if line and (accept is None or accept(line)):
+                    if line:
                         return line
             elif byte:
                 if byte in (b"\x11", b"\x13"):
@@ -127,7 +132,39 @@ class Keithley2000:
                     raise ValueError("Keithley response exceeded 1024 bytes")
         if response:
             self.traffic.append(f"RX incomplete {bytes(response)!r} (hex: {response.hex(' ')})")
+        return None
+
+    def query(self, command, *, accept=None):
+        self._write(command)
+        deadline = time.monotonic() + self.settings.timeout_seconds
+        while time.monotonic() < deadline:
+            line = self._read_line(deadline)
+            if line is None:
+                break
+            # Some serial paths echo commands before the actual response.
+            if line.upper().lstrip(":") in self._commands:
+                continue
+            if accept is None or accept(line):
+                return line
         raise TimeoutError(f"Keithley timed out on {command}; check COM port, baud rate, flow control and RS232/SCPI mode")
+
+    def _clear_device(self, *, check_cancelled=True):
+        # Flush BEFORE Ctrl-C. Commands sent during device-clear can be discarded,
+        # and flushing immediately AFTER it can discard the DCL acknowledgment.
+        self.port.reset_input_buffer()
+        self._send_raw(b"\x03", check_cancelled=check_cancelled)
+        clear_timeout = self.settings.timeout_seconds if check_cancelled else min(1.0, self.settings.timeout_seconds)
+        deadline = time.monotonic() + clear_timeout
+        while time.monotonic() < deadline:
+            line = self._read_line(deadline, check_cancelled=check_cancelled)
+            if line is None:
+                break
+            if line.upper() == "DCL":
+                self.traffic.append("Device clear acknowledged; ready for SCPI commands")
+                return
+        # Not every model/firmware acknowledges clear; give it a bounded settling
+        # interval rather than requiring DCL as an identity or as a prerequisite.
+        self.traffic.append("Device-clear settling interval completed without DCL acknowledgment")
 
     @staticmethod
     def _accept_identity(identity):
@@ -142,6 +179,8 @@ class Keithley2000:
 
     def _identify(self):
         for attempt in range(2):
+            if self.settings.command_terminator == "Auto":
+                self._terminator = b"\r" if attempt == 0 else b"\r\n"
             try:
                 return self.query("*IDN?", accept=self._accept_identity)
             except TimeoutError:
@@ -153,10 +192,11 @@ class Keithley2000:
                         f"{self.settings.baud_rate} baud; received {details}. "
                         "Check adapter COM port, meter baud/flow settings, RS232/SCPI mode and cable. "
                         "Use Copy serial details for the full exchange.") from None
-                self.traffic.append("Retrying identification after clearing stale input")
+                self.traffic.append("Retrying identification after device clear" +
+                                    (" with CRLF terminator" if self.settings.command_terminator == "Auto" else ""))
                 if self.cancelled.wait(0.2):
                     raise MeterCancelled()
-                self.port.reset_input_buffer()
+                self._clear_device()
 
     def connect(self):
         self._check_cancelled()
@@ -167,9 +207,7 @@ class Keithley2000:
                                       parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE,
                                       timeout=0.1, write_timeout=1, xonxoff=s.xonxoff,
                                       rtscts=False, dsrdtr=False)
-            # ^C clears any unfinished query/output from an earlier session.
-            self.port.write(b"\x03")
-            self.port.reset_input_buffer()
+            self._clear_device()
             self.identity = self._identify()
             # CONF establishes a one-shot immediate trigger and disables math/scanning.
             self._write(":SYST:REM")
@@ -193,7 +231,8 @@ class Keithley2000:
             try:
                 if self.identity is not None:
                     # Abort any pending read before returning front-panel control.
-                    self.port.write(b"\x03:SYST:LOC\r")
+                    self._clear_device(check_cancelled=False)
+                    self._send_raw(b":SYST:LOC" + self._terminator, check_cancelled=False)
             except Exception:
                 pass
             finally:

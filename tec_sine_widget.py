@@ -287,6 +287,10 @@ class TecSineWidget(QtWidgets.QWidget):
         self.meter_flow = QtWidgets.QComboBox()
         self.meter_flow.addItems(["None", "XON/XOFF"])
         form.addRow("Flow control", self.meter_flow)
+        self.meter_terminator = QtWidgets.QComboBox()
+        self.meter_terminator.addItems(["Auto", "CR", "CRLF", "LF"])
+        self.meter_terminator.setToolTip("Auto tries CR, then retries identification with CRLF and uses the successful terminator for readings.")
+        form.addRow("Command terminator", self.meter_terminator)
         self.meter_function = QtWidgets.QComboBox()
         self.meter_function.addItems(FUNCTIONS)
         self.meter_function.setMinimumWidth(0)
@@ -356,7 +360,8 @@ class TecSineWidget(QtWidgets.QWidget):
                                  function=self.meter_function.currentText(),
                                  interval_seconds=self.meter_interval.value(),
                                  timeout_seconds=self.meter_timeout.value(),
-                                 xonxoff=self.meter_flow.currentText() == "XON/XOFF")
+                                 xonxoff=self.meter_flow.currentText() == "XON/XOFF",
+                                 command_terminator=self.meter_terminator.currentText())
 
     def start_meter(self):
         if self.meter_worker is not None:

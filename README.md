@@ -214,7 +214,14 @@ If identification fails, use **Copy serial details** after the meter stops to
 copy the COM port, baud/flow settings and recent transmitted/received bytes.
 The status text itself can also be selected and copied. Startup ignores echoed
 commands and stale lines while waiting for a valid `*IDN?` response and retries
-identification once. Quoted identity fields are supported; a different Keithley
+identification once. Before sending SCPI, startup sends Ctrl-C and waits for a
+device-clear acknowledgment (`DCL`) or the configured timeout; it does not flush
+away the acknowledgment or send identification during the clear operation.
+**Command terminator** defaults to **Auto**: try CR, then clear and retry with
+CRLF, retaining the successful terminator for subsequent reads. Explicit CR,
+CRLF and LF choices are available. The diagnostic trace includes clear traffic
+and the active terminator. `DCL` is never accepted as a meter identity.
+Quoted identity fields are supported; a different Keithley
 model is still rejected. Garbled/non-ASCII data points to checking baud rate,
 8N1 framing, COM selection and the RS232 cable before changing the identity check.
 
