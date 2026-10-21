@@ -20,6 +20,7 @@ class KeithleyReadWorker(QtCore.QThread):
     reading = QtCore.Signal(object)
     status = QtCore.Signal(str)
     outcome = QtCore.Signal(str)
+    diagnostics = QtCore.Signal(str)
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -58,6 +59,7 @@ class KeithleyReadWorker(QtCore.QThread):
                 client.close()
             except Exception as exc:
                 message += f" Serial close failed: {exc}"
+            self.diagnostics.emit(str(client.diagnostics))
         self.outcome.emit(message)
 
 
@@ -114,6 +116,7 @@ class TecSineWidget(QtWidgets.QWidget):
         self.meter_worker = None
         self.meter_readings = deque(maxlen=5000)
         self._meter_started_with_sine = False
+        self.meter_serial_details = ""
         self.external_busy = False
         self._frequency_factor = 1e-3
         self._build_controls()
@@ -154,6 +157,7 @@ class TecSineWidget(QtWidgets.QWidget):
         layout.addWidget(self.meter_value)
         self.meter_status = QtWidgets.QLabel("Meter is off. Choose the RS232 COM port and function in the sidebar.")
         self.meter_status.setWordWrap(True)
+        self.meter_status.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.meter_status)
         self.meter_plot = pg.PlotWidget()
         self.meter_plot.setBackground("w")
@@ -313,7 +317,18 @@ class TecSineWidget(QtWidgets.QWidget):
         buttons.addWidget(self.meter_start_button)
         buttons.addWidget(self.meter_stop_button)
         outer.addLayout(buttons)
+        self.meter_copy_button = QtWidgets.QPushButton("Copy serial details")
+        self.meter_copy_button.setEnabled(False)
+        self.meter_copy_button.clicked.connect(self._copy_meter_details)
+        outer.addWidget(self.meter_copy_button)
         layout.addWidget(group)
+
+    def _copy_meter_details(self):
+        QtWidgets.QApplication.clipboard().setText(self.meter_status.text() + "\n" + self.meter_serial_details)
+
+    def _on_meter_diagnostics(self, details):
+        self.meter_serial_details = details
+        self.meter_copy_button.setEnabled(True)
 
     def _show_meter_plot(self, enabled):
         if hasattr(self, "meter_plot"):
@@ -360,10 +375,13 @@ class TecSineWidget(QtWidgets.QWidget):
         self.meter_start_button.setEnabled(False)
         self.meter_stop_button.setEnabled(True)
         self.meter_status.setText(f"Connecting to Keithley 2000 on {settings.port}…")
+        self.meter_serial_details = ""
+        self.meter_copy_button.setEnabled(False)
         self.meter_worker = KeithleyReadWorker(settings, self)
         self.meter_worker.reading.connect(self._on_meter_reading)
         self.meter_worker.status.connect(self.meter_status.setText)
         self.meter_worker.outcome.connect(self.meter_status.setText)
+        self.meter_worker.diagnostics.connect(self._on_meter_diagnostics)
         self.meter_worker.finished.connect(self._meter_finished)
         self.meter_worker.start()
         return True

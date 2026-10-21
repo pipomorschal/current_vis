@@ -6,6 +6,8 @@ RS232 uses 8N1, CR commands, and no hardware handshaking.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import deque
+import csv
 import math
 import re
 import threading
@@ -73,6 +75,15 @@ class Keithley2000:
         self.cancelled = cancelled if cancelled is not None else threading.Event()
         self.port = None
         self.identity = None
+        self.traffic = deque(maxlen=24)
+        self._commands = deque(maxlen=16)
+
+    @property
+    def diagnostics(self):
+        s = self.settings
+        return (f"Keithley 2000 serial session: {s.port}, {s.baud_rate} baud, 8N1, "
+                f"flow={'XON/XOFF' if s.xonxoff else 'None'}, timeout={s.timeout_seconds:g} s\n"
+                + "\n".join(self.traffic))
 
     def _check_cancelled(self):
         if self.cancelled.is_set():
@@ -81,10 +92,12 @@ class Keithley2000:
     def _write(self, command):
         self._check_cancelled()
         data = (command + "\r").encode("ascii")
+        self.traffic.append(f"TX {data!r}")
+        self._commands.append(command.upper().lstrip(":"))
         if self.port.write(data) != len(data):
             raise TimeoutError("Incomplete Keithley serial command")
 
-    def query(self, command):
+    def query(self, command, *, accept=None):
         self._write(command)
         deadline = time.monotonic() + self.settings.timeout_seconds
         response = bytearray()
@@ -93,12 +106,57 @@ class Keithley2000:
             byte = self.port.read(1)
             if byte in (b"\r", b"\n"):
                 if response:
-                    return response.decode("ascii").strip()
+                    raw = bytes(response)
+                    self.traffic.append(f"RX {raw!r} (hex: {raw.hex(' ')})")
+                    response.clear()
+                    try:
+                        line = raw.decode("ascii").strip()
+                    except UnicodeDecodeError as exc:
+                        raise ValueError(
+                            f"Non-ASCII serial response {raw[:80]!r}; check baud rate, 8N1 and the selected COM port") from exc
+                    # Some serial paths echo commands before the actual response.
+                    if line.upper().lstrip(":") in self._commands:
+                        continue
+                    if line and (accept is None or accept(line)):
+                        return line
             elif byte:
+                if byte in (b"\x11", b"\x13"):
+                    continue
                 response.extend(byte)
                 if len(response) > 1024:
                     raise ValueError("Keithley response exceeded 1024 bytes")
+        if response:
+            self.traffic.append(f"RX incomplete {bytes(response)!r} (hex: {response.hex(' ')})")
         raise TimeoutError(f"Keithley timed out on {command}; check COM port, baud rate, flow control and RS232/SCPI mode")
+
+    @staticmethod
+    def _accept_identity(identity):
+        parts = next(csv.reader([identity], skipinitialspace=True))
+        if len(parts) < 2 or "KEITHLEY" not in parts[0].upper():
+            return False
+        model = parts[1].strip().strip('"').upper()
+        if re.fullmatch(r"(?:MODEL\s*)?2000", model):
+            return True
+        # A different recognizable model should not be configured as a 2000.
+        raise ValueError(f"Expected a Keithley 2000; received {identity!r}")
+
+    def _identify(self):
+        for attempt in range(2):
+            try:
+                return self.query("*IDN?", accept=self._accept_identity)
+            except TimeoutError:
+                if attempt == 1:
+                    received = [line for line in self.traffic if line.startswith("RX")]
+                    details = "; ".join(received[-3:]) if received else "no response"
+                    raise TimeoutError(
+                        f"Could not identify a Keithley 2000 on {self.settings.port} at "
+                        f"{self.settings.baud_rate} baud; received {details}. "
+                        "Check adapter COM port, meter baud/flow settings, RS232/SCPI mode and cable. "
+                        "Use Copy serial details for the full exchange.") from None
+                self.traffic.append("Retrying identification after clearing stale input")
+                if self.cancelled.wait(0.2):
+                    raise MeterCancelled()
+                self.port.reset_input_buffer()
 
     def connect(self):
         self._check_cancelled()
@@ -112,11 +170,7 @@ class Keithley2000:
             # ^C clears any unfinished query/output from an earlier session.
             self.port.write(b"\x03")
             self.port.reset_input_buffer()
-            identity = self.query("*IDN?")
-            parts = identity.upper().split(",")
-            if len(parts) < 2 or "KEITHLEY" not in parts[0] or re.fullmatch(r"\s*(?:MODEL\s*)?2000\s*", parts[1]) is None:
-                raise ValueError(f"Expected a Keithley 2000 on {s.port}; received {identity[:100]!r}")
-            self.identity = identity
+            self.identity = self._identify()
             # CONF establishes a one-shot immediate trigger and disables math/scanning.
             self._write(":SYST:REM")
             self._write("*CLS")

@@ -210,6 +210,14 @@ slow reads skip missed read slots. A timeout, invalid/overrange value or serial
 error stops the meter and shows the reason without stopping the sine. Stop
 cancels pending reads, returns local front-panel control and closes the port.
 
+If identification fails, use **Copy serial details** after the meter stops to
+copy the COM port, baud/flow settings and recent transmitted/received bytes.
+The status text itself can also be selected and copied. Startup ignores echoed
+commands and stale lines while waiting for a valid `*IDN?` response and retries
+identification once. Quoted identity fields are supported; a different Keithley
+model is still rejected. Garbled/non-ASCII data points to checking baud rate,
+8N1 framing, COM selection and the RS232 cable before changing the identity check.
+
 ## TEC PID working-point optimization
 
 The **TEC PID** tab, immediately before the mini-game, adjusts the ITC4005 TEC
