@@ -9,7 +9,7 @@ import sys
 import time
 from types import SimpleNamespace
 
-from recording_temperatures import apply_tec_sweep_setpoint
+from recording_temperatures import apply_tec_sweep_setpoint, disable_tec_output
 
 
 class TecWriteCancelled(Exception):
@@ -17,18 +17,36 @@ class TecWriteCancelled(Exception):
 
 
 def apply_request(request):
+    if request.get("operation") == "disable_output":
+        return disable_tec_output(request["resource"], request["timeout_ms"])
     config = SimpleNamespace(itc4005_resource=request["resource"],
                              tec_setpoint_deg_c=request["target"], timeout_ms=request["timeout_ms"])
-    return apply_tec_sweep_setpoint(config, required_range=(request["minimum"], request["maximum"]))
+    return apply_tec_sweep_setpoint(config, required_range=(request["minimum"], request["maximum"]),
+                                    enable_output=request.get("enable_output", False))
 
 
 def set_tec_isolated(resource, target, minimum, maximum, *, timeout_ms=5000,
-                     cancelled=None, deadline_seconds=None):
+                     cancelled=None, deadline_seconds=None, enable_output=False):
     if cancelled is not None and cancelled.is_set():
         raise TecWriteCancelled()
     if not resource or not all(math.isfinite(v) for v in (target, minimum, maximum)) or not minimum <= target <= maximum:
         raise ValueError("A TEC resource and a target inside the waveform range are required")
-    request = dict(resource=resource, target=target, minimum=minimum, maximum=maximum, timeout_ms=timeout_ms)
+    request = dict(resource=resource, target=target, minimum=minimum, maximum=maximum,
+                   timeout_ms=timeout_ms, enable_output=enable_output)
+    return _run_request(request, cancelled=cancelled, deadline_seconds=deadline_seconds)
+
+
+def disable_tec_isolated(resource, *, timeout_ms=5000, deadline_seconds=None):
+    # Shutdown intentionally has no acquisition cancellation token: Stop must
+    # still send and verify OFF, even after a cancelled/stuck setpoint process.
+    if not resource:
+        raise ValueError("A TEC resource is required for output shutdown")
+    return _run_request(dict(operation="disable_output", resource=resource, timeout_ms=timeout_ms),
+                        deadline_seconds=deadline_seconds)
+
+
+def _run_request(request, *, cancelled=None, deadline_seconds=None):
+    timeout_ms = request["timeout_ms"]
     deadline_seconds = max(15, timeout_ms / 1000 * 12) if deadline_seconds is None else deadline_seconds
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), json.dumps(request)],
@@ -40,7 +58,7 @@ def set_tec_isolated(resource, target, minimum, maximum, *, timeout_ms=5000,
             if cancelled is not None and cancelled.is_set():
                 raise TecWriteCancelled()
             if time.monotonic() >= deadline:
-                raise TimeoutError(f"TEC setpoint write exceeded {deadline_seconds:g} s")
+                raise TimeoutError(f"TEC command exceeded {deadline_seconds:g} s")
             try:
                 output, errors = process.communicate(timeout=0.1)
                 break
@@ -55,8 +73,10 @@ def set_tec_isolated(resource, target, minimum, maximum, *, timeout_ms=5000,
                 message = errors[-2000:] or "TEC process exited unexpectedly"
             raise RuntimeError(message)
         result = json.loads(output)
-        if result.get("tec_sweep_setpoint_status") != "verified":
-            raise RuntimeError("TEC setpoint was not verified")
+        key, expected = (("tec_output_status", "off_verified") if request.get("operation") == "disable_output"
+                         else ("tec_sweep_setpoint_status", "verified"))
+        if result.get(key) != expected:
+            raise RuntimeError("TEC command was not verified")
         return result
     finally:
         if process.poll() is None:

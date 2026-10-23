@@ -24,6 +24,44 @@ Hinweis fuer Oszilloskopzugriff:
 python signal_visualization_app_main.py
 ```
 
+## Saved GUI configuration
+
+When the GUI closes, its settings are saved automatically to
+`%LOCALAPPDATA%/SignalVisualizationApp/last_config.json`. This includes VISA
+resources, COM ports and serial settings, acquisition parameters, TEC sine/DC
+sweeps, PID gains, output folders, filters and recording plot selections.
+Waveforms and live measurement results are saved separately by the recording
+functions.
+
+Use **File → Load last configuration** to restore the previous session, or
+**Load configuration…** / **Save configuration as…** for named JSON profiles.
+Loading is optional: startup uses the defaults. Loading only restores controls;
+it never enables an output or starts a measurement. Stop active instrument work
+and analysis before loading a profile. Configurations are validated before
+applying, and files are replaced only after a complete successful write.
+`SIGNAL_VISUALIZATION_CONFIG` can override the automatic-save path.
+
+## Automatic TEC output control
+
+**TEC output ON at start / OFF after run** defaults to checked in Time-tab
+logging, TEC Sine and TEC PID. It applies to Time-tab logging when ITC4005
+temperature reading or a TEC sweep is selected; optical-only logging does not
+operate the TEC. With temperature reading only, the existing controller
+setpoint is used. Temperature mode, limits and accepted setpoint are checked
+before enabling the output. Simulation never operates the hardware.
+
+The TEC stays enabled throughout the measurement, including sweep repeats,
+and is switched off after completion, Stop, a run error or shutdown. The final
+capture/save and any TEC write finish or cancel before output shutdown starts.
+OFF is verified in a separate bounded VISA process, even after cancellation;
+instrument controls stay locked until that attempt finishes. Failed verification
+is reported explicitly so the controller can be checked. Closing during active
+work requests Stop; close again once cleanup finishes, as with existing captures.
+Uncheck the option to retain the previous manual-output behavior: the TEC must
+already be on and retains its final setpoint. The output command controls only
+the TEC channel (`OUTP2`), as documented in the
+[Thorlabs Series 4000 programmer reference](https://www.thorlabs.com/software/MUC/4000_Series/Manual/Series4000_SPCI_Programmers_Reference_V3.2.pdf).
+
 ## Oszilloskopdaten in der GUI
 
 Im Bereich `Data` gibt es den Abschnitt `Oscilloscope Input`:
@@ -166,15 +204,20 @@ temperature. Choose **DC offset temperature** in the x-axis selector to compare
 optical amplitudes, DMM voltage and distortion across the offset sweep instead
 of capture time. File order remains chronological across repeated sweeps.
 
-Enable **Evaluate / plot optical THD (%)**, choose the highest harmonic (default
-10), then click **Plot recordings / Refresh**. The fundamental is Optical
-frequency 1 (default 50 Hz). THD-F is
+Enable **Evaluate / plot optical THD (%)** to calculate THD from the saved raw
+optical waveforms, including recordings loaded before THD was enabled. No
+pre-recorded THD value is required. The calculation runs in the background and
+keeps the current plots visible. Changing the highest harmonic (default 10) or
+Optical frequency 1 (the fundamental, default 50 Hz) recalculates THD
+automatically. Toggling an already calculated THD curve reuses the results.
+THD-F is
 `100 * sqrt(A2^2 + ... + AH^2) / A1`, excluding DC and broadband noise; this is
 THD, not THD+N ([definition](https://www.mathworks.com/help/simscape-electrical/ref/totalharmonicdistortion.html)).
 It uses a joint sine/cosine fit of the **unfiltered** optical waveform, so
 display filter cutoffs cannot hide distortion. Without filters, the displayed
-50/100 Hz components reuse that harmonic fit. At least five fundamental cycles
-and a sample rate strictly above twice the highest harmonic are required.
+50/100 Hz components reuse that harmonic fit. Short records are evaluated
+without a minimum cycle count. A sample rate strictly above twice the highest
+harmonic and enough samples to solve the harmonic fit are required.
 A zero/too-small fundamental or insufficient bandwidth produces a gap and
 warning, without discarding the other recording values. THD uses a separate
 percent axis and is unaffected by normalization or reference-current division.
@@ -191,8 +234,8 @@ setpoint update interval. The sine starts at the center and rises.
 
 Select or enter the USB VISA resource (or **Use Time tab inputs**) and press
 **Start sine**. With logging disabled, no oscilloscope acquisition or recording is performed.
-TEC readback only verifies accepted setpoints. The TEC must already
-be enabled in temperature-control mode, and the complete center ± amplitude
+TEC readback only verifies accepted setpoints. The TEC must be in
+temperature-control mode, and the complete center ± amplitude
 range is checked against its configured limits before the first write.
 For nonzero amplitude, choose an update interval giving at least 20 setpoints per period. Writes run
 sequentially in an isolated process; if USB is slow, missed updates are skipped
@@ -200,7 +243,7 @@ and the sine phase follows elapsed time. The actual temperature follows the
 controller's thermal dynamics.
 
 It runs until **Stop**, a communication/verification error, or application
-shutdown. Stop retains the last commanded setpoint. Hardware access is shared
+shutdown. Automatic TEC output control defaults to on (see above). Hardware access is shared
 with PID, scope logging and frequency sweeps. Data files are saved only when
 the logging group is enabled.
 
@@ -344,11 +387,12 @@ to run its own internal temperature-control loop.
    are analyzed but are not saved by this tab.
 
 Hardware access is shared with scope logging and frequency sweeps; a real PID
-run locks those operations until its worker has finished. TEC output must already
-be enabled in temperature mode, and every command respects controller limits.
+run locks those operations until its worker has finished, including TEC output
+shutdown. The TEC must be in temperature mode, and every command respects controller limits.
 Bad signal, failed readback, a measured temperature outside the chosen bounds,
 or a settled temperature outside the configured tolerance stops the run.
-**Stop** cancels waits/acquisition and retains the last commanded setpoint,
+**Stop** cancels waits/acquisition and then disables the TEC output when automatic
+output control is checked. In manual-output mode it retains the last setpoint,
 including a probe setpoint if stopped mid-cycle. VISA runs in a disposable
 process; cancelling during a scope transaction may leave the scope stopped or
 armed in single-sequence mode. A completed optimization ends at its final center.
@@ -370,9 +414,10 @@ time include all repetitions; saved files also identify the repetition number.
 Setpoints are applied between captures in the isolated VISA process using
 `SOUR2:TEMP`, with readback verification before waveform acquisition. A long
 capture or retry can delay a transition; the next target follows elapsed session
-time. The TEC must already be enabled in temperature-control mode. Controller
+time. The TEC must be in temperature-control mode. Controller
 temperature limits are respected. Failed setpoint application stops logging.
-The final commanded temperature is retained after completion or Stop. This is
+Automatic output control disables the TEC after completion or Stop. In manual
+output mode the final commanded temperature is retained. This is
 a timed setpoint sweep, not a wait-for-stabilization mode. Every saved file
 includes the commanded target, step number and schedule, alongside measured
 TEC temperature. All setpoint writes are disabled when the sweep is unchecked.

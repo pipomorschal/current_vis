@@ -27,6 +27,8 @@ from tec_temperature_sweep import TecTemperatureSweep
 from tec_pid_widget import TecPidWidget
 from tec_sine_widget import TecSineWidget
 from scope_recording_io import next_scope_logging_path
+from tec_output_worker import TecShutdownWorker
+from gui_configuration import default_config_path, save_configuration, load_configuration
 
 
 class ScopeAcquireWorker(QtCore.QObject):
@@ -57,7 +59,7 @@ class ScopeAcquireWorker(QtCore.QObject):
             if self.isolated:
                 data = capture_isolated(self.config, self.output_path, self.extra_metadata, self.cancelled)
             else:
-                sweep_metadata = apply_tec_sweep_setpoint(self.config)
+                sweep_metadata = apply_tec_sweep_setpoint(self.config, enable_output=self.config.auto_tec_output)
                 data = OscilloscopeImporter.capture_channel(self.config)
                 if self.extra_metadata:
                     data.metadata.update(self.extra_metadata)
@@ -136,8 +138,9 @@ class DemodulationWorker(QtCore.QObject):
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, *, config_path=None):
         super().__init__()
+        self.config_path = Path(config_path) if config_path is not None else default_config_path()
         self.setWindowTitle("Signal Visualization App")
         self.resize(1500, 900)
 
@@ -167,6 +170,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scope_failure_is_communication = False
         self._scope_log_handler = None
         self._tec_sweep_plan = None
+        self._scope_tec_shutdown = None
+        self._tec_shutdown_worker = None
         self._scope_log_timer = QtCore.QTimer(self)
         self._scope_log_timer.setSingleShot(True)
         self._demod_thread: QtCore.QThread | None = None
@@ -415,13 +420,16 @@ class MainWindow(QtWidgets.QMainWindow):
         tec_form.addRow("Increment", self.spin_tec_sweep_increment)
         tec_form.addRow("Time per step", self.spin_tec_sweep_minutes)
         tec_form.addRow("Repeat count (N)", self.spin_tec_sweep_repeats)
+        self.check_auto_tec_output = QtWidgets.QCheckBox("TEC output ON at start / OFF after run")
+        self.check_auto_tec_output.setChecked(True)
         self.lbl_tec_sweep_summary = QtWidgets.QLabel()
         self.lbl_tec_sweep_summary.setWordWrap(True)
         tec_form.addRow(self.lbl_tec_sweep_summary)
-        note = QtWidgets.QLabel("Sweep duration replaces Maximum Time. TEC must already be on in temperature mode. The final setpoint is held after stopping.")
+        note = QtWidgets.QLabel("Sweep duration replaces Maximum Time. TEC must be in temperature mode. Automatic output control disables it after completion, Stop or error.")
         note.setWordWrap(True)
         tec_form.addRow(note)
         scope_log_form.addRow(self.group_tec_sweep)
+        scope_log_form.addRow(self.check_auto_tec_output)
         self.group_tec_sweep.toggled.connect(self._update_tec_sweep_ui)
         for spin in (self.spin_tec_sweep_min, self.spin_tec_sweep_max,
                      self.spin_tec_sweep_increment, self.spin_tec_sweep_minutes, self.spin_tec_sweep_repeats):
@@ -659,6 +667,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         file_menu.addSeparator()
 
+        load_last = file_menu.addAction("Load last configuration")
+        load_last.triggered.connect(lambda: self._load_gui_configuration(self.config_path))
+        load_config = file_menu.addAction("Load configuration…")
+        load_config.triggered.connect(self._choose_gui_configuration)
+        save_config = file_menu.addAction("Save configuration as…")
+        save_config.triggered.connect(self._save_gui_configuration_as)
+        save_config.setToolTip(f"Settings also save automatically on close to {self.config_path}")
+        file_menu.addSeparator()
+
         action_exit = QtGui.QAction("Exit", self)
         action_exit.triggered.connect(self.close)
         file_menu.addAction(action_exit)
@@ -670,6 +687,67 @@ class MainWindow(QtWidgets.QMainWindow):
         self.action_auto_demod.setToolTip("Run lock-in demodulation automatically after data or range changes.")
         self.action_auto_demod.toggled.connect(self._on_auto_demod_toggled)
         processing_menu.addAction(self.action_auto_demod)
+
+    def _configuration_busy(self):
+        return (self._scope_logging_active or self._scope_thread is not None or self._tec_shutdown_worker is not None
+                or self.sweep_widget.is_busy or self.tec_pid_widget.worker is not None
+                or self.tec_sine_widget.worker is not None or self.tec_sine_widget.recording_worker is not None
+                or self.tec_sine_widget._shutdown_worker is not None or self.tec_sine_widget.meter_worker is not None
+                or self.recording_widget._thread is not None or self._demod_thread is not None)
+
+    def _choose_gui_configuration(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load GUI configuration", str(self.config_path.parent),
+                                                      "JSON configuration (*.json)")
+        if path:
+            self._load_gui_configuration(Path(path))
+
+    def _load_gui_configuration(self, path):
+        if self._configuration_busy():
+            self.statusBar().showMessage("Stop active acquisition, meter readings and analysis before loading settings.", 8000)
+            return False
+        try:
+            count = load_configuration(self, path)
+            self._update_tec_sweep_ui()
+            self._update_scope_logging_ui()
+            self.combo_scope_reference.setEnabled(self.check_scope_reference.isChecked())
+            for control in (self.edit_t4200_port, self.combo_t4200_channel, self.spin_t4200_float_offset):
+                control.setEnabled(self.check_ambient_temperature.isChecked())
+            scope_available = (OscilloscopeImporter.pyvisa_available() and bool(self.combo_scope_resource.currentText())
+                               and self.combo_scope_resource.currentText() not in {"No VISA resource", "pyvisa not installed"})
+            self.combo_scope_resource.setEnabled(scope_available)
+            self.btn_scope_acquire.setEnabled(scope_available)
+            self._current_time_unit_scale = self._time_unit_scale()
+            self._update_demod_scale_toggle_ui()
+            self._update_demod_mode_ui()
+            sweep = self.sweep_widget
+            sweep._update_mode_controls()
+            sweep._update_rectangular_ramp_preview()
+            sweep._update_serrodyne_dither_preview()
+            sweep._update_waveform_controls()
+            sine = self.tec_sine_widget
+            sine._update_preview()
+            self.tec_pid_widget._update_timing()
+            self.tec_pid_widget.set_external_hardware_busy(False)
+            recordings = self.recording_widget
+            recordings.optical_frequency_2.setEnabled(recordings.evaluate_second_frequency.isChecked())
+            recordings.thd_harmonics.setEnabled(recordings.show_thd.isChecked())
+            recordings._refresh_normalization()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Configuration", f"Could not load configuration: {exc}")
+            return False
+        self.statusBar().showMessage(f"Loaded {count} settings from {path}. Hardware remains idle.", 10000)
+        return True
+
+    def _save_gui_configuration_as(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save GUI configuration", str(self.config_path),
+                                                      "JSON configuration (*.json)")
+        if path:
+            try:
+                save_configuration(self, Path(path))
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Configuration", f"Could not save configuration: {exc}")
+                return
+            self.statusBar().showMessage(f"Configuration saved to {path}", 8000)
 
     def _connect_signals(self):
         self.btn_browse.clicked.connect(self.browse_file)
@@ -763,6 +841,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def _update_scope_logging_ui(self, _checked: bool | None = None):
+        if self._tec_shutdown_worker is not None:
+            self.btn_scope_acquire.setText("Switching TEC OFF…")
+            self.btn_scope_acquire.setEnabled(False)
+            return
         logging_selected = self.group_scope_logging.isChecked()
         if self._scope_logging_active:
             self.btn_scope_acquire.setText("Stop Logging")
@@ -957,8 +1039,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"{len(resources)} VISA-Ressource(n) gefunden", 4000)
 
     def _acquire_scope_data(self):
+        if self._tec_shutdown_worker is not None:
+            return
         if self._scope_logging_active:
             self._stop_scope_logging()
+        if self._tec_shutdown_worker is not None:
+            self.statusBar().showMessage("Waiting for TEC output OFF verification before closing.")
+            event.ignore()
+            return
             return
 
         if self._scope_thread is not None:
@@ -1036,6 +1124,8 @@ class MainWindow(QtWidgets.QMainWindow):
             t4200_port=ambient_port,
             t4200_channel=self.combo_t4200_channel.currentIndex() + 1,
             t4200_float_offset=self.spin_t4200_float_offset.value(),
+            auto_tec_output=(self.group_scope_logging.isChecked() and bool(itc_resource)
+                             and self.check_auto_tec_output.isChecked()),
         )
 
     def _start_scope_logging(self, config: ScopeCaptureConfig):
@@ -1069,6 +1159,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._scope_logging_session_id = started_at.isoformat(timespec="milliseconds")
         self._scope_logging_config = config
+        self._scope_tec_shutdown = ((config.itc4005_resource, config.timeout_ms)
+                                    if config.auto_tec_output and config.itc4005_resource else None)
         self._scope_logging_finish_message = None
         self._scope_logging_current_path = None
 
@@ -1232,6 +1324,28 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _finish_scope_logging(self, message: str):
+        if self._tec_shutdown_worker is not None:
+            return
+        if self._scope_tec_shutdown is not None:
+            resource, timeout = self._scope_tec_shutdown
+            self._scope_tec_shutdown = None
+            self._scope_log_timer.stop()
+            self._scope_logging_active = False
+            self._tec_shutdown_worker = TecShutdownWorker(resource, timeout, self)
+            self._tec_shutdown_worker.finished.connect(lambda: self._scope_output_shutdown_finished(message))
+            self.lbl_scope_logging_status.setText(message + " Switching TEC output OFF…")
+            self._update_scope_logging_ui()
+            self._tec_shutdown_worker.start()
+            return
+        self._complete_scope_logging(message)
+
+    def _scope_output_shutdown_finished(self, message):
+        worker = self._tec_shutdown_worker
+        self._tec_shutdown_worker = None
+        self._complete_scope_logging(message + " " + worker.result_text())
+        worker.deleteLater()
+
+    def _complete_scope_logging(self, message: str):
         logger = logging.getLogger("scope_recording")
         logger.info(message)
         if self._scope_log_handler is not None:
@@ -2025,6 +2139,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_scope_resources()
 
     def closeEvent(self, event: QtGui.QCloseEvent):
+        if self._tec_shutdown_worker is not None:
+            self.statusBar().showMessage("Waiting for TEC output OFF verification before closing.")
+            event.ignore()
+            return
         if not self.tec_sine_widget.shutdown():
             self.statusBar().showMessage("TEC sine / meter is stopping. Close again after instrument communication has stopped.")
             event.ignore()
@@ -2059,4 +2177,9 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             event.ignore()
             return
+        try:
+            save_configuration(self, self.config_path)
+        except Exception as exc:
+            logging.getLogger("scope_recording").exception("Could not save GUI configuration")
+            QtWidgets.QMessageBox.warning(self, "Configuration", f"Could not save settings to {self.config_path}: {exc}")
         super().closeEvent(event)

@@ -13,6 +13,7 @@ from PySide6 import QtCore, QtWidgets
 import pyqtgraph as pg
 
 from tec_setpoint_process import set_tec_isolated, TecWriteCancelled
+from tec_output_worker import TecShutdownWorker
 from tec_sine import TecSineSettings, TecSineSweep
 from tec_temperature_sweep import TecTemperatureSweep
 from tec_sine_recording import SineRunState, SineLogSettings, SineRecordingWorker
@@ -78,12 +79,14 @@ class TecSineWorker(QtCore.QThread):
     applied = QtCore.Signal(object)
     outcome = QtCore.Signal(str)
 
-    def __init__(self, settings, resource, timeout_ms=5000, parent=None, *, state=None, duration=None):
+    def __init__(self, settings, resource, timeout_ms=5000, parent=None, *, state=None, duration=None,
+                 auto_output=False):
         super().__init__(parent)
         self.settings, self.resource, self.timeout_ms = settings, resource, timeout_ms
         self.cancelled = threading.Event()
         self.recording_state = state
         self.duration = duration if duration is not None else getattr(settings, "duration_seconds", None)
+        self.auto_output = auto_output
 
     def cancel(self):
         self.cancelled.set()
@@ -103,7 +106,8 @@ class TecSineWorker(QtCore.QThread):
                     break
                 target = s.target_at(elapsed)
                 set_tec_isolated(self.resource, target, s.minimum, s.maximum,
-                                 timeout_ms=self.timeout_ms, cancelled=self.cancelled)
+                                 timeout_ms=self.timeout_ms, cancelled=self.cancelled,
+                                 enable_output=self.auto_output)
                 if self.cancelled.is_set():
                     break
                 finished = time.monotonic()
@@ -121,12 +125,14 @@ class TecSineWorker(QtCore.QThread):
                     due_elapsed = min(due_elapsed, (s.offsets.step_at(finished - started) + 1) * s.offsets.step_seconds)
                 if self.duration is not None:
                     due_elapsed = min(due_elapsed, self.duration)
-            self.outcome.emit("Stopped. The TEC holds its last commanded setpoint." if self.cancelled.is_set()
-                              else "Run complete. The TEC holds its final commanded setpoint.")
+            ending = " TEC output shutdown follows the final capture." if self.auto_output else " The TEC holds its last commanded setpoint."
+            self.outcome.emit(("Stopped." if self.cancelled.is_set() else "Run complete.") + ending)
         except TecWriteCancelled:
-            self.outcome.emit("Stopped. The TEC holds its last commanded setpoint.")
+            self.outcome.emit("Stopped. TEC output shutdown pending." if self.auto_output else
+                              "Stopped. The TEC holds its last commanded setpoint.")
         except Exception as exc:
-            self.outcome.emit(f"Stopped on error: {exc}. The TEC holds its last commanded setpoint.")
+            self.outcome.emit(f"Stopped on error: {exc}." + (" TEC output shutdown pending." if self.auto_output else
+                              " The TEC holds its last commanded setpoint."))
 
 
 class TecSineWidget(QtWidgets.QWidget):
@@ -141,6 +147,8 @@ class TecSineWidget(QtWidgets.QWidget):
         self.recording_worker = None
         self.run_state = None
         self._run_error = None
+        self._tec_shutdown = None
+        self._shutdown_worker = None
         self.meter_worker = None
         self.meter_readings = deque(maxlen=5000)
         self._meter_started_with_sine = False
@@ -204,9 +212,9 @@ class TecSineWidget(QtWidgets.QWidget):
         layout.addWidget(self.meter_plot, 1)
         self.meter_plot.hide()
         note = QtWidgets.QLabel(
-            "The TEC must already be enabled in temperature-control mode. Its configured limits must contain "
+            "The TEC must be in temperature-control mode. Its configured limits must contain "
             "the complete sine range. Actual temperature follows the TEC's thermal response. "
-            "Stop leaves the last commanded setpoint in place.")
+            "Automatic output control enables the TEC at Start and disables it after the final capture, Stop or error.")
         note.setWordWrap(True)
         layout.addWidget(note)
         self._update_preview()
@@ -270,6 +278,9 @@ class TecSineWidget(QtWidgets.QWidget):
         self.timeout.setValue(5000)
         self.timeout.setSuffix(" ms")
         form.addRow("USB timeout", self.timeout)
+        self.auto_tec_output = QtWidgets.QCheckBox("TEC output ON at start / OFF after run")
+        self.auto_tec_output.setChecked(True)
+        form.addRow(self.auto_tec_output)
         instructions = QtWidgets.QLabel(
             "1 mHz = 0.001 Hz = a 1000 s period. For nonzero AC amplitude, choose at least 20 setpoint updates per period. "
             "A DC sweep finishes after its final dwell; otherwise the sine runs until Stop or its logging time limit.")
@@ -586,7 +597,8 @@ class TecSineWidget(QtWidgets.QWidget):
                 self.marker.clear()
             self._preview_settings = program
             self.start_button.setText("Start offset sweep" if self.sweep_group.isChecked() else "Start sine")
-            self.start_button.setEnabled(self.worker is None and self.recording_worker is None and not self.external_busy)
+            self.start_button.setEnabled(self.worker is None and self.recording_worker is None
+                                         and self._shutdown_worker is None and not self.external_busy)
         except ValueError as exc:
             self.summary_label.setText(str(exc))
             self.preview_curve.clear()
@@ -618,7 +630,7 @@ class TecSineWidget(QtWidgets.QWidget):
             self.status_label.setText(f"USB discovery failed: {exc}")
 
     def start(self):
-        if self.worker is not None or self.recording_worker is not None or self.external_busy:
+        if self.worker is not None or self.recording_worker is not None or self._shutdown_worker is not None or self.external_busy:
             return
         try:
             settings = self.settings()
@@ -671,7 +683,9 @@ class TecSineWidget(QtWidgets.QWidget):
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.status_label.setText("Starting sine; checking the full temperature range against controller limits…")
-        self.worker = TecSineWorker(program, resource, self.timeout.value(), self, state=self.run_state, duration=duration)
+        self._tec_shutdown = (resource, self.timeout.value()) if self.auto_tec_output.isChecked() else None
+        self.worker = TecSineWorker(program, resource, self.timeout.value(), self, state=self.run_state, duration=duration,
+                                    auto_output=self.auto_tec_output.isChecked())
         self.worker.applied.connect(self._on_applied)
         self.worker.outcome.connect(self.status_label.setText)
         self.worker.finished.connect(self._finished)
@@ -728,7 +742,7 @@ class TecSineWidget(QtWidgets.QWidget):
         if self.worker is not None:
             self.worker.cancel()
             self.stop_button.setEnabled(False)
-            self.status_label.setText("Stopping USB updates; retaining the last commanded TEC setpoint…")
+            self.status_label.setText("Stopping USB updates; waiting for acquisition and TEC output cleanup…")
 
     def _finished(self):
         worker = self.worker
@@ -744,6 +758,17 @@ class TecSineWidget(QtWidgets.QWidget):
         # have finished, even when the TEC sweep has already completed.
         if self.worker is not None or self.recording_worker is not None:
             return
+        if self._shutdown_worker is not None:
+            return
+        if self._tec_shutdown is not None:
+            resource, timeout = self._tec_shutdown
+            self._tec_shutdown = None
+            self._shutdown_worker = TecShutdownWorker(resource, timeout, self)
+            self._shutdown_worker.finished.connect(self._output_shutdown_finished)
+            self.stop_button.setEnabled(False)
+            self.status_label.setText(self.status_label.text() + " Switching TEC output OFF…")
+            self._shutdown_worker.start()
+            return
         self.settings_panel.setEnabled(True)
         self.meter_with_sine.setEnabled(True)
         if self._meter_started_with_sine:
@@ -758,12 +783,20 @@ class TecSineWidget(QtWidgets.QWidget):
         if self._run_error:
             self.status_label.setText(f"Run stopped because logging failed: {self._run_error}")
 
+    def _output_shutdown_finished(self):
+        worker = self._shutdown_worker
+        self._shutdown_worker = None
+        self._release_run_controls()
+        self.status_label.setText(self.status_label.text() + " " + worker.result_text())
+        worker.deleteLater()
+
     def set_external_hardware_busy(self, busy):
         self.external_busy = bool(busy)
         self._update_preview()
 
     def shutdown(self):
-        if self.worker is not None or self.meter_worker is not None or self.recording_worker is not None:
+        if (self.worker is not None or self.meter_worker is not None or self.recording_worker is not None
+                or self._shutdown_worker is not None):
             self.stop()
             self.stop_meter()
             return False

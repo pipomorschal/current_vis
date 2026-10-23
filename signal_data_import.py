@@ -30,6 +30,7 @@ class ScopeCaptureConfig:
 	tec_settle_seconds: float = 0.0
 	fresh_trigger: bool = False
 	trigger_wait_seconds: float = 30.0
+	auto_tec_output: bool = False
 
 
 class ScopeCommunicationError(RuntimeError):

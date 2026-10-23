@@ -77,7 +77,8 @@ class SineRecordingWorker(QtCore.QThread):
         self.program, self.settings, self.state = program, settings, state
         # Scope acquisition must never write or open the TEC while its sine worker
         # owns the controller. Only verified command metadata is attached here.
-        self.config = replace(config, itc4005_resource=None, tec_setpoint_deg_c=None, tec_settle_seconds=0)
+        self.config = replace(config, itc4005_resource=None, tec_setpoint_deg_c=None, tec_settle_seconds=0,
+                              auto_tec_output=False)
         self.duration = duration if duration is not None else getattr(program, "duration_seconds", None)
         if self.duration is None and settings.maximum_seconds:
             self.duration = settings.maximum_seconds

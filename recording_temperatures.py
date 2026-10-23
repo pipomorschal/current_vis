@@ -8,12 +8,12 @@ import struct
 import time
 
 
-def apply_tec_sweep_setpoint(config, *, required_range=None) -> dict[str, str]:
+def apply_tec_sweep_setpoint(config, *, required_range=None, enable_output=False) -> dict[str, str]:
     """Apply and verify an explicitly enabled sweep target before acquisition."""
     target = config.tec_setpoint_deg_c
-    if target is None:
+    if target is None and not enable_output:
         return {}
-    if not config.itc4005_resource or not math.isfinite(target):
+    if not config.itc4005_resource or (target is not None and not math.isfinite(target)):
         raise ValueError("A valid ITC4005 resource and temperature target are required")
     import pyvisa
     manager = pyvisa.ResourceManager()
@@ -32,10 +32,17 @@ def apply_tec_sweep_setpoint(config, *, required_range=None) -> dict[str, str]:
             scale, offset, tolerance = 9 / 5, 32, 1.8e-3
         else:
             raise ValueError(f"Unsupported TEC temperature unit: {unit}")
-        native_target = target * scale + offset
+        # Temperature-only logging can enable the controller at its existing
+        # setpoint. Validate it just as a requested sweep target before ON.
+        native_target = target * scale + offset if target is not None else float(query("SOUR2:TEMP?"))
+        target = (native_target - offset) / scale
         if query("SOUR2:FUNC?") not in {"TEMP", "TEMPERATURE"}:
             raise RuntimeError("ITC4005 must be in TEC temperature-control mode before starting a sweep")
-        if query("OUTP2?") not in {"1", "ON"}:
+        output_state = query("OUTP2?")
+        if output_state not in {"0", "OFF", "1", "ON"}:
+            raise RuntimeError(f"Unknown ITC4005 TEC output state: {output_state!r}")
+        output_on = output_state in {"1", "ON"}
+        if not output_on and not enable_output:
             raise RuntimeError("ITC4005 TEC output is off; enable it before starting a temperature sweep")
         low, high = float(query("SOUR2:TEMP:LIM:LOW?")), float(query("SOUR2:TEMP:LIM:HIGH?"))
         if not all(math.isfinite(v) for v in (low, high)) or not low <= native_target <= high:
@@ -51,9 +58,34 @@ def apply_tec_sweep_setpoint(config, *, required_range=None) -> dict[str, str]:
             actual = float(query("SOUR2:TEMP?"))
         if not math.isclose(actual, native_target, rel_tol=0, abs_tol=tolerance):
             raise RuntimeError(f"ITC4005 did not accept the sweep setpoint {target:g} °C (readback {actual:g} {unit})")
+        if enable_output and not output_on:
+            instrument.write("OUTP2 ON")
+            if query("OUTP2?") not in {"1", "ON"}:
+                raise RuntimeError("ITC4005 TEC output did not switch on")
         logging.getLogger("scope_recording").info("Verified TEC sweep setpoint: %.6g °C", target)
         return {"tec_sweep_setpoint_deg_c": str(target), "tec_sweep_setpoint_status": "verified",
                 "tec_sweep_setpoint_verified_at": datetime.now().astimezone().isoformat(timespec="milliseconds")}
+    finally:
+        try:
+            if instrument is not None:
+                instrument.close()
+        finally:
+            manager.close()
+
+
+def disable_tec_output(resource, timeout_ms=5000):
+    """Disable and verify only the TEC output (channel 2), leaving laser output alone."""
+    import pyvisa
+    manager = pyvisa.ResourceManager()
+    instrument = None
+    try:
+        instrument = manager.open_resource(resource)
+        instrument.timeout = min(timeout_ms, 5000)
+        instrument.write("OUTP2 OFF")
+        response = instrument.query("OUTP2?").strip().split()[-1].upper().strip('"')
+        if response not in {"0", "OFF"}:
+            raise RuntimeError(f"ITC4005 TEC output OFF was not verified (readback {response!r})")
+        return {"tec_output_status": "off_verified"}
     finally:
         try:
             if instrument is not None:

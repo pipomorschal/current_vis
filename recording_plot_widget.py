@@ -98,8 +98,10 @@ class RecordingTimeAxis(pg.AxisItem):
         self.update()
 
     def _update_label(self):
-        self.setLabel(self.value_label if self.value_label else f"Capture time ({self.time_format})"
-                      if self.capture_time else "File index", units="")
+        label = (self.value_label if self.value_label else f"Capture time ({self.time_format})"
+                 if self.capture_time else "File index")
+        if self.labelText != label:
+            self.setLabel(label, units="")
 
     def setRange(self, minimum, maximum):
         span = abs(maximum - minimum)
@@ -109,6 +111,10 @@ class RecordingTimeAxis(pg.AxisItem):
             self._update_label()
 
     def tickValues(self, minVal, maxVal, size):
+        if self.logMode:
+            # Log tick levels may use spacing=None; these are already in the
+            # coordinates expected by AxisItem and cannot be multiplied.
+            return super().tickValues(minVal, maxVal, size)
         # Generate ticks in the displayed resolution to avoid repeated labels.
         unit = {"HH:MM:SS": 1, "HH:MM": 60, "DD Mon HH:MM": 3600}[self.time_format] if self.capture_time else 1
         levels = super().tickValues(minVal / unit, maxVal / unit, size)
@@ -117,7 +123,7 @@ class RecordingTimeAxis(pg.AxisItem):
         return [(spacing * unit, [value * unit for value in values]) for spacing, values in levels]
 
     def tickStrings(self, values, scale, spacing):
-        if not self.capture_time:
+        if not self.capture_time or self.logMode:
             return super().tickStrings(values, scale, spacing)
         labels = []
         date_format = "%d %b " if self.time_format == "DD Mon HH:MM" else ""
@@ -163,17 +169,20 @@ class RecordingWorker(QtCore.QObject):
                 if len(amplitudes) > 1:
                     optional["optical_secondary"] = amplitudes[1]
                 if self.thd_harmonics is not None:
+                    optional["thd_fundamental_hz"] = self.frequencies[0]
+                    optional["thd_harmonics"] = self.thd_harmonics
                     try:
                         harmonics = recording_harmonic_analysis(data, self.frequencies[0], self.thd_harmonics,
                                                                  self.frequencies)
                         optional["thd"] = harmonics["thd_percent"]
-                        optional["thd_harmonics"] = self.thd_harmonics
+                        optional["thd_status"] = "ok"
                         if not self.highpass and not self.lowpass:
                             amplitude = harmonics["amplitudes"][self.frequencies[0]]
                             if len(self.frequencies) > 1:
                                 optional["optical_secondary"] = harmonics["amplitudes"][self.frequencies[1]]
                     except ValueError as exc:
                         optional["thd"] = np.nan
+                        optional["thd_status"] = "unavailable"
                         optional["warnings"].append(f"THD: {exc}")
                 timestamp = recording_timestamp(path, data.metadata)
                 rows.append((path, amplitude, timestamp,
@@ -193,6 +202,13 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self._rows = []
         self._errors = []
         self._loaded_frequencies = (50,)
+        self._pending_thd_analysis = False
+        self._shutting_down = False
+        self._analysis_label = "Processing"
+        self._thd_refresh_timer = QtCore.QTimer(self)
+        self._thd_refresh_timer.setSingleShot(True)
+        self._thd_refresh_timer.setInterval(250)
+        self._thd_refresh_timer.timeout.connect(self._ensure_thd_analysis)
         self.control_panel = QtWidgets.QScrollArea()
         self.control_panel.setWidgetResizable(True)
         self.control_panel.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
@@ -219,7 +235,7 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         frequency_form.addRow("Optical frequency 2", self.optical_frequency_2)
         controls.addLayout(frequency_form)
         self.show_thd = QtWidgets.QCheckBox("Evaluate / plot optical THD (%)")
-        self.show_thd.toggled.connect(self._refresh_normalization)
+        self.show_thd.toggled.connect(self._on_thd_toggled)
         controls.addWidget(self.show_thd)
         thd_form = QtWidgets.QFormLayout()
         self.thd_harmonics = QtWidgets.QSpinBox()
@@ -227,9 +243,11 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self.thd_harmonics.setValue(10)
         self.thd_harmonics.setEnabled(False)
         self.show_thd.toggled.connect(self.thd_harmonics.setEnabled)
+        self.thd_harmonics.valueChanged.connect(self._schedule_thd_analysis)
+        self.optical_frequency.valueChanged.connect(self._schedule_thd_analysis)
         thd_form.addRow("Highest THD harmonic", self.thd_harmonics)
         controls.addLayout(thd_form)
-        thd_note = QtWidgets.QLabel("THD uses the unfiltered optical waveform: 100 × RMS sum of harmonics 2…H / fundamental (frequency 1). Excludes DC and noise. Requires H×fundamental below Nyquist and ≥5 cycles. Refresh after changing THD settings.")
+        thd_note = QtWidgets.QLabel("THD is calculated from each saved, unfiltered optical waveform: 100 × RMS sum of harmonics 2…H / fundamental (frequency 1). Excludes DC and noise. Short records are evaluated without a minimum cycle count. Requires H×fundamental below Nyquist and enough samples to fit the harmonics. Enabling THD or changing its settings calculates it in the background.")
         thd_note.setWordWrap(True)
         controls.addWidget(thd_note)
         self.x_axis = QtWidgets.QComboBox()
@@ -271,7 +289,7 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         for toggle in (self.show_optical, self.show_ambient, self.show_tec, self.show_reference,
                        self.show_dmm, self.show_offset, self.show_setpoint):
             controls.addWidget(toggle)
-            toggle.toggled.connect(self._refresh_normalization)
+            toggle.toggled.connect(self._refresh_visibility)
         current_form = QtWidgets.QFormLayout()
         self.reference_amps_per_volt = QtWidgets.QDoubleSpinBox()
         self.reference_amps_per_volt.setDecimals(6)
@@ -392,26 +410,23 @@ class RecordingPlotWidget(QtWidgets.QWidget):
     def load_recordings(self):
         if self._thread is not None:
             return
+        self._shutting_down = False
         folder = Path(self.directory.text().strip())
         if not self.directory.text().strip() or not folder.is_dir():
             self.status.setText("Please select an existing recording directory.")
             return
-        hp, lp = self.highpass.value(), self.lowpass.value()
-        frequencies = (self.optical_frequency.value(),)
-        if self.evaluate_second_frequency.isChecked():
-            frequencies += (self.optical_frequency_2.value(),)
-            if frequencies[0] == frequencies[1]:
-                self.status.setText("Choose two different optical frequencies.")
-                return
-        if hp and lp and hp >= lp:
-            self.status.setText("High-pass cutoff must be below low-pass cutoff.")
+        options = self._analysis_options()
+        if options is None:
             return
+        hp, lp, frequencies = options
         try:
             paths = sorted((p for p in (folder.rglob("*") if self.recursive.isChecked() else folder.iterdir())
                             if p.is_file() and p.suffix.lower() in {".csv", ".h5", ".hdf5"}), key=natural_key)
         except OSError as exc:
             self.status.setText(str(exc))
             return
+        self._thd_refresh_timer.stop()
+        self._pending_thd_analysis = False
         self._clear_curves()
         self.table.setRowCount(0)
         self._rows = []
@@ -420,6 +435,57 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         if not paths:
             self.status.setText("No CSV, H5 or HDF5 files found.")
             return
+        self._start_analysis(paths, hp, lp, frequencies)
+
+    def _analysis_options(self):
+        hp, lp = self.highpass.value(), self.lowpass.value()
+        frequencies = (self.optical_frequency.value(),)
+        if self.evaluate_second_frequency.isChecked():
+            frequencies += (self.optical_frequency_2.value(),)
+            if frequencies[0] == frequencies[1]:
+                self.status.setText("Choose two different optical frequencies.")
+                return None
+        if hp and lp and hp >= lp:
+            self.status.setText("High-pass cutoff must be below low-pass cutoff.")
+            return None
+        return hp, lp, frequencies
+
+    def _on_thd_toggled(self, enabled):
+        self._refresh_normalization()
+        if enabled:
+            self._ensure_thd_analysis()
+        else:
+            self._thd_refresh_timer.stop()
+            self._pending_thd_analysis = False
+
+    def _schedule_thd_analysis(self):
+        if self.show_thd.isChecked():
+            self._thd_refresh_timer.start()
+
+    def _ensure_thd_analysis(self):
+        if self._shutting_down or not self.show_thd.isChecked():
+            return
+        if self._thread is not None:
+            self._pending_thd_analysis = True
+            return
+        if not self._rows:
+            self.status.setText("Load optical waveform recordings to calculate THD.")
+            return
+        fundamental = self.optical_frequency.value()
+        highest = self.thd_harmonics.value()
+        if all(len(row) > 5 and "thd" in row[5]
+               and row[5].get("thd_fundamental_hz") == fundamental
+               and row[5].get("thd_harmonics") == highest for row in self._rows):
+            return
+        options = self._analysis_options()
+        if options is None:
+            return
+        # Reopen the files that were actually plotted, even if the directory
+        # edit has since changed. Raw waveforms stay out of the GUI's memory.
+        self._start_analysis([row[0] for row in self._rows], *options, thd_only_refresh=True)
+
+    def _start_analysis(self, paths, hp, lp, frequencies, *, thd_only_refresh=False):
+        self._analysis_label = "Calculating optical THD" if thd_only_refresh else "Processing"
         self._thread = QtCore.QThread(self)
         self._worker = RecordingWorker(paths, hp, lp, frequencies,
                                         self.thd_harmonics.value() if self.show_thd.isChecked() else None)
@@ -432,12 +498,12 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self._thread.finished.connect(self._cleanup)
         self._thread.finished.connect(self._thread.deleteLater)
         self.load_button.setEnabled(False)
-        self.status.setText(f"Processing {len(paths)} files…")
+        self.status.setText(f"{self._analysis_label}: {len(paths)} files…")
         self._thread.start()
 
     @QtCore.Slot(int, int)
     def _progress(self, done, total):
-        self.status.setText(f"Processing {done} / {total} files…")
+        self.status.setText(f"{self._analysis_label}: {done} / {total} files…")
 
     @QtCore.Slot(object, object)
     def _display(self, rows, errors):
@@ -447,7 +513,12 @@ class RecordingPlotWidget(QtWidgets.QWidget):
             self._loaded_frequencies = self._rows[0][5].get("optical_frequencies", (50,))
         self._refresh_normalization()
 
-    def _refresh_normalization(self):
+    def _refresh_visibility(self):
+        # Visibility never changes scalar table values. In particular, do not
+        # recreate thousands of cells just to show the DMM voltage curve.
+        self._refresh_normalization(update_table=False)
+
+    def _refresh_normalization(self, *, update_table=True):
         rows = list(self._rows)
         errors = list(self._errors)
         self._clear_curves()
@@ -533,7 +604,8 @@ class RecordingPlotWidget(QtWidgets.QWidget):
                     self._add_overlay(key, overlay_x, values,
                                       view, color, label)
                 else:
-                    missing.append(key)
+                    if key != "thd":
+                        missing.append(key)
         self.temperature_axis.setLabel("Temperature", units="°C")
         self.current_axis.setLabel("Normalized reference peak" if normalized else "Reference 50 Hz peak current",
                                    units="" if normalized else "A")
@@ -557,7 +629,6 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self.voltage_view.enableAutoRange(axis=pg.ViewBox.YAxis)
         self.thd_view.enableAutoRange(axis=pg.ViewBox.YAxis)
         self._sync_overlay_views()
-        self.table.setRowCount(len(rows))
         headers = ["File", "Capture time", f"{optical_label} ({first_frequency:g} Hz)",
                    "Ambient (°C)", "TEC (°C)", "Normalized reference" if normalized else "Reference peak (A)"]
         if second_enabled:
@@ -569,26 +640,20 @@ class RecordingPlotWidget(QtWidgets.QWidget):
             if enabled or np.any(np.isfinite(series)):
                 headers.append(label)
                 extra_columns.append(series)
-        self.table.setColumnCount(len(headers))
-        self.table.setHorizontalHeaderLabels(headers)
-        for i, row in enumerate(rows):
-            path, amplitude, timestamp, unit, _ = row[:5]
-            values = [path.name, datetime.fromtimestamp(timestamp).isoformat(timespec="milliseconds")
-                      if timestamp is not None else "—", (f"{y[i]:.9g}" if np.isfinite(y[i]) else "—")
-                      if normalized or ratio else f"{amplitude:.9g} {unit}".strip()]
-            values.extend(f"{series[i]:.9g}" if np.isfinite(series[i]) else "—" for series in (ambient, tec, reference))
-            if second_enabled:
-                values.append((f"{secondary[i]:.9g}" + (f" {unit}" if not normalized and not ratio else ""))
-                              if np.isfinite(secondary[i]) else "—")
-            values.extend(f"{series[i]:.9g}" if np.isfinite(series[i]) else "—" for series in extra_columns)
-            for j, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(value)
-                item.setToolTip(str(path))
-                self.table.setItem(i, j, item)
-        # Added voltage/offset/THD columns should remain readable via horizontal
-        # scrolling instead of squeezing every heading into a narrow stretch column.
-        self.table.horizontalHeader().setMinimumSectionSize(90)
-        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        table_values = []
+        if update_table:
+            for i, row in enumerate(rows):
+                path, amplitude, timestamp, unit, _ = row[:5]
+                values = [path.name, datetime.fromtimestamp(timestamp).isoformat(timespec="milliseconds")
+                          if timestamp is not None else "—", (f"{y[i]:.9g}" if np.isfinite(y[i]) else "—")
+                          if normalized or ratio else f"{amplitude:.9g} {unit}".strip()]
+                values.extend(f"{series[i]:.9g}" if np.isfinite(series[i]) else "—" for series in (ambient, tec, reference))
+                if second_enabled:
+                    values.append((f"{secondary[i]:.9g}" + (f" {unit}" if not normalized and not ratio else ""))
+                                  if np.isfinite(secondary[i]) else "—")
+                values.extend(f"{series[i]:.9g}" if np.isfinite(series[i]) else "—" for series in extra_columns)
+                table_values.append((str(path), values))
+            self._populate_table(headers, table_values)
         warnings = [f"{row[0].name}: {warning}" for row, v in zip(rows, aux) for warning in v.get("warnings", [])]
         self.errors.setPlainText("\n".join(errors + warnings))
         self.errors.setVisible(bool(errors or warnings))
@@ -600,13 +665,55 @@ class RecordingPlotWidget(QtWidgets.QWidget):
                              if offset_mode and np.any(~np.isfinite(offsets)) else "") +
                             (f" Optical/reference ratio unavailable for {invalid_ratios} recording(s) (missing or zero reference)."
                              if invalid_ratios else ""))
+        if self.show_thd.isChecked():
+            if not rows:
+                thd_message = " Load optical waveform recordings to calculate THD."
+            elif not any("thd" in values for values in aux):
+                thd_message = " THD has not been calculated from the optical waveforms yet."
+            else:
+                unavailable = int(np.count_nonzero(~np.isfinite(thd)))
+                thd_message = (f" THD could not be calculated for {unavailable} waveform(s); see details below."
+                               if unavailable else "")
+            self.status.setText(self.status.text() + thd_message)
+
+    def _populate_table(self, headers, rows):
+        table = self.table
+        header = table.horizontalHeader()
+        updates_enabled = table.updatesEnabled()
+        sorting_enabled = table.isSortingEnabled()
+        table.setUpdatesEnabled(False)
+        table.setSortingEnabled(False)
+        # ResizeToContents on a populated QTableWidget can scan the entire
+        # column for every setItem. Populate with fixed widths, then size once.
+        header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
+        try:
+            table.setRowCount(len(rows))
+            table.setColumnCount(len(headers))
+            table.setHorizontalHeaderLabels(headers)
+            for i, (path, values) in enumerate(rows):
+                for j, value in enumerate(values):
+                    item = QtWidgets.QTableWidgetItem(value)
+                    item.setToolTip(path)
+                    table.setItem(i, j, item)
+            header.setMinimumSectionSize(90)
+            header.setResizeContentsPrecision(1000)
+            table.resizeColumnsToContents()
+        finally:
+            table.setSortingEnabled(sorting_enabled)
+            table.setUpdatesEnabled(updates_enabled)
 
     @QtCore.Slot()
     def _cleanup(self):
         self._thread = self._worker = None
         self.load_button.setEnabled(True)
+        if self._pending_thd_analysis:
+            self._pending_thd_analysis = False
+            QtCore.QTimer.singleShot(0, self._ensure_thd_analysis)
 
     def shutdown(self):
+        self._shutting_down = True
+        self._thd_refresh_timer.stop()
+        self._pending_thd_analysis = False
         if self._thread is not None:
             self._thread.requestInterruption()
             return False

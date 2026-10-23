@@ -94,7 +94,7 @@ def run_capture(root):
         config = ScopeCaptureConfig(**request["config"])
         if not np.isfinite(config.tec_settle_seconds) or config.tec_settle_seconds < 0:
             raise ValueError("TEC settling time must be finite and non-negative")
-        sweep_metadata = apply_tec_sweep_setpoint(config)
+        sweep_metadata = apply_tec_sweep_setpoint(config, enable_output=config.auto_tec_output)
         if config.tec_settle_seconds:
             time.sleep(config.tec_settle_seconds)
         data = OscilloscopeImporter.capture_channel(config)

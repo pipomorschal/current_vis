@@ -17,6 +17,7 @@ from scope_capture_process import capture_isolated
 from signal_data_class import SignalData
 from signal_data_import import OscilloscopeImporter, ScopeCaptureConfig
 from tec_pid_control import TecPidSettings, GradientPid, harmonic_amplitudes, calibration_recommendation
+from tec_setpoint_process import disable_tec_isolated
 
 
 class Cancelled(Exception):
@@ -46,6 +47,7 @@ class TecPidWorker(QtCore.QThread):
         self._sim_temperature = settings.initial
         self._sim_time = 0.0
         self._started = 0.0
+        self._tec_output_owned = False
 
     def cancel(self):
         self.cancelled.set()
@@ -81,6 +83,7 @@ class TecPidWorker(QtCore.QThread):
             data = SignalData(t, a50 * np.sin(2 * np.pi * 50 * t + 0.3)
                               + a100 * np.sin(2 * np.pi * 100 * t - 0.2), sampling_rate=2000)
         else:
+            self._tec_output_owned = self.config.auto_tec_output
             config = replace(self.config, tec_setpoint_deg_c=target, tec_settle_seconds=settle,
                              fresh_trigger=True)
             data = capture_isolated(config, cancelled=self.cancelled)
@@ -180,14 +183,25 @@ class TecPidWorker(QtCore.QThread):
                         json.dumps(result, indent=2), encoding="utf-8")
                 else:
                     self._run_control()
-            self.outcome.emit(f"{'Calibration' if self.calibrate else 'Optimization'} complete. Log: {path}")
+            message = f"{'Calibration' if self.calibrate else 'Optimization'} complete. Log: {path}"
         except Cancelled:
-            self.outcome.emit("Stopped. TEC retains its last commanded setpoint.")
+            message = "Stopped."
         except Exception as exc:
             if self.cancelled.is_set():
-                self.outcome.emit("Stopped. TEC retains its last commanded setpoint.")
+                message = "Stopped."
             else:
-                self.outcome.emit(f"Stopped on error: {exc}. TEC retains its last commanded setpoint.")
+                message = f"Stopped on error: {exc}."
+        finally:
+            if self._tec_output_owned and not self.simulation:
+                self.status.emit("Switching TEC output OFF…")
+                try:
+                    disable_tec_isolated(self.config.itc4005_resource, timeout_ms=self.config.timeout_ms)
+                    output_message = " TEC output OFF verified."
+                except Exception as exc:
+                    output_message = f" TEC output OFF could not be verified: {exc}. Check the controller."
+            else:
+                output_message = "" if self.simulation else " TEC retains its last commanded setpoint."
+        self.outcome.emit(message + output_message)
 
 
 class TecPidWidget(QtWidgets.QWidget):
@@ -297,6 +311,9 @@ class TecPidWidget(QtWidgets.QWidget):
         self.trigger_wait.setValue(30)
         self.trigger_wait.setSuffix(" s")
         form.addRow("Trigger wait limit", self.trigger_wait)
+        self.auto_tec_output = QtWidgets.QCheckBox("TEC output ON at start / OFF after run")
+        self.auto_tec_output.setChecked(True)
+        form.addRow(self.auto_tec_output)
         instruction = QtWidgets.QLabel("Configure scope timebase (≥0.2 s transferred), scale, trigger source/level first. Every read arms a new normal-triggered single sequence. No forced trigger.")
         instruction.setWordWrap(True)
         form.addRow(instruction)
@@ -344,7 +361,7 @@ class TecPidWidget(QtWidgets.QWidget):
         browse = QtWidgets.QPushButton("Choose log folder…")
         browse.clicked.connect(self._choose_folder)
         form.addRow(browse)
-        final_note = QtWidgets.QLabel("TEC must already be on in temperature mode. Stop/error leaves the last setpoint in place. Scope settings are restored after a completed read; cancellation during VISA may leave a single sequence armed.")
+        final_note = QtWidgets.QLabel("TEC must be in temperature mode. Automatic output control switches it off after completion, Stop or error. Scope settings are restored after a completed read; cancellation during VISA may leave a single sequence armed.")
         final_note.setWordWrap(True)
         form.addRow(final_note)
         scroll.setWidget(self.settings_panel)
@@ -400,7 +417,8 @@ class TecPidWidget(QtWidgets.QWidget):
                 raise ValueError("Calibration observation time must span at least four read intervals")
             config = ScopeCaptureConfig(scope, channel=self.channel.currentText(), point_count=self.points.value(),
                                         timeout_ms=self.timeout.value(), itc4005_resource=tec,
-                                        fresh_trigger=True, trigger_wait_seconds=self.trigger_wait.value())
+                                        fresh_trigger=True, trigger_wait_seconds=self.trigger_wait.value(),
+                                        auto_tec_output=self.auto_tec_output.isChecked())
         except ValueError as exc:
             self.status_label.setText(str(exc))
             return
@@ -463,7 +481,7 @@ class TecPidWidget(QtWidgets.QWidget):
         if self.worker is not None:
             self.worker.cancel()
             self.stop_button.setEnabled(False)
-            self.status_label.setText("Stopping acquisition; retaining the last commanded TEC setpoint…")
+            self.status_label.setText("Stopping acquisition; waiting for TEC output cleanup…")
 
     def _finished(self):
         worker = self.worker

@@ -77,8 +77,6 @@ def recording_harmonic_analysis(data: SignalData, fundamental_hz=50.0, highest_h
     if (not np.isfinite(fundamental_hz) or fundamental_hz <= 0 or isinstance(highest_harmonic, bool)
             or not isinstance(highest_harmonic, int) or not 2 <= highest_harmonic <= 50):
         raise ValueError("THD requires a positive fundamental and highest harmonic between 2 and 50")
-    if data.duration * fundamental_hz < 5:
-        raise ValueError("THD requires at least five fundamental cycles")
     harmonics = list(fundamental_hz * np.arange(1, highest_harmonic + 1))
     frequencies = list(dict.fromkeys(harmonics + list(extra_frequencies)))
     fitted = recording_amplitudes(data, frequencies)
