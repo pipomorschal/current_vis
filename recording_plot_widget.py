@@ -247,9 +247,6 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self.optical_frequency.valueChanged.connect(self._schedule_thd_analysis)
         thd_form.addRow("Highest THD harmonic", self.thd_harmonics)
         controls.addLayout(thd_form)
-        thd_note = QtWidgets.QLabel("THD is calculated from each saved, unfiltered optical waveform: 100 × RMS sum of harmonics 2…H / fundamental (frequency 1). Excludes DC and noise. Short records are evaluated without a minimum cycle count. Requires H×fundamental below Nyquist and enough samples to fit the harmonics. Enabling THD or changing its settings calculates it in the background.")
-        thd_note.setWordWrap(True)
-        controls.addWidget(thd_note)
         self.x_axis = QtWidgets.QComboBox()
         self.x_axis.addItems(["Capture time / file index", "DC offset temperature"])
         self.x_axis.currentIndexChanged.connect(self._refresh_normalization)
@@ -260,12 +257,6 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         form.addRow("High-pass (Hz)", self.highpass)
         form.addRow("Low-pass (Hz)", self.lowpass)
         controls.addLayout(form)
-        note = QtWidgets.QLabel(
-            "0 disables a filter. Filters apply to each waveform before the "
-            "selected sine amplitudes are extracted (4th-order, zero-phase Butterworth). "
-            "Click Plot / Refresh after changing evaluation frequencies. Reference current remains evaluated at 50 Hz.")
-        note.setWordWrap(True)
-        controls.addWidget(note)
         self.load_button = QtWidgets.QPushButton("Plot recordings / Refresh")
         controls.addWidget(self.load_button)
         self.normalize = QtWidgets.QCheckBox("Normalize displayed optical values")

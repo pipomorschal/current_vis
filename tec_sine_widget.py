@@ -78,22 +78,32 @@ class KeithleyReadWorker(QtCore.QThread):
 class TecTemperatureWorker(QtCore.QThread):
     reading = QtCore.Signal(object)
 
-    def __init__(self, resource, timeout_ms=5000, parent=None):
+    def __init__(self, resource, timeout_ms=5000, parent=None, *, target=None):
         super().__init__(parent)
         self.resource, self.timeout_ms = resource, timeout_ms
         self.cancelled = threading.Event()
+        self.target = target
 
     def cancel(self):
         self.cancelled.set()
 
     def run(self):
         try:
-            result = read_tec_temperature_isolated(self.resource, timeout_ms=self.timeout_ms, cancelled=self.cancelled)
+            if self.target is None:
+                result = read_tec_temperature_isolated(self.resource, timeout_ms=self.timeout_ms, cancelled=self.cancelled)
+            else:
+                result = set_tec_isolated(self.resource, self.target, self.target, self.target,
+                                          timeout_ms=self.timeout_ms, cancelled=self.cancelled,
+                                          enable_output=True, read_temperature=True)
         except TecWriteCancelled:
             return
         except Exception as exc:
             result = dict(tec_temperature_status="error", tec_temperature_error=str(exc))
+            if self.target is not None:
+                result["tec_manual_setpoint_error"] = str(exc)
         if not self.cancelled.is_set():
+            if self.target is not None:
+                result = dict(result, tec_manual_setpoint=self.target)
             self.reading.emit(dict(result, tec_resource=self.resource))
 
 
@@ -194,6 +204,20 @@ class TecSineWidget(QtWidgets.QWidget):
         self.temperature_refresh_button = QtWidgets.QPushButton("Refresh temperature")
         self.temperature_refresh_button.clicked.connect(self._refresh_temperature)
         temperature_row.addWidget(self.temperature_value, 1)
+        temperature_row.addWidget(QtWidgets.QLabel("Setpoint:"))
+        self.single_temperature = QtWidgets.QDoubleSpinBox()
+        self.single_temperature.setRange(-273.15, 1000)
+        self.single_temperature.setDecimals(3)
+        self.single_temperature.setValue(25)
+        self.single_temperature.setSuffix(" °C")
+        self.single_temperature.setMaximumWidth(120)
+        self.single_temperature.setKeyboardTracking(False)
+        self.single_temperature.setToolTip("Apply one temperature setpoint. A later sine or sweep can overwrite it.")
+        self.single_temperature_button = QtWidgets.QPushButton("Set")
+        self.single_temperature_button.setToolTip("Apply this setpoint once and enable the TEC output; hold until another command changes it.")
+        self.single_temperature_button.clicked.connect(self._set_single_temperature)
+        temperature_row.addWidget(self.single_temperature)
+        temperature_row.addWidget(self.single_temperature_button)
         temperature_row.addWidget(self.temperature_refresh_button)
         layout.addLayout(temperature_row)
         self.status_label = QtWidgets.QLabel("Ready. Select the ITC4005 USB resource and press Start sine.")
@@ -258,23 +282,35 @@ class TecSineWidget(QtWidgets.QWidget):
         self._update_temperature_controls()
 
     def _update_temperature_controls(self):
-        self.temperature_refresh_button.setEnabled(
+        available = (
             self.resource.currentText().strip().upper().startswith("USB") and not self.external_busy
             and self.worker is None and self.recording_worker is None
             and self._shutdown_worker is None and self._temperature_worker is None)
+        self.temperature_refresh_button.setEnabled(available)
+        self.single_temperature_button.setEnabled(available)
 
     def _poll_temperature(self):
         if self.isVisible():
             self._refresh_temperature()
 
     def _refresh_temperature(self):
+        self._start_temperature_request()
+
+    def _set_single_temperature(self):
+        self.single_temperature.interpretText()
+        self._start_temperature_request(target=self.single_temperature.value())
+
+    def _start_temperature_request(self, *, target=None):
         self._update_temperature_controls()
         if not self.temperature_refresh_button.isEnabled():
             return
-        self._temperature_worker = TecTemperatureWorker(self.resource.currentText().strip(), self.timeout.value(), self)
+        self._temperature_worker = TecTemperatureWorker(self.resource.currentText().strip(), self.timeout.value(), self,
+                                                       target=target)
         self._temperature_worker.reading.connect(self._on_temperature_reading)
         self._temperature_worker.finished.connect(self._temperature_finished)
         self.temperature_value.setToolTip("Reading the measured TEC temperature…")
+        if target is not None:
+            self.status_label.setText(f"Setting TEC temperature to {target:.3f} °C…")
         self.hardware_busy_changed.emit(True)
         self._update_preview()
         self._temperature_worker.start()
@@ -282,6 +318,11 @@ class TecSineWidget(QtWidgets.QWidget):
     def _on_temperature_reading(self, result):
         if result.get("tec_resource") != self.resource.currentText().strip():
             return
+        if "tec_manual_setpoint" in result:
+            if result.get("tec_sweep_setpoint_status") == "verified":
+                self.status_label.setText(f"TEC setpoint: {result['tec_manual_setpoint']:.3f} °C. Output enabled.")
+            elif "tec_manual_setpoint_error" in result:
+                self.status_label.setText(f"Could not set TEC temperature: {result['tec_manual_setpoint_error']}")
         value = result.get("tec_temperature")
         if result.get("tec_temperature_status") == "ok" and isinstance(value, (int, float)) and math.isfinite(value):
             self._last_temperature = value
@@ -300,6 +341,8 @@ class TecSineWidget(QtWidgets.QWidget):
     def _temperature_finished(self):
         worker = self._temperature_worker
         self._temperature_worker = None
+        if worker.target is not None and worker.cancelled.is_set():
+            self.status_label.setText("Single temperature command stopped.")
         self.hardware_busy_changed.emit(False)
         self._update_preview()
         worker.deleteLater()
@@ -311,7 +354,7 @@ class TecSineWidget(QtWidgets.QWidget):
 
     def hideEvent(self, event):
         self._temperature_timer.stop()
-        if self._temperature_worker is not None:
+        if self._temperature_worker is not None and self._temperature_worker.target is None:
             self._temperature_worker.cancel()
         super().hideEvent(event)
 
@@ -523,7 +566,7 @@ class TecSineWidget(QtWidgets.QWidget):
         form.addRow(find)
         self.meter_baud = QtWidgets.QComboBox()
         self.meter_baud.addItems([str(rate) for rate in BAUD_RATES])
-        self.meter_baud.setCurrentText("4800")
+        self.meter_baud.setCurrentText("9600")
         form.addRow("Baud rate (8N1)", self.meter_baud)
         self.meter_flow = QtWidgets.QComboBox()
         self.meter_flow.addItems(["None", "XON/XOFF"])

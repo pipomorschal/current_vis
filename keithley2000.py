@@ -37,7 +37,7 @@ class MeterCancelled(Exception):
 @dataclass(frozen=True)
 class KeithleySettings:
     port: str
-    baud_rate: int = 4800
+    baud_rate: int = 9600
     function: str = "DC voltage"
     interval_seconds: float = 1.0
     timeout_seconds: float = 5.0

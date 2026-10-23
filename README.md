@@ -234,7 +234,24 @@ setpoint update interval. The sine starts at the center and rises.
 
 Select or enter the USB VISA resource (or **Use Time tab inputs**) and press
 **Start sine**. With logging disabled, no oscilloscope acquisition or recording is performed.
-TEC readback only verifies accepted setpoints. The TEC must be in
+The top of the tab shows the **measured TEC temperature**, in °C, with its
+reading time. Select the ITC4005 USB resource: while the tab is visible and
+idle, the sensor is read every five seconds; **Refresh temperature** reads it
+on demand. During a sine/sweep run, the reading follows each verified setpoint
+write in the same isolated operation, so no separate reader competes with the
+controller. Idle reads pause while other instrument work owns the hardware.
+Failed readings show **unavailable** (with the last reading if one exists).
+Reading the sensor does not enable the TEC or change its setpoint.
+
+Use the small **Setpoint** box and **Set** button beside the temperature reading
+to apply a single temperature and enable the TEC output. The command is verified
+against the controller's temperature limits. It holds that setpoint until
+another command changes it; a later sine, offset sweep or PID run can overwrite
+it. The single setting does not change the sine/sweep parameters. During a run,
+the Set button is disabled to keep controller access sequential. The value is
+included in saved GUI configurations.
+
+Setpoint readback separately verifies accepted commands. The TEC must be in
 temperature-control mode, and the complete center ± amplitude
 range is checked against its configured limits before the first write.
 For nonzero amplitude, choose an update interval giving at least 20 setpoints per period. Writes run
@@ -291,7 +308,7 @@ a sweep, **Maximum time (no sweep)** limits the run; zero means Until Stop.
 The same tab can display live measurements from a **Keithley 2000** connected
 through a USB-to-RS232 adapter. In the sidebar's Keithley section, use **Find
 serial ports** or enter the COM port, and match the baud rate and flow control
-to the meter's RS232 menu. Defaults are **4800 baud, 8 data bits, no parity,
+to the meter's RS232 menu. Defaults are **9600 baud, 8 data bits, no parity,
 one stop bit, no flow control**. XON/XOFF is also supported. Enable RS232 and
 SCPI on the meter; hardware RTS/CTS handshaking is disabled. Protocol details
 are in the [Keithley 2000 manual](https://download.tek.com/manual/2000-900_J-Aug2010_User.pdf).
