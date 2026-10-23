@@ -26,6 +26,7 @@ from recording_temperatures import read_optional_temperatures, apply_tec_sweep_s
 from tec_temperature_sweep import TecTemperatureSweep
 from tec_pid_widget import TecPidWidget
 from tec_sine_widget import TecSineWidget
+from scope_recording_io import next_scope_logging_path
 
 
 class ScopeAcquireWorker(QtCore.QObject):
@@ -812,6 +813,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _copy_sine_time_input(self):
         self.tec_sine_widget.resource.setEditText(self.combo_itc_resource.currentText())
+        self.tec_sine_widget.scope_resource.setEditText(self.combo_scope_resource.currentText())
+        self.tec_sine_widget.scope_channel.setCurrentText(self.combo_scope_channel.currentText())
+        self.tec_sine_widget.scope_points.setValue(self.spin_scope_points.value())
+        self.tec_sine_widget.scope_timeout.setValue(self.spin_scope_timeout_ms.value())
 
     def _update_sidebar_visibility(self):
         current = self.tabs.currentWidget()
@@ -1158,18 +1163,7 @@ class MainWindow(QtWidgets.QMainWindow):
         capture_index: int,
         extension: str,
     ) -> Path:
-        safe_channel = "".join(
-            character if character.isalnum() else "_" for character in channel
-        ).strip("_") or "channel"
-        extension = extension if extension.startswith(".") else f".{extension}"
-        timestamp = captured_at.strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        stem = f"scope_{timestamp}_{safe_channel}_{capture_index:06d}"
-        candidate = output_dir / f"{stem}{extension}"
-        collision_index = 1
-        while candidate.exists():
-            candidate = output_dir / f"{stem}_{collision_index:02d}{extension}"
-            collision_index += 1
-        return candidate
+        return next_scope_logging_path(output_dir, captured_at, channel, capture_index, extension)
 
     def _begin_scope_capture(
         self,

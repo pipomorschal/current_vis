@@ -159,7 +159,28 @@ respective maxima; temperatures remain in °C. Missing readings appear as gaps
 and unavailable series are reported in the sidebar. The table includes all
 available values. Toggle and scale changes reuse loaded data.
 
-## TEC temperature sine (USB only)
+The **DMM voltage**, **TEC DC offset** and **TEC commanded setpoint** toggles
+display values saved by TEC Sine logging. DMM voltage uses its own voltage axis
+and reading timestamp; a commanded TEC value is distinct from a measured TEC
+temperature. Choose **DC offset temperature** in the x-axis selector to compare
+optical amplitudes, DMM voltage and distortion across the offset sweep instead
+of capture time. File order remains chronological across repeated sweeps.
+
+Enable **Evaluate / plot optical THD (%)**, choose the highest harmonic (default
+10), then click **Plot recordings / Refresh**. The fundamental is Optical
+frequency 1 (default 50 Hz). THD-F is
+`100 * sqrt(A2^2 + ... + AH^2) / A1`, excluding DC and broadband noise; this is
+THD, not THD+N ([definition](https://www.mathworks.com/help/simscape-electrical/ref/totalharmonicdistortion.html)).
+It uses a joint sine/cosine fit of the **unfiltered** optical waveform, so
+display filter cutoffs cannot hide distortion. Without filters, the displayed
+50/100 Hz components reuse that harmonic fit. At least five fundamental cycles
+and a sample rate strictly above twice the highest harmonic are required.
+A zero/too-small fundamental or insufficient bandwidth produces a gap and
+warning, without discarding the other recording values. THD uses a separate
+percent axis and is unaffected by normalization or reference-current division.
+Large records use a bounded-memory QR fit.
+
+## TEC temperature sine, offset sweep and logging
 
 The **TEC Sine** tab continuously sends
 `T(t) = center + amplitude * sin(2*pi*frequency*t)` to the ITC4005 over USB.
@@ -168,19 +189,59 @@ mHz or µHz. The preview shows one period and the last verified setpoint.
 Defaults are 25 °C center, ±1 °C amplitude, 1 mHz (1000 s period), and a 5 s
 setpoint update interval. The sine starts at the center and rises.
 
-Select or enter the USB VISA resource (or **Use Time tab TEC**) and press
-**Start sine**. No oscilloscope acquisition or recording is performed.
+Select or enter the USB VISA resource (or **Use Time tab inputs**) and press
+**Start sine**. With logging disabled, no oscilloscope acquisition or recording is performed.
 TEC readback only verifies accepted setpoints. The TEC must already
 be enabled in temperature-control mode, and the complete center ± amplitude
 range is checked against its configured limits before the first write.
-Choose an update interval giving at least 20 setpoints per period. Writes run
+For nonzero amplitude, choose an update interval giving at least 20 setpoints per period. Writes run
 sequentially in an isolated process; if USB is slow, missed updates are skipped
 and the sine phase follows elapsed time. The actual temperature follows the
 controller's thermal dynamics.
 
 It runs until **Stop**, a communication/verification error, or application
 shutdown. Stop retains the last commanded setpoint. Hardware access is shared
-with PID, scope logging and frequency sweeps. The tab does not save data files.
+with PID, scope logging and frequency sweeps. Data files are saved only when
+the logging group is enabled.
+
+### DC offset sweep and paired scope/DMM logging
+
+Enable **Sweep DC offset** and set minimum, maximum, increment, dwell per offset
+and repeat count. The sine phase remains continuous while the center temperature
+steps through the range; **Amplitude = 0** runs a pure DC sweep. The maximum
+offset is included even for a non-divisible increment, each offset gets its full
+timed dwell, and all repeats are included in the duration. A dwell must be at
+least as long as the setpoint update interval. The complete offset ± AC envelope
+must fit the TEC limits. This is a timed sweep, without waiting for thermal
+stabilization; select dwell times appropriate to the setup.
+
+Enable **Log optical scope + DMM**, select the optical scope VISA/channel, transfer
+points, trigger/read timeouts, capture interval, HDF5 or CSV, and an existing
+output folder. **Use Time tab inputs** copies scope and TEC selections.
+Set the scope timebase, trigger source/level and input scale beforehand.
+Each acquisition is a fresh normal-triggered single sequence. **Include Keithley
+voltage** starts the meter if necessary and requires a DC/AC voltage function.
+The last valid DMM voltage is saved **once per waveform**, with its own reading
+timestamp and age; intermediate live meter readings are not all stored.
+
+Files use the same `scope_YYYYMMDD_HHMMSS_mmm_CHANNEL_index.h5/.csv` format as
+Logging Mode and open directly in **Recordings**. They contain the full optical
+waveform, capture/session timestamps, verified TEC command and command age,
+DC offset and sweep settings, sine settings, and DMM voltage/function/timestamp.
+TEC and DMM readings are not simultaneous. Captures spanning a DC offset change
+are flagged and warned about in Recordings; the plotted offset is the start
+value. No actual TEC temperature is read concurrently by the scope process,
+avoiding competing access to the TEC controller. The command and DC offset
+can be plotted separately from measured temperature.
+
+TEC updates, scope captures and meter reads run independently. Slow scope
+transfers do not block the sine; missed capture slots are skipped. Files are
+published only after a complete save. A scope/save error or missing, stale or
+failed **required** DMM voltage stops the run, retaining the last TEC setpoint.
+Stop cancels active acquisitions; a save already in progress is completed.
+The instrument lock stays held until both the controller and scope workers finish.
+With an offset sweep, total duration replaces the maximum logging time. Without
+a sweep, **Maximum time (no sweep)** limits the run; zero means Until Stop.
 
 ### Keithley 2000 readings via RS232
 
@@ -204,10 +265,11 @@ The app verifies `*IDN?`, uses `CONF` to select the function with its default
 settings, and requests a fresh single measurement with `READ?`. CR, LF and
 combined response terminators are accepted. The numeric value, units and read
 completion timestamp appear above a trend plot; only the last 5000 points are
-kept in memory. No recording file is created. AC readings are meter RMS values,
+kept in memory. Without scope logging, no recording file is created. AC readings are meter RMS values,
 not separate 50/100 Hz amplitudes. Meter I/O runs separately from TEC updates;
 slow reads skip missed read slots. A timeout, invalid/overrange value or serial
-error stops the meter and shows the reason without stopping the sine. Stop
+error stops the meter and shows the reason without stopping the sine, except
+when that voltage is required by an active logging run. Stop
 cancels pending reads, returns local front-panel control and closes the port.
 
 If identification fails, use **Copy serial details** after the meter stops to

@@ -9,7 +9,7 @@ from PySide6 import QtCore, QtWidgets
 import pyqtgraph as pg
 
 from data_manager_signal_loader import DataManager
-from recording_analysis import recording_amplitude, recording_amplitudes
+from recording_analysis import recording_amplitude, recording_amplitudes, recording_harmonic_analysis
 
 
 def natural_key(path: Path):
@@ -40,6 +40,8 @@ def recording_timestamp(path: Path, metadata: dict) -> float | None:
 
 def optional_recording_values(data, highpass, lowpass):
     values = {"ambient": np.nan, "tec": np.nan, "reference": np.nan, "warnings": []}
+    if data.metadata.get("tec_dc_transition_during_capture") == "true":
+        values["warnings"].append("DC offset changed during this capture; plotted offset is the start value")
     for prefix, key in (("ambient", "ambient"), ("tec", "tec")):
         try:
             if data.metadata.get(f"{prefix}_temperature_status", "ok") != "ok":
@@ -59,6 +61,21 @@ def optional_recording_values(data, highpass, lowpass):
             values["reference"] = recording_amplitude(data.reference, highpass, lowpass)
         except Exception as exc:
             values["warnings"].append(f"Reference amplitude: {exc}")
+    for key, metadata_key in (("dc_offset", "tec_dc_offset_deg_c"), ("tec_setpoint", "tec_sweep_setpoint_deg_c"),
+                              ("dmm", "dmm_voltage")):
+        try:
+            if key == "dmm" and (data.metadata.get("dmm_voltage_status") != "ok"
+                                  or data.metadata.get("dmm_voltage_unit", "V") != "V"):
+                continue
+            value = float(data.metadata[metadata_key])
+            if np.isfinite(value):
+                values[key] = value
+        except (KeyError, ValueError, TypeError):
+            pass
+    try:
+        values["dmm_timestamp"] = datetime.fromisoformat(data.metadata["dmm_voltage_read_at"]).timestamp()
+    except (KeyError, ValueError, TypeError, OverflowError):
+        pass
     return values
 
 
@@ -68,6 +85,7 @@ class RecordingTimeAxis(pg.AxisItem):
     def __init__(self):
         self.capture_time = False
         self.time_format = "HH:MM:SS"
+        self.value_label = None
         self._ready = False
         super().__init__(orientation="bottom")
         self._ready = True
@@ -80,7 +98,7 @@ class RecordingTimeAxis(pg.AxisItem):
         self.update()
 
     def _update_label(self):
-        self.setLabel(f"Capture time ({self.time_format})"
+        self.setLabel(self.value_label if self.value_label else f"Capture time ({self.time_format})"
                       if self.capture_time else "File index", units="")
 
     def setRange(self, minimum, maximum):
@@ -118,10 +136,11 @@ class RecordingWorker(QtCore.QObject):
     finished = QtCore.Signal(object, object)
     progress = QtCore.Signal(int, int)
 
-    def __init__(self, paths, highpass, lowpass, frequencies=(50,)):
+    def __init__(self, paths, highpass, lowpass, frequencies=(50,), thd_harmonics=None):
         super().__init__()
         self.paths, self.highpass, self.lowpass = paths, highpass, lowpass
         self.frequencies = tuple(frequencies)
+        self.thd_harmonics = thd_harmonics
 
     @QtCore.Slot()
     def run(self):
@@ -143,6 +162,19 @@ class RecordingWorker(QtCore.QObject):
                 amplitude = amplitudes[0]
                 if len(amplitudes) > 1:
                     optional["optical_secondary"] = amplitudes[1]
+                if self.thd_harmonics is not None:
+                    try:
+                        harmonics = recording_harmonic_analysis(data, self.frequencies[0], self.thd_harmonics,
+                                                                 self.frequencies)
+                        optional["thd"] = harmonics["thd_percent"]
+                        optional["thd_harmonics"] = self.thd_harmonics
+                        if not self.highpass and not self.lowpass:
+                            amplitude = harmonics["amplitudes"][self.frequencies[0]]
+                            if len(self.frequencies) > 1:
+                                optional["optical_secondary"] = harmonics["amplitudes"][self.frequencies[1]]
+                    except ValueError as exc:
+                        optional["thd"] = np.nan
+                        optional["warnings"].append(f"THD: {exc}")
                 timestamp = recording_timestamp(path, data.metadata)
                 rows.append((path, amplitude, timestamp,
                              data.metadata.get("amplitude_unit", ""), index + 1,
@@ -186,6 +218,24 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         frequency_form.addRow(self.evaluate_second_frequency)
         frequency_form.addRow("Optical frequency 2", self.optical_frequency_2)
         controls.addLayout(frequency_form)
+        self.show_thd = QtWidgets.QCheckBox("Evaluate / plot optical THD (%)")
+        self.show_thd.toggled.connect(self._refresh_normalization)
+        controls.addWidget(self.show_thd)
+        thd_form = QtWidgets.QFormLayout()
+        self.thd_harmonics = QtWidgets.QSpinBox()
+        self.thd_harmonics.setRange(2, 50)
+        self.thd_harmonics.setValue(10)
+        self.thd_harmonics.setEnabled(False)
+        self.show_thd.toggled.connect(self.thd_harmonics.setEnabled)
+        thd_form.addRow("Highest THD harmonic", self.thd_harmonics)
+        controls.addLayout(thd_form)
+        thd_note = QtWidgets.QLabel("THD uses the unfiltered optical waveform: 100 × RMS sum of harmonics 2…H / fundamental (frequency 1). Excludes DC and noise. Requires H×fundamental below Nyquist and ≥5 cycles. Refresh after changing THD settings.")
+        thd_note.setWordWrap(True)
+        controls.addWidget(thd_note)
+        self.x_axis = QtWidgets.QComboBox()
+        self.x_axis.addItems(["Capture time / file index", "DC offset temperature"])
+        self.x_axis.currentIndexChanged.connect(self._refresh_normalization)
+        controls.addWidget(self.x_axis)
         form = QtWidgets.QFormLayout()
         self.highpass = self._cutoff()
         self.lowpass = self._cutoff()
@@ -215,7 +265,11 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self.show_ambient = QtWidgets.QCheckBox("Ambient temperature")
         self.show_tec = QtWidgets.QCheckBox("TEC temperature")
         self.show_reference = QtWidgets.QCheckBox("Reference current (50 Hz peak)")
-        for toggle in (self.show_optical, self.show_ambient, self.show_tec, self.show_reference):
+        self.show_dmm = QtWidgets.QCheckBox("DMM voltage")
+        self.show_offset = QtWidgets.QCheckBox("TEC DC offset")
+        self.show_setpoint = QtWidgets.QCheckBox("TEC commanded setpoint")
+        for toggle in (self.show_optical, self.show_ambient, self.show_tec, self.show_reference,
+                       self.show_dmm, self.show_offset, self.show_setpoint):
             controls.addWidget(toggle)
             toggle.toggled.connect(self._refresh_normalization)
         current_form = QtWidgets.QFormLayout()
@@ -244,7 +298,7 @@ class RecordingPlotWidget(QtWidgets.QWidget):
                                   axisItems={"bottom": self.time_axis})
         self.plot.setBackground("w")
         self.plot.showGrid(x=True, y=True, alpha=0.3)
-        self.legend = self.plot.addLegend()
+        self.legend = self.plot.addLegend(labelTextColor="#333333")
         self.temperature_view = pg.ViewBox()
         self.current_view = pg.ViewBox()
         self.plot.scene().addItem(self.temperature_view)
@@ -255,6 +309,15 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self.current_axis = pg.AxisItem("right")
         self.plot.plotItem.layout.addItem(self.current_axis, 2, 3)
         self.current_axis.linkToView(self.current_view)
+        self.voltage_view = pg.ViewBox()
+        self.thd_view = pg.ViewBox()
+        self.voltage_axis = pg.AxisItem("right")
+        self.thd_axis = pg.AxisItem("right")
+        for column, view, axis in ((4, self.voltage_view, self.voltage_axis), (5, self.thd_view, self.thd_axis)):
+            self.plot.scene().addItem(view)
+            self.plot.plotItem.layout.addItem(axis, 2, column)
+            axis.linkToView(view)
+            view.setXLink(self.plot.getViewBox())
         self.temperature_view.setXLink(self.plot.getViewBox())
         self.current_view.setXLink(self.plot.getViewBox())
         self.plot.getViewBox().sigResized.connect(self._sync_overlay_views)
@@ -262,6 +325,8 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self._sync_overlay_views()
         self.temperature_axis.hide()
         self.current_axis.hide()
+        self.voltage_axis.hide()
+        self.thd_axis.hide()
         layout.addWidget(self.plot, 3)
         self.table = QtWidgets.QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(["File", "Capture time", "50 Hz peak amplitude", "Ambient (°C)", "TEC (°C)", "Reference peak (A)"])
@@ -295,7 +360,7 @@ class RecordingPlotWidget(QtWidgets.QWidget):
 
     def _sync_overlay_views(self):
         main = self.plot.getViewBox()
-        for view in (self.temperature_view, self.current_view):
+        for view in (self.temperature_view, self.current_view, self.voltage_view, self.thd_view):
             view.setGeometry(main.sceneBoundingRect())
             view.linkedViewChanged(main, view.XAxis)
 
@@ -303,10 +368,14 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self.plot.clear()
         self.temperature_view.clear()
         self.current_view.clear()
+        self.voltage_view.clear()
+        self.thd_view.clear()
         self.legend.clear()
         self._curves = {}
         self.temperature_axis.hide()
         self.current_axis.hide()
+        self.voltage_axis.hide()
+        self.thd_axis.hide()
 
     def _add_overlay(self, key, x, y, view, color, label):
         curve = pg.PlotDataItem(x, y, pen=pg.mkPen(color, width=1.5),
@@ -352,7 +421,8 @@ class RecordingPlotWidget(QtWidgets.QWidget):
             self.status.setText("No CSV, H5 or HDF5 files found.")
             return
         self._thread = QtCore.QThread(self)
-        self._worker = RecordingWorker(paths, hp, lp, frequencies)
+        self._worker = RecordingWorker(paths, hp, lp, frequencies,
+                                        self.thd_harmonics.value() if self.show_thd.isChecked() else None)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._progress)
@@ -387,6 +457,10 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         x = np.array([row[2] if timed else row[4] for row in rows])
         y = np.array([row[1] for row in rows])
         aux = [row[5] if len(row) > 5 else {} for row in rows]
+        offset_mode = self.x_axis.currentIndex() == 1
+        offsets = np.array([v.get("dc_offset", np.nan) for v in aux])
+        if offset_mode:
+            x = offsets
         reference = np.array([v.get("reference", np.nan) for v in aux]) * self.reference_amps_per_volt.value()
         second_enabled = self.evaluate_second_frequency.isChecked() and len(self._loaded_frequencies) > 1
         secondary = np.array([v.get("optical_secondary", np.nan) for v in aux])
@@ -417,7 +491,8 @@ class RecordingPlotWidget(QtWidgets.QWidget):
                 secondary = secondary / maximum
         units = {row[3] for row in rows}
         unit = next(iter(units)) if len(units) == 1 else "mixed units"
-        self.time_axis.set_capture_time(timed)
+        self.time_axis.value_label = "DC offset temperature (°C)" if offset_mode else None
+        self.time_axis.set_capture_time(timed and not offset_mode)
         first_frequency = self._loaded_frequencies[0]
         optical_label = "Optical / reference current" if ratio else "Optical peak amplitude"
         if normalized:
@@ -435,6 +510,9 @@ class RecordingPlotWidget(QtWidgets.QWidget):
                     name=f"Optical {second_frequency:g} Hz" + (" / reference" if ratio else ""))
         ambient = np.array([v.get("ambient", np.nan) for v in aux])
         tec = np.array([v.get("tec", np.nan) for v in aux])
+        setpoints = np.array([v.get("tec_setpoint", np.nan) for v in aux])
+        dmm = np.array([v.get("dmm", np.nan) for v in aux])
+        thd = np.array([v.get("thd", np.nan) for v in aux])
         if normalized and np.any(np.isfinite(reference)):
             maximum = np.nanmax(reference)
             if maximum > 0:
@@ -443,19 +521,31 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         for key, values, toggle, color, label in (
                 ("ambient", ambient, self.show_ambient, "#d97706", "Ambient (°C)"),
                 ("tec", tec, self.show_tec, "#15803d", "TEC (°C)"),
-                ("reference", reference, self.show_reference, "#9333ea", "Reference current")):
+                ("reference", reference, self.show_reference, "#9333ea", "Reference current"),
+                ("dc_offset", offsets, self.show_offset, "#b45309", "DC offset (°C)"),
+                ("tec_setpoint", setpoints, self.show_setpoint, "#0e7490", "TEC setpoint (°C)"),
+                ("dmm", dmm, self.show_dmm, "#08916b", "DMM voltage (V)"),
+                ("thd", thd, self.show_thd, "#7c3aed", "Optical THD (%)")):
             if toggle.isChecked():
                 if np.any(np.isfinite(values)):
-                    overlay_x = np.array([v.get(f"{key}_timestamp", row[2]) for row, v in zip(rows, aux)]) if timed else x
+                    overlay_x = np.array([v.get(f"{key}_timestamp", row[2]) for row, v in zip(rows, aux)]) if timed and not offset_mode else x
+                    view = {"reference": self.current_view, "dmm": self.voltage_view, "thd": self.thd_view}.get(key, self.temperature_view)
                     self._add_overlay(key, overlay_x, values,
-                                      self.current_view if key == "reference" else self.temperature_view, color, label)
+                                      view, color, label)
                 else:
                     missing.append(key)
         self.temperature_axis.setLabel("Temperature", units="°C")
         self.current_axis.setLabel("Normalized reference peak" if normalized else "Reference 50 Hz peak current",
                                    units="" if normalized else "A")
-        self.temperature_axis.setVisible("ambient" in self._curves or "tec" in self._curves)
+        self.temperature_axis.setVisible(any(key in self._curves for key in ("ambient", "tec", "dc_offset", "tec_setpoint")))
         self.current_axis.setVisible("reference" in self._curves)
+        self.voltage_axis.setLabel("DMM voltage", units="V")
+        self.thd_axis.setLabel("Optical THD", units="%")
+        self.voltage_axis.setVisible("dmm" in self._curves)
+        self.thd_axis.setVisible("thd" in self._curves)
+        self.plot.setTitle("Recorded optical amplitudes, DMM voltage and distortion"
+                           if self.show_thd.isChecked() or self.show_dmm.isChecked()
+                           else "Optical peak amplitudes per recording", color="#333333")
         self.plot.autoRange()
         visible_x = [curve.xData[np.isfinite(curve.xData)] for curve in self._curves.values()
                      if curve.xData is not None]
@@ -464,12 +554,21 @@ class RecordingPlotWidget(QtWidgets.QWidget):
             self.plot.setXRange(float(np.min(all_x)), float(np.max(all_x)), padding=0.02)
         self.temperature_view.enableAutoRange(axis=pg.ViewBox.YAxis)
         self.current_view.enableAutoRange(axis=pg.ViewBox.YAxis)
+        self.voltage_view.enableAutoRange(axis=pg.ViewBox.YAxis)
+        self.thd_view.enableAutoRange(axis=pg.ViewBox.YAxis)
         self._sync_overlay_views()
         self.table.setRowCount(len(rows))
         headers = ["File", "Capture time", f"{optical_label} ({first_frequency:g} Hz)",
                    "Ambient (°C)", "TEC (°C)", "Normalized reference" if normalized else "Reference peak (A)"]
         if second_enabled:
             headers.append(f"{optical_label} ({self._loaded_frequencies[1]:g} Hz)")
+        extra_columns = []
+        for label, series, enabled in (("DMM voltage (V)", dmm, self.show_dmm.isChecked()),
+                                       ("DC offset (°C)", offsets, False), ("TEC setpoint (°C)", setpoints, False),
+                                       ("Optical THD (%)", thd, self.show_thd.isChecked())):
+            if enabled or np.any(np.isfinite(series)):
+                headers.append(label)
+                extra_columns.append(series)
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
         for i, row in enumerate(rows):
@@ -481,10 +580,15 @@ class RecordingPlotWidget(QtWidgets.QWidget):
             if second_enabled:
                 values.append((f"{secondary[i]:.9g}" + (f" {unit}" if not normalized and not ratio else ""))
                               if np.isfinite(secondary[i]) else "—")
+            values.extend(f"{series[i]:.9g}" if np.isfinite(series[i]) else "—" for series in extra_columns)
             for j, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
                 item.setToolTip(str(path))
                 self.table.setItem(i, j, item)
+        # Added voltage/offset/THD columns should remain readable via horizontal
+        # scrolling instead of squeezing every heading into a narrow stretch column.
+        self.table.horizontalHeader().setMinimumSectionSize(90)
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         warnings = [f"{row[0].name}: {warning}" for row, v in zip(rows, aux) for warning in v.get("warnings", [])]
         self.errors.setPlainText("\n".join(errors + warnings))
         self.errors.setVisible(bool(errors or warnings))
@@ -492,6 +596,8 @@ class RecordingPlotWidget(QtWidgets.QWidget):
                             (" Using filename order (capture timestamps unavailable)." if rows and not timed else "") +
                             (" Maximum amplitude is zero; values remain zero." if zero_maximum else "") +
                             (f" No recorded data for: {', '.join(missing)}." if missing else "") +
+                            (f" DC offset missing for {int(np.count_nonzero(~np.isfinite(offsets)))} recording(s)."
+                             if offset_mode and np.any(~np.isfinite(offsets)) else "") +
                             (f" Optical/reference ratio unavailable for {invalid_ratios} recording(s) (missing or zero reference)."
                              if invalid_ratios else ""))
 

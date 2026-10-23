@@ -45,12 +45,51 @@ def recording_amplitudes(data: SignalData, frequencies, highpass_hz=0, lowpass_h
             kind = "highpass" if highpass_hz else "lowpass"
         sos = butter(4, cutoff, btype=kind, fs=fs, output="sos")
         y = sosfiltfilt(sos, y)
-    columns = []
-    for frequency in frequencies:
-        phase = 2 * np.pi * frequency * (t - t[0])
-        columns.extend((np.sin(phase), np.cos(phase)))
-    design = np.column_stack([*columns, np.ones(t.size)])
-    coefficients, _, rank, _ = np.linalg.lstsq(design, y, rcond=None)
-    if rank < design.shape[1]:
+    width = 2 * frequencies.size + 1
+    block_size = max(1024, 2_000_000 // width)
+    reduced = None
+    for start in range(0, t.size, block_size):
+        times = t[start:start + block_size] - t[0]
+        columns = []
+        for frequency in frequencies:
+            phase = 2 * np.pi * frequency * times
+            columns.extend((np.sin(phase), np.cos(phase)))
+        design = np.column_stack([*columns, np.ones(times.size)])
+        if t.size <= block_size:
+            coefficients, _, rank, _ = np.linalg.lstsq(design, y, rcond=None)
+            break
+        # Incremental QR retains the least-squares problem without a multi-GB
+        # full-resolution harmonic design matrix or ill-conditioned normal equations.
+        augmented = np.column_stack([design, y[start:start + block_size]])
+        if reduced is not None:
+            augmented = np.vstack([reduced, augmented])
+        reduced = np.linalg.qr(augmented, mode="r")
+    else:
+        coefficients, _, rank, _ = np.linalg.lstsq(reduced[:, :-1], reduced[:, -1], rcond=None)
+    if rank < width:
         raise ValueError("Insufficient time coverage to fit the selected sine frequencies.")
     return [float(np.hypot(*coefficients[2 * i:2 * i + 2])) for i in range(len(frequencies))]
+
+
+def recording_harmonic_analysis(data: SignalData, fundamental_hz=50.0, highest_harmonic=10,
+                                extra_frequencies=()):
+    """Joint raw-waveform harmonic amplitudes and THD-F, excluding DC/noise."""
+    if (not np.isfinite(fundamental_hz) or fundamental_hz <= 0 or isinstance(highest_harmonic, bool)
+            or not isinstance(highest_harmonic, int) or not 2 <= highest_harmonic <= 50):
+        raise ValueError("THD requires a positive fundamental and highest harmonic between 2 and 50")
+    if data.duration * fundamental_hz < 5:
+        raise ValueError("THD requires at least five fundamental cycles")
+    harmonics = list(fundamental_hz * np.arange(1, highest_harmonic + 1))
+    frequencies = list(dict.fromkeys(harmonics + list(extra_frequencies)))
+    fitted = recording_amplitudes(data, frequencies)
+    amplitudes = np.asarray(fitted[:highest_harmonic])
+    floor = max(1e-12, float(np.max(np.abs(data.amplitude))) * 1e-10)
+    if not np.isfinite(amplitudes[0]) or amplitudes[0] <= floor:
+        raise ValueError("THD is undefined because the fundamental amplitude is zero or too small")
+    return {"thd_percent": float(100 * np.linalg.norm(amplitudes[1:]) / amplitudes[0]),
+            "amplitudes": dict(zip(frequencies, fitted))}
+
+
+def recording_thd(data: SignalData, fundamental_hz=50.0, highest_harmonic=10) -> float:
+    """Unfiltered THD-F (%): 100 * sqrt(A2² + ... + AH²) / A1."""
+    return recording_harmonic_analysis(data, fundamental_hz, highest_harmonic)["thd_percent"]
