@@ -54,6 +54,19 @@ class OscilloscopeImporter:
 		return response
 
 	@classmethod
+	def _parse_mode_response(cls, response: str, keywords: tuple[str, ...]) -> str | None:
+		"""Expand SCPI short/long keywords without changing the scope's VERBOSE setting.
+
+		Uppercase letters in each keyword specify its minimum accepted spelling.
+		"""
+		value = cls._parse_query_response(response).upper()
+		for keyword in keywords:
+			minimum = sum(letter.isupper() for letter in keyword)
+			if minimum <= len(value) <= len(keyword) and keyword.upper().startswith(value):
+				return keyword.upper()
+		return None
+
+	@classmethod
 	def _query_float(cls, instrument: Any, command: str, fallback: float = 0.0) -> float:
 		try:
 			val = cls._parse_query_response(instrument.query(command))
@@ -132,10 +145,15 @@ class OscilloscopeImporter:
 		if not np.isfinite(config.trigger_wait_seconds) or config.trigger_wait_seconds <= 0:
 			raise ValueError("Trigger wait must be finite and positive")
 		was_running = bool(cls._query_float(inst, "ACQUIRE:STATE?"))
-		stop_after = cls._parse_query_response(inst.query("ACQUIRE:STOPAFTER?")).upper()
-		trigger_mode = cls._parse_query_response(inst.query("TRIGGER:A:MODE?")).upper()
-		if stop_after not in {"RUNSTOP", "SEQUENCE", "SEQ"} or trigger_mode not in {"AUTO", "NORMAL", "NORM"}:
-			raise ValueError("Unsupported oscilloscope acquisition/trigger mode readback")
+		stop_after_response = inst.query("ACQUIRE:STOPAFTER?")
+		trigger_mode_response = inst.query("TRIGGER:A:MODE?")
+		stop_after = cls._parse_mode_response(stop_after_response, ("RUNStop", "SEQuence"))
+		trigger_mode = cls._parse_mode_response(trigger_mode_response, ("AUTO", "NORMal"))
+		if stop_after is None or trigger_mode is None:
+			raise ValueError(
+				"Unsupported oscilloscope acquisition/trigger mode readback: "
+				f"ACQUIRE:STOPAFTER? returned {stop_after_response!r}; "
+				f"TRIGGER:A:MODE? returned {trigger_mode_response!r}")
 		try:
 			inst.write("ACQUIRE:STATE STOP")
 			inst.write("TRIGGER:A:MODE NORMAL")
