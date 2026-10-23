@@ -12,7 +12,7 @@ import numpy as np
 from PySide6 import QtCore, QtWidgets
 import pyqtgraph as pg
 
-from tec_setpoint_process import set_tec_isolated, TecWriteCancelled
+from tec_setpoint_process import set_tec_isolated, read_tec_temperature_isolated, TecWriteCancelled
 from tec_output_worker import TecShutdownWorker
 from tec_sine import TecSineSettings, TecSineSweep
 from tec_temperature_sweep import TecTemperatureSweep
@@ -75,6 +75,28 @@ class KeithleyReadWorker(QtCore.QThread):
         self.outcome.emit(message)
 
 
+class TecTemperatureWorker(QtCore.QThread):
+    reading = QtCore.Signal(object)
+
+    def __init__(self, resource, timeout_ms=5000, parent=None):
+        super().__init__(parent)
+        self.resource, self.timeout_ms = resource, timeout_ms
+        self.cancelled = threading.Event()
+
+    def cancel(self):
+        self.cancelled.set()
+
+    def run(self):
+        try:
+            result = read_tec_temperature_isolated(self.resource, timeout_ms=self.timeout_ms, cancelled=self.cancelled)
+        except TecWriteCancelled:
+            return
+        except Exception as exc:
+            result = dict(tec_temperature_status="error", tec_temperature_error=str(exc))
+        if not self.cancelled.is_set():
+            self.reading.emit(dict(result, tec_resource=self.resource))
+
+
 class TecSineWorker(QtCore.QThread):
     applied = QtCore.Signal(object)
     outcome = QtCore.Signal(str)
@@ -105,9 +127,9 @@ class TecSineWorker(QtCore.QThread):
                 if self.duration is not None and elapsed >= self.duration:
                     break
                 target = s.target_at(elapsed)
-                set_tec_isolated(self.resource, target, s.minimum, s.maximum,
-                                 timeout_ms=self.timeout_ms, cancelled=self.cancelled,
-                                 enable_output=self.auto_output)
+                result = set_tec_isolated(self.resource, target, s.minimum, s.maximum,
+                                         timeout_ms=self.timeout_ms, cancelled=self.cancelled,
+                                         enable_output=self.auto_output, read_temperature=True)
                 if self.cancelled.is_set():
                     break
                 finished = time.monotonic()
@@ -115,7 +137,9 @@ class TecSineWorker(QtCore.QThread):
                 point = dict(elapsed_seconds=elapsed, target=target, io_seconds=finished - command_started,
                              skipped=max(0, next_tick - math.floor(elapsed / s.interval_seconds) - 1),
                              verified_at=datetime.now().astimezone().isoformat(timespec="milliseconds"),
-                             verified_monotonic=finished)
+                             verified_monotonic=finished, tec_resource=self.resource)
+                if isinstance(result, dict):
+                    point.update({key: value for key, value in result.items() if key.startswith("tec_temperature")})
                 if self.recording_state is not None:
                     self.recording_state.set_target(point, started)
                 self.applied.emit(point)
@@ -149,6 +173,8 @@ class TecSineWidget(QtWidgets.QWidget):
         self._run_error = None
         self._tec_shutdown = None
         self._shutdown_worker = None
+        self._temperature_worker = None
+        self._last_temperature = None
         self.meter_worker = None
         self.meter_readings = deque(maxlen=5000)
         self._meter_started_with_sine = False
@@ -160,14 +186,16 @@ class TecSineWidget(QtWidgets.QWidget):
         title = QtWidgets.QLabel("TEC temperature sine")
         title.setStyleSheet("font-size: 20px; font-weight: bold;")
         layout.addWidget(title)
-        description = QtWidgets.QLabel(
-            "T(t) = center + amplitude × sin(2π × frequency × t). "
-            "Amplitude is the peak deviation in °C. The sine starts at the center and rises. "
-            "Temperature setpoints are sent to the ITC4005 over USB. Optional Keithley 2000 readings "
-            "can be paired with optical scope waveforms in optional HDF5/CSV logging. "
-            "Sweep the DC offset and set amplitude to 0 for a pure DC temperature sweep.")
-        description.setWordWrap(True)
-        layout.addWidget(description)
+        temperature_row = QtWidgets.QHBoxLayout()
+        self.temperature_value = QtWidgets.QLabel("TEC temperature: unavailable")
+        self.temperature_value.setStyleSheet("font-size: 18px; font-weight: bold;")
+        self.temperature_value.setWordWrap(True)
+        self.temperature_value.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.temperature_refresh_button = QtWidgets.QPushButton("Refresh temperature")
+        self.temperature_refresh_button.clicked.connect(self._refresh_temperature)
+        temperature_row.addWidget(self.temperature_value, 1)
+        temperature_row.addWidget(self.temperature_refresh_button)
+        layout.addLayout(temperature_row)
         self.status_label = QtWidgets.QLabel("Ready. Select the ITC4005 USB resource and press Start sine.")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -217,7 +245,75 @@ class TecSineWidget(QtWidgets.QWidget):
             "Automatic output control enables the TEC at Start and disables it after the final capture, Stop or error.")
         note.setWordWrap(True)
         layout.addWidget(note)
+        self._temperature_timer = QtCore.QTimer(self)
+        self._temperature_timer.setInterval(5000)
+        self._temperature_timer.timeout.connect(self._poll_temperature)
+        self.resource.currentTextChanged.connect(self._temperature_resource_changed)
         self._update_preview()
+
+    def _temperature_resource_changed(self):
+        self._last_temperature = None
+        self.temperature_value.setText("TEC temperature: unavailable")
+        self.temperature_value.setToolTip("Select the ITC4005 USB resource to read its measured temperature.")
+        self._update_temperature_controls()
+
+    def _update_temperature_controls(self):
+        self.temperature_refresh_button.setEnabled(
+            self.resource.currentText().strip().upper().startswith("USB") and not self.external_busy
+            and self.worker is None and self.recording_worker is None
+            and self._shutdown_worker is None and self._temperature_worker is None)
+
+    def _poll_temperature(self):
+        if self.isVisible():
+            self._refresh_temperature()
+
+    def _refresh_temperature(self):
+        self._update_temperature_controls()
+        if not self.temperature_refresh_button.isEnabled():
+            return
+        self._temperature_worker = TecTemperatureWorker(self.resource.currentText().strip(), self.timeout.value(), self)
+        self._temperature_worker.reading.connect(self._on_temperature_reading)
+        self._temperature_worker.finished.connect(self._temperature_finished)
+        self.temperature_value.setToolTip("Reading the measured TEC temperature…")
+        self.hardware_busy_changed.emit(True)
+        self._update_preview()
+        self._temperature_worker.start()
+
+    def _on_temperature_reading(self, result):
+        if result.get("tec_resource") != self.resource.currentText().strip():
+            return
+        value = result.get("tec_temperature")
+        if result.get("tec_temperature_status") == "ok" and isinstance(value, (int, float)) and math.isfinite(value):
+            self._last_temperature = value
+            timestamp = result.get("tec_temperature_read_at", "")
+            try:
+                timestamp = datetime.fromisoformat(timestamp).strftime("%H:%M:%S")
+            except (ValueError, TypeError):
+                timestamp = ""
+            self.temperature_value.setText(f"TEC temperature: {value:.3f} °C" + (f" (read {timestamp})" if timestamp else ""))
+            self.temperature_value.setToolTip("Measured TEC temperature from the ITC4005 sensor.")
+        elif result.get("tec_temperature_status") == "error":
+            previous = f" (last: {self._last_temperature:.3f} °C)" if self._last_temperature is not None else ""
+            self.temperature_value.setText("TEC temperature: unavailable" + previous)
+            self.temperature_value.setToolTip(result.get("tec_temperature_error", "Temperature reading failed"))
+
+    def _temperature_finished(self):
+        worker = self._temperature_worker
+        self._temperature_worker = None
+        self.hardware_busy_changed.emit(False)
+        self._update_preview()
+        worker.deleteLater()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._temperature_timer.start()
+        QtCore.QTimer.singleShot(0, self._poll_temperature)
+
+    def hideEvent(self, event):
+        self._temperature_timer.stop()
+        if self._temperature_worker is not None:
+            self._temperature_worker.cancel()
+        super().hideEvent(event)
 
     def _build_controls(self):
         self.control_panel = QtWidgets.QWidget()
@@ -598,13 +694,15 @@ class TecSineWidget(QtWidgets.QWidget):
             self._preview_settings = program
             self.start_button.setText("Start offset sweep" if self.sweep_group.isChecked() else "Start sine")
             self.start_button.setEnabled(self.worker is None and self.recording_worker is None
-                                         and self._shutdown_worker is None and not self.external_busy)
+                                         and self._shutdown_worker is None and self._temperature_worker is None
+                                         and not self.external_busy)
         except ValueError as exc:
             self.summary_label.setText(str(exc))
             self.preview_curve.clear()
             self.marker.clear()
             self._preview_settings = None
             self.start_button.setEnabled(False)
+        self._update_temperature_controls()
 
     def _refresh_resources(self):
         try:
@@ -630,7 +728,8 @@ class TecSineWidget(QtWidgets.QWidget):
             self.status_label.setText(f"USB discovery failed: {exc}")
 
     def start(self):
-        if self.worker is not None or self.recording_worker is not None or self._shutdown_worker is not None or self.external_busy:
+        if (self.worker is not None or self.recording_worker is not None or self._shutdown_worker is not None
+                or self._temperature_worker is not None or self.external_busy):
             return
         try:
             settings = self.settings()
@@ -719,6 +818,7 @@ class TecSineWidget(QtWidgets.QWidget):
         self._release_run_controls()
 
     def _on_applied(self, point):
+        self._on_temperature_reading(point)
         s = self._run_settings
         phase_seconds = point["elapsed_seconds"] % s.period_seconds
         if isinstance(self._run_program, TecSineSweep):
@@ -795,8 +895,11 @@ class TecSineWidget(QtWidgets.QWidget):
         self._update_preview()
 
     def shutdown(self):
+        self._temperature_timer.stop()
+        if self._temperature_worker is not None:
+            self._temperature_worker.cancel()
         if (self.worker is not None or self.meter_worker is not None or self.recording_worker is not None
-                or self._shutdown_worker is not None):
+                or self._shutdown_worker is not None or self._temperature_worker is not None):
             self.stop()
             self.stop_meter()
             return False

@@ -693,6 +693,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 or self.sweep_widget.is_busy or self.tec_pid_widget.worker is not None
                 or self.tec_sine_widget.worker is not None or self.tec_sine_widget.recording_worker is not None
                 or self.tec_sine_widget._shutdown_worker is not None or self.tec_sine_widget.meter_worker is not None
+                or self.tec_sine_widget._temperature_worker is not None
                 or self.recording_widget._thread is not None or self._demod_thread is not None)
 
     def _choose_gui_configuration(self):
