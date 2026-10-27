@@ -20,6 +20,7 @@ from signal_data_import import OscilloscopeImporter, ScopeCaptureConfig, ScopeCo
 from plot_panel_widget import PlotPanel
 from frequency_sweep_widget import FrequencyInput, FrequencySweepWidget
 from recording_plot_widget import RecordingPlotWidget
+from capture_playback_widget import CapturePlaybackWidget
 from mini_game_widget import MiniGameWidget
 from scope_capture_process import capture_isolated
 from recording_temperatures import read_optional_temperatures, apply_tec_sweep_setpoint
@@ -226,6 +227,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recording_widget = RecordingPlotWidget()
         self.tec_pid_widget = TecPidWidget()
         self.tec_sine_widget = TecSineWidget()
+        self.playback_widget = CapturePlaybackWidget()
         self.mini_game_widget = MiniGameWidget()
 
         self.sidebar_stack = QtWidgets.QStackedWidget()
@@ -234,6 +236,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar_stack.addWidget(self.recording_widget.control_panel)
         self.sidebar_stack.addWidget(self.tec_pid_widget.control_panel)
         self.sidebar_stack.addWidget(self.tec_sine_widget.control_panel)
+        self.sidebar_stack.addWidget(self.playback_widget.control_panel)
         self.sidebar_stack.addWidget(self.mini_game_widget.control_panel)
         self.sidebar_stack.setMinimumWidth(340)
         self.sidebar_stack.setMaximumWidth(340)
@@ -251,6 +254,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.recording_widget, "Recordings")
         self.tabs.addTab(self.tec_sine_widget, "TEC Sine")
         self.tabs.addTab(self.tec_pid_widget, "TEC PID")
+        self.tabs.addTab(self.playback_widget, "Capture Playback")
         self.tabs.addTab(self.mini_game_widget, " ")
 
         self.statusBar().showMessage("Ready")
@@ -691,6 +695,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 or self.tec_sine_widget.worker is not None or self.tec_sine_widget.recording_worker is not None
                 or self.tec_sine_widget._shutdown_worker is not None or self.tec_sine_widget.meter_worker is not None
                 or self.tec_sine_widget._temperature_worker is not None
+                or self.playback_widget.is_busy or self.playback_widget.is_playing
                 or self.recording_widget._thread is not None or self._demod_thread is not None)
 
     def _choose_gui_configuration(self):
@@ -730,6 +735,7 @@ class MainWindow(QtWidgets.QMainWindow):
             recordings.optical_frequency_2.setEnabled(recordings.evaluate_second_frequency.isChecked())
             recordings.thd_harmonics.setEnabled(recordings.show_thd.isChecked())
             recordings._refresh_normalization()
+            self.playback_widget._metadata_visibility()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Configuration", f"Could not load configuration: {exc}")
             return False
@@ -903,6 +909,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar_stack.setCurrentWidget(
             self.tec_sine_widget.control_panel if current == self.tec_sine_widget else
             self.tec_pid_widget.control_panel if current == self.tec_pid_widget else
+            self.playback_widget.control_panel if current == self.playback_widget else
             self.mini_game_widget.control_panel if current == self.mini_game_widget else
             self.recording_widget.control_panel if current == self.recording_widget else
             self.sweep_widget.control_panel if current == self.sweep_widget else self.controls
@@ -2137,6 +2144,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_scope_resources()
 
     def closeEvent(self, event: QtGui.QCloseEvent):
+        playback_stopped = self.playback_widget.shutdown()
         if self._tec_shutdown_worker is not None:
             self.statusBar().showMessage("Waiting for TEC output OFF verification before closing.")
             event.ignore()
@@ -2151,6 +2159,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not self.recording_widget.shutdown():
             self.statusBar().showMessage("Recording analysis is stopping. Close again when it has finished.")
+            event.ignore()
+            return
+        if not playback_stopped:
+            self.statusBar().showMessage("Capture playback is finishing a file read. Close again once it finishes.")
             event.ignore()
             return
         if self._scope_logging_active:

@@ -223,6 +223,30 @@ warning, without discarding the other recording values. THD uses a separate
 percent axis and is unaffected by normalization or reference-current division.
 Large records use a bounded-memory QR fit.
 
+## Capture playback
+
+The **Capture Playback** tab is immediately before Snake. Select a capture
+directory and click **Load directory**, then **Play**. Files play in natural
+filename order, which is chronological for the application's timestamped
+recordings. **Frame interval** defaults to **1 second per frame** and can be
+changed during playback. Use **Previous**, **Next**, or the frame number to
+inspect individual captures. Playback loops by default and pauses when leaving
+the tab. Subdirectories are included only when selected.
+
+The plot shows the original time/amplitude samples without filtering,
+normalization or harmonic analysis. **Auto-range each frame** can be disabled
+to compare waveforms with fixed axes; **Fit view** fits the current capture.
+A small upper-right metadata overlay shows the filename/frame, capture time,
+recorded temperatures, TEC target/offset, DMM voltage and available sweep values.
+Hover over it for complete file metadata, or uncheck **Show metadata** to hide it.
+
+HDF5, CSV/TXT, Tektronix WFM and NumPy captures use the same importer as the
+Time tab. Directory scans and file reads run in the background; only the current
+frame and the next prefetched frame are retained. Unreadable files are skipped.
+Slow file reads extend the frame interval without dropping captures. Playback
+settings are included in saved GUI configurations; loading settings does not
+start playback or load a directory automatically.
+
 ## TEC temperature sine, offset sweep and logging
 
 The **TEC Sine** tab continuously sends
