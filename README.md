@@ -194,13 +194,16 @@ axis and is computed from the reference waveform's 50 Hz peak voltage using
 The optional waveform filters apply to both optical and reference amplitude
 extraction. Normalization divides optical and reference values by their own
 respective maxima; temperatures remain in °C. Missing readings appear as gaps
-and unavailable series are reported in the sidebar. The table includes all
-available values. Toggle and scale changes reuse loaded data.
+and unavailable series are reported in the sidebar. The table includes the
+values paired with each waveform. Toggle and scale changes reuse loaded data.
 
 The **DMM voltage**, **TEC DC offset** and **TEC commanded setpoint** toggles
-display values saved by TEC Sine logging. DMM voltage uses its own voltage axis
-and reading timestamp; a commanded TEC value is distinct from a measured TEC
-temperature. Choose **DC offset temperature** in the x-axis selector to compare
+display values saved by TEC Sine logging. The continuous TEC/DMM trace files in
+the selected folder are loaded automatically: every DMM reading, verified TEC
+setpoint and available measured TEC temperature uses its own timestamp, including
+samples between scope captures. These samples are plotted without creating a
+table row for each sample. DMM voltage uses its own voltage axis; a commanded TEC
+value is distinct from a measured TEC temperature. Choose **DC offset temperature** in the x-axis selector to compare
 optical amplitudes, DMM voltage and distortion across the offset sweep instead
 of capture time. File order remains chronological across repeated sweeps.
 
@@ -305,8 +308,13 @@ output folder. **Use Time tab inputs** copies scope and TEC selections.
 Set the scope timebase, trigger source/level and input scale beforehand.
 Each acquisition is a fresh normal-triggered single sequence. **Include Keithley
 voltage** starts the meter if necessary and requires a DC/AC voltage function.
-The last valid DMM voltage is saved **once per waveform**, with its own reading
-timestamp and age; intermediate live meter readings are not all stored.
+Every completed DMM voltage reading is saved in an additional
+`tec_sine_trace_...h5/.csv` file in the same folder. Every verified TEC setpoint
+and available measured TEC temperature is also saved there. Each sample has its
+own timestamp and is flushed immediately; storage is independent of the scope
+capture interval and the live plot's history limit. Each waveform still contains
+the latest paired DMM voltage, timestamp and age for compatibility. Recordings
+prefers the full trace for that session, avoiding duplicate plotted samples.
 
 Files use the same `scope_YYYYMMDD_HHMMSS_mmm_CHANNEL_index.h5/.csv` format as
 Logging Mode and open directly in **Recordings**. They contain the full optical
@@ -314,14 +322,19 @@ waveform, capture/session timestamps, verified TEC command and command age,
 DC offset and sweep settings, sine settings, and DMM voltage/function/timestamp.
 TEC and DMM readings are not simultaneous. Captures spanning a DC offset change
 are flagged and warned about in Recordings; the plotted offset is the start
-value. No actual TEC temperature is read concurrently by the scope process,
-avoiding competing access to the TEC controller. The command and DC offset
-can be plotted separately from measured temperature.
+value. Actual TEC temperatures in the trace come from the existing TEC update
+worker; the scope process does not access the TEC controller. The command and
+DC offset can be plotted separately from measured temperature.
 
 TEC updates, scope captures and meter reads run independently. Slow scope
-transfers do not block the sine; missed capture slots are skipped. Files are
+transfers do not block the sine; missed capture slots are skipped. Defaults are
+one TEC update every 5 s (0.2 Hz), one DMM reading every 1 s (1 Hz), and one scope
+capture every 10 s. Instrument communication can extend these intervals. The
+sample rate within a scope waveform is determined by the scope timebase and
+transfer settings, independently of these intervals. Waveform files are
 published only after a complete save. A scope/save error or missing, stale or
-failed **required** DMM voltage stops the run, retaining the last TEC setpoint.
+failed **required** DMM voltage stops the run and performs the configured TEC
+output cleanup.
 Stop cancels active acquisitions; a save already in progress is completed.
 The instrument lock stays held until both the controller and scope workers finish.
 With an offset sweep, total duration replaces the maximum logging time. Without
@@ -349,7 +362,9 @@ The app verifies `*IDN?`, uses `CONF` to select the function with its default
 settings, and requests a fresh single measurement with `READ?`. CR, LF and
 combined response terminators are accepted. The numeric value, units and read
 completion timestamp appear above a trend plot; only the last 5000 points are
-kept in memory. Without scope logging, no recording file is created. AC readings are meter RMS values,
+kept in the live plot's memory. With scope logging and **Include Keithley voltage**
+enabled, all readings during the run are saved, including those between waveforms.
+Without scope logging, no recording file is created. AC readings are meter RMS values,
 not separate 50/100 Hz amplitudes. Meter I/O runs separately from TEC updates;
 slow reads skip missed read slots. A timeout, invalid/overrange value or serial
 error stops the meter and shows the reason without stopping the sine, except

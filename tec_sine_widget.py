@@ -1,4 +1,4 @@
-"""USB TEC temperature sine generation, without waveform acquisition or recording."""
+"""USB TEC temperature sine generation with optional scope and continuous DMM logging."""
 from __future__ import annotations
 
 import math
@@ -70,8 +70,9 @@ class KeithleyReadWorker(QtCore.QThread):
         except Exception as exc:
             message = f"Meter stopped on error: {exc}. TEC sine control is independent."
         finally:
-            if self.recording_state is not None:
-                self.recording_state.fail_meter(message)
+            recording_state = self.recording_state
+            if recording_state is not None:
+                recording_state.fail_meter(message)
             try:
                 client.close()
             except Exception as exc:
