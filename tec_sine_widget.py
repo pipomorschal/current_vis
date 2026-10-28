@@ -17,6 +17,7 @@ from tec_output_worker import TecShutdownWorker
 from tec_sine import TecSineSettings, TecSineSweep
 from tec_temperature_sweep import TecTemperatureSweep
 from tec_sine_recording import SineRunState, SineLogSettings, SineRecordingWorker
+from tec_sine_trace import TecSineTraceRecorder
 from signal_data_import import ScopeCaptureConfig
 from keithley2000 import Keithley2000, KeithleySettings, MeterCancelled, FUNCTIONS, BAUD_RATES
 
@@ -26,6 +27,7 @@ class KeithleyReadWorker(QtCore.QThread):
     status = QtCore.Signal(str)
     outcome = QtCore.Signal(str)
     diagnostics = QtCore.Signal(str)
+    logging_failed = QtCore.Signal(str)
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -49,15 +51,18 @@ class KeithleyReadWorker(QtCore.QThread):
                 if self.cancelled.wait(max(0, due - time.monotonic())):
                     break
                 value = client.read()
-                if self.cancelled.is_set():
-                    break
                 now = time.monotonic()
                 row = dict(value=value, unit=self.settings.unit, function=self.settings.function,
                            elapsed_seconds=now - started, monotonic=now,
                            port=self.settings.port, identity=client.identity,
                            timestamp=datetime.now().astimezone().isoformat(timespec="milliseconds"))
-                if self.recording_state is not None:
-                    self.recording_state.set_meter(row)
+                recording_state = self.recording_state
+                if recording_state is not None:
+                    try:
+                        recording_state.set_meter(row)
+                    except Exception as exc:
+                        self.logging_failed.emit(f"DMM sample could not be saved: {exc}")
+                        raise
                 self.reading.emit(row)
                 tick = max(tick + 1, math.floor((now - started) / self.settings.interval_seconds) + 1)
         except MeterCancelled:
@@ -526,7 +531,7 @@ class TecSineWidget(QtWidgets.QWidget):
         self.log_dmm = QtWidgets.QCheckBox("Include Keithley voltage")
         self.log_dmm.setChecked(True)
         log.addRow(self.log_dmm)
-        note = QtWidgets.QLabel("Uses fresh triggered scope captures. Configure scope scale, timebase and trigger first (≥0.2 s of waveform recommended). Each file includes the verified TEC command and latest valid DMM voltage, with separate timestamps (not simultaneous). DMM is saved once per waveform. Failed scope/save/required-DMM readings stop the run.")
+        note = QtWidgets.QLabel("Scope waveforms use the capture interval. A separate TEC/DMM trace saves every completed DMM reading and verified TEC update at its own timestamp. Select DMM voltage, TEC temperature or TEC commanded setpoint in Recordings to display the full traces.")
         note.setWordWrap(True)
         log.addRow(note)
         form.addRow(self.logging_group)
@@ -672,6 +677,7 @@ class TecSineWidget(QtWidgets.QWidget):
         self.meter_worker.status.connect(self.meter_status.setText)
         self.meter_worker.outcome.connect(self.meter_status.setText)
         self.meter_worker.diagnostics.connect(self._on_meter_diagnostics)
+        self.meter_worker.logging_failed.connect(self._on_recording_failed)
         self.meter_worker.finished.connect(self._meter_finished)
         self.meter_worker.start()
         return True
@@ -807,16 +813,28 @@ class TecSineWidget(QtWidgets.QWidget):
             return
         self._meter_started_with_sine = False
         self._run_error = None
-        self.run_state = SineRunState() if log_settings is not None else None
+        try:
+            trace = (TecSineTraceRecorder(log_settings.folder, log_settings.extension, program,
+                                          include_dmm=log_settings.include_dmm) if log_settings is not None else None)
+        except Exception as exc:
+            self.status_label.setText(f"Could not start TEC/DMM trace recording: {exc}")
+            return
+        self.run_state = SineRunState(trace) if log_settings is not None else None
         if (self.meter_with_sine.isChecked() or (log_settings and log_settings.include_dmm)) and self.meter_worker is None:
             if not self.start_meter():
+                if self.run_state is not None:
+                    self.run_state.close_trace()
+                    self.run_state = None
                 self.status_label.setText("Choose valid Keithley settings before starting the sine with meter readings.")
                 return
             self._meter_started_with_sine = True
         if self.meter_worker is not None:
             self.meter_worker.recording_state = self.run_state
             if self.run_state is not None and self.meter_readings:
-                self.run_state.set_meter(self.meter_readings[-1])
+                # Seed waveform pairing with the previous live value, but do
+                # not append a reading acquired before this recording began.
+                with self.run_state.lock:
+                    self.run_state.meter = dict(self.meter_readings[-1])
         self.meter_with_sine.setEnabled(False)
         self.marker.clear()
         self._run_settings = settings
@@ -837,7 +855,7 @@ class TecSineWidget(QtWidgets.QWidget):
             self.recording_worker.status.connect(self.recording_status.setText)
             self.recording_worker.failed.connect(self._on_recording_failed)
             self.recording_worker.finished.connect(self._recording_finished)
-            self.recording_status.setText("Logging enabled; waiting for the first verified TEC command…")
+            self.recording_status.setText(f"Trace: {trace.path.name}. Waiting for the first verified TEC command…")
             self.recording_worker.start()
         else:
             self.recording_status.setText("Logging is off.")
@@ -920,6 +938,11 @@ class TecSineWidget(QtWidgets.QWidget):
         self.stop_button.setEnabled(False)
         if self.meter_worker is not None:
             self.meter_worker.recording_state = None
+        if self.run_state is not None:
+            try:
+                self.run_state.close_trace()
+            except Exception as exc:
+                self._run_error = f"TEC/DMM trace close failed: {exc}"
         self.run_state = None
         self.hardware_busy_changed.emit(False)
         self._update_preview()

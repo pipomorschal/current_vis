@@ -10,6 +10,7 @@ import pyqtgraph as pg
 
 from data_manager_signal_loader import DataManager
 from recording_analysis import recording_amplitude, recording_amplitudes, recording_harmonic_analysis
+from tec_sine_trace import is_trace_path, load_trace, trace_plot_series, DMM_SAMPLE, TEC_SAMPLE
 
 
 def natural_key(path: Path):
@@ -40,6 +41,7 @@ def recording_timestamp(path: Path, metadata: dict) -> float | None:
 
 def optional_recording_values(data, highpass, lowpass):
     values = {"ambient": np.nan, "tec": np.nan, "reference": np.nan, "warnings": []}
+    values["trace_session_id"] = data.metadata.get("tec_trace_session_id")
     if data.metadata.get("tec_dc_transition_during_capture") == "true":
         values["warnings"].append("DC offset changed during this capture; plotted offset is the start value")
     for prefix, key in (("ambient", "ambient"), ("tec", "tec")):
@@ -155,6 +157,12 @@ class RecordingWorker(QtCore.QObject):
             if QtCore.QThread.currentThread().isInterruptionRequested():
                 break
             try:
+                if is_trace_path(path):
+                    trace = load_trace(path)
+                    rows.append((path, np.nan, None, "", index + 1, {"trace": trace}))
+                    errors.extend(f"{path.name}: {warning}" for warning in trace.warnings)
+                    self.progress.emit(index + 1, len(self.paths))
+                    continue
                 data = DataManager.load_file(str(path))
                 optional = optional_recording_values(data, self.highpass, self.lowpass)
                 optional["optical_frequencies"] = self.frequencies
@@ -200,6 +208,8 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self._thread = None
         self._worker = None
         self._rows = []
+        self._traces = []
+        self._preserve_trace_refresh = False
         self._errors = []
         self._loaded_frequencies = (50,)
         self._pending_thd_analysis = False
@@ -421,6 +431,7 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self._clear_curves()
         self.table.setRowCount(0)
         self._rows = []
+        self._traces = []
         self._errors = []
         self.errors.hide()
         if not paths:
@@ -476,6 +487,7 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self._start_analysis([row[0] for row in self._rows], *options, thd_only_refresh=True)
 
     def _start_analysis(self, paths, hp, lp, frequencies, *, thd_only_refresh=False):
+        self._preserve_trace_refresh = thd_only_refresh
         self._analysis_label = "Calculating optical THD" if thd_only_refresh else "Processing"
         self._thread = QtCore.QThread(self)
         self._worker = RecordingWorker(paths, hp, lp, frequencies,
@@ -498,7 +510,11 @@ class RecordingPlotWidget(QtWidgets.QWidget):
 
     @QtCore.Slot(object, object)
     def _display(self, rows, errors):
-        self._rows = list(rows)
+        traces = [row[5]["trace"] for row in rows if len(row) > 5 and "trace" in row[5]]
+        if not self._preserve_trace_refresh:
+            self._traces = traces
+        self._preserve_trace_refresh = False
+        self._rows = [row for row in rows if not (len(row) > 5 and "trace" in row[5])]
         self._errors = list(errors)
         if self._rows and len(self._rows[0]) > 5:
             self._loaded_frequencies = self._rows[0][5].get("optical_frequencies", (50,))
@@ -513,10 +529,12 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         rows = list(self._rows)
         errors = list(self._errors)
         self._clear_curves()
-        timed = bool(rows) and all(row[2] is not None for row in rows)
+        trace_series = trace_plot_series(self._traces)
+        has_trace = bool(trace_series)
+        timed = has_trace or (bool(rows) and all(row[2] is not None for row in rows))
         if timed:
-            rows.sort(key=lambda row: row[2])
-        x = np.array([row[2] if timed else row[4] for row in rows])
+            rows.sort(key=lambda row: row[2] if row[2] is not None else float("inf"))
+        x = np.array([(row[2] if row[2] is not None else np.nan) if timed else row[4] for row in rows])
         y = np.array([row[1] for row in rows])
         aux = [row[5] if len(row) > 5 else {} for row in rows]
         offset_mode = self.x_axis.currentIndex() == 1
@@ -560,8 +578,8 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         if normalized:
             optical_label = "Normalized " + optical_label
         self.plot.setLabel("left", optical_label, units="" if normalized or ratio else unit)
-        self.plot.getAxis("left").setVisible(self.show_optical.isChecked())
-        if self.show_optical.isChecked():
+        self.plot.getAxis("left").setVisible(self.show_optical.isChecked() and bool(rows))
+        if self.show_optical.isChecked() and rows:
             self._curves["optical"] = self.plot.plot(x, y, pen=pg.mkPen("b", width=1.5), symbol="o", symbolSize=6,
                                                      name=f"Optical {first_frequency:g} Hz" + (" / reference" if ratio else ""), connect="finite")
             if second_enabled:
@@ -589,10 +607,10 @@ class RecordingPlotWidget(QtWidgets.QWidget):
                 ("dmm", dmm, self.show_dmm, "#08916b", "DMM voltage (V)"),
                 ("thd", thd, self.show_thd, "#7c3aed", "Optical THD (%)")):
             if toggle.isChecked():
-                if np.any(np.isfinite(values)):
-                    overlay_x = np.array([v.get(f"{key}_timestamp", row[2]) for row, v in zip(rows, aux)]) if timed and not offset_mode else x
+                overlay_x, overlay_y = self._overlay_samples(key, values, x, rows, aux, trace_series, timed, offset_mode)
+                if np.any(np.isfinite(overlay_y)):
                     view = {"reference": self.current_view, "dmm": self.voltage_view, "thd": self.thd_view}.get(key, self.temperature_view)
-                    self._add_overlay(key, overlay_x, values,
+                    self._add_overlay(key, overlay_x, overlay_y,
                                       view, color, label)
                 else:
                     if key != "thd":
@@ -649,6 +667,9 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         self.errors.setPlainText("\n".join(errors + warnings))
         self.errors.setVisible(bool(errors or warnings))
         self.status.setText(f"Plotted {len(rows)} recordings; skipped {len(errors)} files." +
+                            (f" Full traces: {sum(np.count_nonzero(t.samples['kind'] == DMM_SAMPLE) for t in self._traces)} DMM values, "
+                             f"{sum(np.count_nonzero(t.samples['kind'] == TEC_SAMPLE) for t in self._traces)} TEC updates."
+                             if self._traces else "") +
                             (" Using filename order (capture timestamps unavailable)." if rows and not timed else "") +
                             (" Maximum amplitude is zero; values remain zero." if zero_maximum else "") +
                             (f" No recorded data for: {', '.join(missing)}." if missing else "") +
@@ -666,6 +687,23 @@ class RecordingPlotWidget(QtWidgets.QWidget):
                 thd_message = (f" THD could not be calculated for {unavailable} waveform(s); see details below."
                                if unavailable else "")
             self.status.setText(self.status.text() + thd_message)
+
+    @staticmethod
+    def _overlay_samples(key, values, x, rows, aux, traces, timed, offset_mode):
+        wave_time = np.array([v.get(f"{key}_timestamp", row[2]) if row[2] is not None else np.nan
+                              for row, v in zip(rows, aux)], dtype=float)
+        wave_x = wave_time if timed and not offset_mode else x
+        trace = traces.get(key)
+        if trace is None:
+            return wave_x, values
+        # Each scope file keeps a paired snapshot for older readers. Prefer the
+        # complete stream when that same session is present, without duplicates.
+        keep = np.array([v.get("trace_session_id") not in trace["sessions"] for v in aux], dtype=bool)
+        full_x = np.concatenate([wave_x[keep], trace["offsets"] if offset_mode else trace["timestamp"]])
+        full_y = np.concatenate([values[keep], trace["values"]])
+        stamps = np.concatenate([wave_time[keep], trace["timestamp"]])
+        order = np.argsort(stamps, kind="stable")
+        return full_x[order], full_y[order]
 
     def _populate_table(self, headers, rows):
         table = self.table

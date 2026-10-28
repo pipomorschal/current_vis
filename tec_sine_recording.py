@@ -13,28 +13,47 @@ from PySide6 import QtCore
 from scope_capture_process import capture_isolated
 from scope_recording_io import next_scope_logging_path, save_scope_recording
 from tec_sine import sine_program_metadata
+from tec_sine_trace import TEC_SAMPLE, DMM_SAMPLE
 
 
 class SineRunState:
     """Small snapshots shared by independent TEC, DMM and scope workers."""
-    def __init__(self):
+    def __init__(self, trace=None):
         self.lock = threading.Lock()
         self.ready = threading.Event()
         self.setpoint = None
         self.meter = None
         self.meter_error = None
         self.started = None
+        self.trace = trace
+        self.trace_path = trace.path if trace is not None else None
+        self.trace_session_id = trace.session_id if trace is not None else None
 
     def set_target(self, point, started):
         with self.lock:
             self.setpoint = dict(point)
             self.started = started
+            if self.trace is not None:
+                self.trace.append(TEC_SAMPLE, point, point)
         self.ready.set()
 
     def set_meter(self, row):
         with self.lock:
             self.meter = dict(row)
             self.meter_error = None
+            if self.trace is not None:
+                self.trace.append(DMM_SAMPLE, row, self.setpoint)
+
+    def close_trace(self):
+        with self.lock:
+            if self.trace is not None:
+                trace, self.trace = self.trace, None
+                trace.close()
+
+    def trace_metadata(self):
+        if self.trace_path is None:
+            return {}
+        return {"tec_trace_file": self.trace_path.name, "tec_trace_session_id": self.trace_session_id}
 
     def fail_meter(self, message):
         with self.lock:
@@ -144,6 +163,7 @@ class SineRecordingWorker(QtCore.QThread):
                 captured_at = datetime.now().astimezone()
                 _, target, _, _ = self.state.snapshot()
                 metadata = sine_program_metadata(self.program, target["elapsed_seconds"])
+                metadata.update(self.state.trace_metadata())
                 metadata.update(logging_mode="true", logging_source="tec_sine", logging_session_started_at=session,
                                 logging_capture_started_at=captured_at.isoformat(timespec="milliseconds"),
                                 logging_capture_index=str(self.capture_count + 1),

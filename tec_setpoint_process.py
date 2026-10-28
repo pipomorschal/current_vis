@@ -39,7 +39,7 @@ def apply_request(request):
 def _read_temperature(request):
     value, unit = read_itc4005(request["resource"], request["timeout_ms"])
     return {"tec_temperature": value, "tec_temperature_unit": unit, "tec_temperature_status": "ok",
-            "tec_temperature_read_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+            "tec_temperature_read_at": datetime.now().astimezone().isoformat(timespec="milliseconds")}
 
 
 def set_tec_isolated(resource, target, minimum, maximum, *, timeout_ms=5000,
