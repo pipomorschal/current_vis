@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime
 import math
+import logging
 from pathlib import Path
 import threading
 import time
@@ -24,6 +25,7 @@ class SineRunState:
         self.setpoint = None
         self.meter = None
         self.meter_error = None
+        self._meter_recovery_deadline = None
         self.started = None
         self.trace = trace
         self.trace_path = trace.path if trace is not None else None
@@ -41,6 +43,7 @@ class SineRunState:
         with self.lock:
             self.meter = dict(row)
             self.meter_error = None
+            self._meter_recovery_deadline = None
             if self.trace is not None:
                 self.trace.append(DMM_SAMPLE, row, self.setpoint)
 
@@ -58,6 +61,23 @@ class SineRunState:
     def fail_meter(self, message):
         with self.lock:
             self.meter_error = message
+            self._meter_recovery_deadline = None
+
+    def recovering_meter(self, timeout_seconds):
+        with self.lock:
+            self._meter_recovery_deadline = time.monotonic() + timeout_seconds
+
+    def meter_recovery_deadline(self):
+        with self.lock:
+            return self._meter_recovery_deadline
+
+    def record_event(self, source, message, details=""):
+        with self.lock:
+            if self.trace is not None:
+                try:
+                    self.trace.log_event(source, message, details)
+                except OSError:
+                    logging.getLogger(__name__).exception("Could not write TEC sine diagnostic log")
 
     def snapshot(self):
         with self.lock:
@@ -120,6 +140,16 @@ class SineRecordingWorker(QtCore.QThread):
             _, _, meter, error = self.state.snapshot()
             if error:
                 raise RuntimeError(f"Required DMM voltage unavailable: {error}")
+            recovery_deadline = self.state.meter_recovery_deadline()
+            if recovery_deadline is not None:
+                # A failed exchange is being cleared/reconnected. Never pair an
+                # old sample while waiting, and never extend this grace forever.
+                if time.monotonic() >= recovery_deadline:
+                    raise TimeoutError("Required DMM voltage unavailable: serial recovery timed out")
+                deadline = max(deadline, recovery_deadline)
+                if self.cancelled.wait(0.05):
+                    return None
+                continue
             if meter:
                 if meter.get("unit") != "V":
                     raise ValueError("DMM logging requires a voltage function")

@@ -34,6 +34,13 @@ class MeterCancelled(Exception):
     pass
 
 
+class MeterProtocolError(ValueError):
+    """A damaged/incomplete serial exchange, distinct from a real overrange."""
+
+
+RECOVERABLE_METER_ERRORS = (TimeoutError, OSError, MeterProtocolError)
+
+
 @dataclass(frozen=True)
 class KeithleySettings:
     port: str
@@ -63,10 +70,10 @@ class KeithleySettings:
 def parse_reading(response, function):
     match = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?)\s*([A-Za-z0-9]*)\s*", response)
     if match is None:
-        raise ValueError(f"Invalid Keithley reading: {response[:100]!r}")
+        raise MeterProtocolError(f"Invalid Keithley reading: {response[:100]!r}")
     suffix = match[2].upper()
     if suffix and suffix != FUNCTIONS[function][2]:
-        raise ValueError(f"Unexpected Keithley reading units: {suffix}")
+        raise MeterProtocolError(f"Unexpected Keithley reading units: {suffix}")
     value = float(match[1])
     if not math.isfinite(value) or abs(value) >= 9e36:
         raise ValueError("Keithley reading is overrange or invalid; check the selected function and input")
@@ -120,7 +127,7 @@ class Keithley2000:
                     try:
                         line = raw.decode("ascii").strip()
                     except UnicodeDecodeError as exc:
-                        raise ValueError(
+                        raise MeterProtocolError(
                             f"Non-ASCII serial response {raw[:80]!r}; check baud rate, 8N1 and the selected COM port") from exc
                     if line:
                         return line
@@ -129,7 +136,7 @@ class Keithley2000:
                     continue
                 response.extend(byte)
                 if len(response) > 1024:
-                    raise ValueError("Keithley response exceeded 1024 bytes")
+                    raise MeterProtocolError("Keithley response exceeded 1024 bytes")
         if response:
             self.traffic.append(f"RX incomplete {bytes(response)!r} (hex: {response.hex(' ')})")
         return None
@@ -209,15 +216,7 @@ class Keithley2000:
                                       rtscts=False, dsrdtr=False)
             self._clear_device()
             self.identity = self._identify()
-            # CONF establishes a one-shot immediate trigger and disables math/scanning.
-            self._write(":SYST:REM")
-            self._write("*CLS")
-            self._write(f":CONF:{FUNCTIONS[s.function][0]}")
-            self._write(":FORM:DATA ASC")
-            self._write(":FORM:ELEM READ")
-            error = self.query(":SYST:ERR?")
-            if int(error.split(",", 1)[0]) != 0:
-                raise RuntimeError(f"Keithley configuration error: {error}")
+            self._configure()
             return self
         except Exception:
             self.close()
@@ -226,15 +225,41 @@ class Keithley2000:
     def read(self):
         return parse_reading(self.query(":READ?"), self.settings.function)
 
-    def close(self):
+    def _configure(self):
+        # CONF establishes a one-shot immediate trigger and disables math/scanning.
+        self._write(":SYST:REM")
+        self._write("*CLS")
+        self._write(f":CONF:{FUNCTIONS[self.settings.function][0]}")
+        self._write(":SAMP:COUN 1")
+        # TRAC settings survive CONF/*RST. Streaming to the PC must not depend
+        # on an armed finite buffer left over from a previous front-panel setup.
+        self._write(":TRAC:FEED:CONT NEV")
+        self._write(":FORM:DATA ASC")
+        self._write(":FORM:ELEM READ")
+        error = self.query(":SYST:ERR?")
+        if int(error.split(",", 1)[0]) != 0:
+            raise RuntimeError(f"Keithley configuration error: {error}")
+
+    def recover(self, *, reopen=False):
+        """Discard a failed exchange before issuing a new measurement query."""
+        self._check_cancelled()
+        if reopen:
+            # Do not spend another timeout talking to an adapter that vanished.
+            self.close(restore_local=False)
+            return self.connect()
+        self._clear_device()
+        self._configure()
+        return self
+
+    def close(self, *, restore_local=True):
         if self.port is not None:
             try:
-                if self.identity is not None:
+                if restore_local and self.identity is not None:
                     # Abort any pending read before returning front-panel control.
                     self._clear_device(check_cancelled=False)
                     self._send_raw(b":SYST:LOC" + self._terminator, check_cancelled=False)
             except Exception:
                 pass
             finally:
-                self.port.close()
-                self.port = None
+                port, self.port = self.port, None
+                port.close()

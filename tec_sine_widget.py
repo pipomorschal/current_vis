@@ -19,7 +19,8 @@ from tec_temperature_sweep import TecTemperatureSweep
 from tec_sine_recording import SineRunState, SineLogSettings, SineRecordingWorker
 from tec_sine_trace import TecSineTraceRecorder
 from signal_data_import import ScopeCaptureConfig
-from keithley2000 import Keithley2000, KeithleySettings, MeterCancelled, FUNCTIONS, BAUD_RATES
+from keithley2000 import (Keithley2000, KeithleySettings, MeterCancelled, FUNCTIONS, BAUD_RATES,
+                          RECOVERABLE_METER_ERRORS)
 
 
 class KeithleyReadWorker(QtCore.QThread):
@@ -38,19 +39,60 @@ class KeithleyReadWorker(QtCore.QThread):
     def cancel(self):
         self.cancelled.set()
 
+    def _event(self, client, message):
+        details = str(client.diagnostics)
+        self.diagnostics.emit(details)
+        state = self.recording_state
+        if state is not None:
+            state.record_event("DMM", message, details)
+
+    def _read_with_recovery(self, client):
+        try:
+            return client.read()
+        except RECOVERABLE_METER_ERRORS as exc:
+            error = exc
+        budget = max(30, 12 * self.settings.timeout_seconds)
+        deadline = time.monotonic() + budget
+        state = self.recording_state
+        if state is not None:
+            state.recovering_meter(budget)
+        for attempt, delay in enumerate((0.5, 1.0, 2.0), 1):
+            message = f"Meter communication error: {error}. Recovery attempt {attempt}/3."
+            self.status.emit(message)
+            # Save the failed exchange before clearing/reopening overwrites it.
+            self._event(client, message)
+            if self.cancelled.wait(delay):
+                raise MeterCancelled()
+            if time.monotonic() >= deadline:
+                break
+            try:
+                client.recover(reopen=attempt > 1 or
+                               (isinstance(error, OSError) and not isinstance(error, TimeoutError)))
+                if time.monotonic() >= deadline:
+                    break
+                value = client.read()
+                self._event(client, f"Meter communication recovered on attempt {attempt}.")
+                self.status.emit(f"Connected: {client.identity}. Communication recovered.")
+                return value
+            except RECOVERABLE_METER_ERRORS as exc:
+                error = exc
+        raise RuntimeError(f"Keithley serial recovery failed after bounded retries: {error}") from error
+
     def run(self):
         client = Keithley2000(self.settings, self.cancelled)
         message = "Meter stopped. Front-panel control restored."
+        samples = 0
         try:
             client.connect()
             self.status.emit(f"Connected: {client.identity}")
+            self._event(client, f"Connected: {client.identity}")
             started = time.monotonic()
             tick = 0
             while not self.cancelled.is_set():
                 due = started + tick * self.settings.interval_seconds
                 if self.cancelled.wait(max(0, due - time.monotonic())):
                     break
-                value = client.read()
+                value = self._read_with_recovery(client)
                 now = time.monotonic()
                 row = dict(value=value, unit=self.settings.unit, function=self.settings.function,
                            elapsed_seconds=now - started, monotonic=now,
@@ -64,12 +106,14 @@ class KeithleyReadWorker(QtCore.QThread):
                         self.logging_failed.emit(f"DMM sample could not be saved: {exc}")
                         raise
                 self.reading.emit(row)
+                samples += 1
                 tick = max(tick + 1, math.floor((now - started) / self.settings.interval_seconds) + 1)
         except MeterCancelled:
             pass
         except Exception as exc:
             message = f"Meter stopped on error: {exc}. TEC sine control is independent."
         finally:
+            self._event(client, f"{message} Completed readings: {samples}.")
             recording_state = self.recording_state
             if recording_state is not None:
                 recording_state.fail_meter(message)
@@ -116,6 +160,7 @@ class TecTemperatureWorker(QtCore.QThread):
 class TecSineWorker(QtCore.QThread):
     applied = QtCore.Signal(object)
     outcome = QtCore.Signal(str)
+    failed = QtCore.Signal(str)
 
     def __init__(self, settings, resource, timeout_ms=5000, parent=None, *, state=None, duration=None,
                  auto_output=False):
@@ -171,6 +216,7 @@ class TecSineWorker(QtCore.QThread):
             self.outcome.emit("Stopped. TEC output shutdown pending." if self.auto_output else
                               "Stopped. The TEC holds its last commanded setpoint.")
         except Exception as exc:
+            self.failed.emit(str(exc))
             self.outcome.emit(f"Stopped on error: {exc}." + (" TEC output shutdown pending." if self.auto_output else
                               " The TEC holds its last commanded setpoint."))
 
@@ -835,7 +881,8 @@ class TecSineWidget(QtWidgets.QWidget):
                 # Seed waveform pairing with the previous live value, but do
                 # not append a reading acquired before this recording began.
                 with self.run_state.lock:
-                    self.run_state.meter = dict(self.meter_readings[-1])
+                    if self.run_state.meter is None:
+                        self.run_state.meter = dict(self.meter_readings[-1])
         self.meter_with_sine.setEnabled(False)
         self.marker.clear()
         self._run_settings = settings
@@ -849,6 +896,7 @@ class TecSineWidget(QtWidgets.QWidget):
                                     auto_output=self.auto_tec_output.isChecked())
         self.worker.applied.connect(self._on_applied)
         self.worker.outcome.connect(self.status_label.setText)
+        self.worker.failed.connect(self._on_tec_failed)
         self.worker.finished.connect(self._finished)
         if log_settings is not None:
             self.recording_worker = SineRecordingWorker(program, config, log_settings, self.run_state, duration, self)
@@ -867,10 +915,20 @@ class TecSineWidget(QtWidgets.QWidget):
         self.recording_status.setText(f"Saved {info['count']} capture(s). Latest: {info['path']}")
 
     def _on_recording_failed(self, message):
-        self._run_error = message
+        if self.run_state is not None:
+            self.run_state.record_event("logging", message)
+        self._run_error = self._run_error or message
         self.recording_status.setText(f"Logging stopped on error: {message}")
         if self.worker is not None:
             self.worker.cancel()
+
+    def _on_tec_failed(self, message):
+        self._run_error = self._run_error or f"TEC control failed: {message}"
+        if self.run_state is not None:
+            self.run_state.record_event("TEC", message)
+        if self.recording_worker is not None:
+            self.recording_worker.cancel()
+        self.recording_status.setText(f"Run stopped: {self._run_error}")
 
     def _recording_finished(self):
         worker = self.recording_worker
@@ -941,6 +999,7 @@ class TecSineWidget(QtWidgets.QWidget):
             self.meter_worker.recording_state = None
         if self.run_state is not None:
             try:
+                self.run_state.record_event("run", self._run_error or "Recording finished.")
                 self.run_state.close_trace()
             except Exception as exc:
                 self._run_error = f"TEC/DMM trace close failed: {exc}"
@@ -948,7 +1007,7 @@ class TecSineWidget(QtWidgets.QWidget):
         self.hardware_busy_changed.emit(False)
         self._update_preview()
         if self._run_error:
-            self.status_label.setText(f"Run stopped because logging failed: {self._run_error}")
+            self.status_label.setText(f"Run stopped: {self._run_error}")
 
     def _output_shutdown_finished(self):
         worker = self._shutdown_worker

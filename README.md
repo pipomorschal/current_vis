@@ -366,10 +366,27 @@ kept in the live plot's memory. With scope logging and **Include Keithley voltag
 enabled, all readings during the run are saved, including those between waveforms.
 Without scope logging, no recording file is created. AC readings are meter RMS values,
 not separate 50/100 Hz amplitudes. Meter I/O runs separately from TEC updates;
-slow reads skip missed read slots. A timeout, invalid/overrange value or serial
-error stops the meter and shows the reason without stopping the sine, except
+slow reads skip missed read slots. An unrecoverable communication error or
+overrange reading stops the meter and shows the reason without stopping the sine, except
 when that voltage is required by an active logging run. Stop
 cancels pending reads, returns local front-panel control and closes the port.
+
+Transient serial timeouts, damaged replies and adapter disconnects are retried
+automatically, up to three recovery attempts. The first timeout clears the
+failed exchange and restores the measurement setup; subsequent attempts reopen
+and identify the adapter's instrument. Adapter I/O errors reopen immediately.
+Required scope logging waits for a new valid DMM sample during this bounded
+recovery, instead of pairing a stale voltage or immediately aborting the sweep.
+Overrange readings and recording disk errors remain terminal errors. Missed
+readings are not filled in. The meter is explicitly configured for one reading
+per query with internal trace-buffer feeding disabled; see the
+[Keithley manual's TRACe subsystem](https://download.tek.com/manual/2000-900_J-Aug2010_User.pdf#page=199).
+
+Each TEC Sine trace has an accompanying `tec_sine_trace_....log` diagnostic file.
+It saves serial failures, recovery attempts and their raw serial details, plus
+TEC/control and recording errors. A confirmed TEC control failure cancels scope
+logging and preserves the original cause through output cleanup. These logs are
+separate from the HDF5/CSV measurements and are ignored by Recordings/playback.
 
 If identification fails, use **Copy serial details** after the meter stops to
 copy the COM port, baud/flow settings and recent transmitted/received bytes.

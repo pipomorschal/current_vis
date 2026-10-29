@@ -42,6 +42,7 @@ class TecSineTraceRecorder:
         self.closed = False
         self.count = 0
         self._handle = None
+        self._events = None
         self._dataset = None
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.path = Path(folder) / f"{TRACE_PREFIX}{stamp}_{self.session_id[:8]}{extension}"
@@ -61,10 +62,26 @@ class TecSineTraceRecorder:
                                                             chunks=(256,), dtype=SAMPLE_DTYPE)
                 self._handle.swmr_mode = True
                 self._handle.flush()
+            self._events = self.path.with_suffix(".log").open("x", encoding="utf-8")
+            self.log_event("run", f"Recording started; session={self.session_id}; "
+                           f"program={json.dumps(sine_program_metadata(program, 0))}")
         except Exception:
             if self._handle is not None:
                 self._handle.close()
+            if self._events is not None:
+                self._events.close()
             raise
+
+    def log_event(self, source, message, details=""):
+        """Persist faults and recovery traffic, without logging every good sample."""
+        with self.lock:
+            if self.closed:
+                return
+            stamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+            self._events.write(f"{stamp} [{source}] {message}\n")
+            if details:
+                self._events.write(str(details) + "\n")
+            self._events.flush()
 
     def append(self, kind, row, target=None):
         if kind == DMM_SAMPLE and not self.include_dmm:
@@ -106,7 +123,10 @@ class TecSineTraceRecorder:
         with self.lock:
             if not self.closed:
                 self.closed = True
-                self._handle.close()
+                try:
+                    self._handle.close()
+                finally:
+                    self._events.close()
 
 
 @dataclass
