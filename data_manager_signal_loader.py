@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import csv
 import json
+from itertools import zip_longest
 
 import numpy as np
 
@@ -12,6 +13,8 @@ except Exception:  # pragma: no cover - optional dependency guarded at runtime
     h5py = None
 
 from signal_data_class import SignalData
+from text_measurements import preview_text, open_text_table, needs_measurement_import, load_text_measurements
+from hdf5_measurements import describe_hdf5_measurements, load_hdf5_selection
 
 
 class DataManager:
@@ -89,26 +92,21 @@ class DataManager:
             return None
 
     @classmethod
-    def preview_csv_or_txt(cls, file_path: str) -> dict:
-        path = Path(file_path)
-        metadata, header, rows = cls._parse_metadata_and_table(path)
-
-        return {
-            "format": "text",
-            "file_path": str(path),
-            "metadata": metadata,
-            "columns": header,
-            "row_count": len(rows),
-        }
+    def preview_csv_or_txt(cls, file_path: str, cancelled=None) -> dict:
+        return preview_text(Path(file_path), cancelled)
 
     @classmethod
-    def preview_hdf5(cls, file_path: str) -> dict:
+    def preview_hdf5(cls, file_path: str, cancelled=None) -> dict:
         cls._require_h5py()
         path = Path(file_path)
 
         with h5py.File(path, "r") as h5:
             datasets = cls._collect_hdf5_datasets(h5)
             metadata = cls._read_hdf5_metadata(h5)
+            description = describe_hdf5_measurements(h5, datasets, metadata)
+            if cancelled is not None and cancelled():
+                from text_measurements import TextImportCancelled
+                raise TextImportCancelled()
 
             row_count = 0
             for candidate in ("amplitude", "signal", "time"):
@@ -133,6 +131,10 @@ class DataManager:
                 "columns": datasets,
                 "row_count": row_count,
                 "source_name": cls._to_text(h5.attrs.get("source_name", path.name)),
+                **description,
+                "measurement_datasets": list(description["measurements"]),
+                "dataset_labels": {name: spec["label"] for name, spec in description["measurements"].items()},
+                "populated_counts": {name: spec["count"] for name, spec in description["measurements"].items()},
             }
 
     @classmethod
@@ -143,14 +145,19 @@ class DataManager:
         amplitude_column: str | None = None,
         time_dataset: str | None = None,
         amplitude_dataset: str | None = None,
+        additional_columns: tuple[str, ...] = (),
+        cancelled=None,
+        additional_datasets: tuple[str, ...] | None = None,
     ) -> SignalData:
         path = Path(file_path)
         suffix = path.suffix.lower()
 
         if suffix in {".csv", ".txt"}:
-            return cls._load_csv_or_txt(path, time_column=time_column, amplitude_column=amplitude_column)
+            return cls._load_csv_or_txt(path, time_column=time_column, amplitude_column=amplitude_column,
+                                       additional_columns=additional_columns, cancelled=cancelled)
         if suffix in {".h5", ".hdf5"}:
-            return cls._load_hdf5(path, time_dataset=time_dataset, amplitude_dataset=amplitude_dataset)
+            return cls._load_hdf5(path, time_dataset=time_dataset, amplitude_dataset=amplitude_dataset,
+                                  additional_datasets=additional_datasets, cancelled=cancelled)
         if suffix == ".wfm":
             return cls._load_wfm(path)
         if suffix == ".npy":
@@ -161,50 +168,9 @@ class DataManager:
         raise ValueError(f"Unsupported file type: {suffix}")
 
     @classmethod
-    def _parse_metadata_and_table(cls, path: Path) -> tuple[dict[str, str], list[str], list[list[str]]]:
-        metadata: dict[str, str] = {}
-        header: list[str] | None = None
-        rows: list[list[str]] = []
-
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for raw_line in f:
-                line = raw_line.strip()
-                if not line:
-                    continue
-
-                parts = [p.strip() for p in line.split(",")]
-
-                if header is None:
-                    if len(parts) >= 2:
-                        left, right = parts[0], parts[1]
-                        left_float = cls._try_float(left)
-                        right_float = cls._try_float(right)
-
-                        if left.upper() == "TIME" or any(p.upper() == "TIME" for p in parts):
-                            header = parts
-                            continue
-
-                        if left_float is not None and right_float is not None:
-                            header = ["TIME", "VOLTAGE"]
-                            header.extend(f"COLUMN_{index}" for index in range(3, len(parts) + 1))
-                            rows.append(parts[:len(header)])
-                            continue
-
-                        if left_float is None or right_float is None:
-                            metadata[left] = ",".join(parts[1:]).strip()
-                            continue
-
-                    continue
-
-                if len(parts) >= len(header):
-                    rows.append(parts[:len(header)])
-
-        if header is None:
-            raise ValueError(
-                "Could not find a table header or a row with at least two numeric columns."
-            )
-
-        return metadata, header, rows
+    def _parse_metadata_and_table(cls, path: Path, cancelled=None) -> tuple[dict[str, str], list[str], list[list[str]]]:
+        with open_text_table(path, cancelled) as (metadata, header, rows, delimiter):
+            return metadata, header, list(rows)
 
     @classmethod
     def _load_csv_or_txt(
@@ -212,8 +178,15 @@ class DataManager:
         path: Path,
         time_column: str | None = None,
         amplitude_column: str | None = None,
+        additional_columns: tuple[str, ...] = (),
+        cancelled=None,
     ) -> SignalData:
-        metadata, header, rows = cls._parse_metadata_and_table(path)
+        with path.open(encoding="utf-8", errors="ignore") as handle:
+            if handle.readline().strip() == "# current_vis_rf_spectrum_v1":
+                raise ValueError("RF spectra contain frequency/power data. Open this file in the RF Capture tab.")
+        if additional_columns or needs_measurement_import(path):
+            return load_text_measurements(path, time_column, amplitude_column, additional_columns, cancelled)
+        metadata, header, rows = cls._parse_metadata_and_table(path, cancelled)
 
         if not rows:
             raise ValueError("No numeric data rows found.")
@@ -240,7 +213,8 @@ class DataManager:
         time_vals = []
         amp_vals = []
 
-        for row in rows:
+        primary_count = int(metadata.get("multi_channel_primary_count", len(rows)))
+        for row in rows[:primary_count]:
             try:
                 t = float(row[time_idx])
                 y = float(row[amp_idx])
@@ -281,6 +255,18 @@ class DataManager:
                                        sampling_rate=cls.estimate_sampling_rate(ref_time),
                                        column_names=("REFERENCE_TIME", reference_channel))
 
+        channels = {}
+        for spec in json.loads(metadata.get("captured_channel_data", "[]")):
+            samples = np.asarray([[float(row[header.index(spec["time_column"])]),
+                                   float(row[header.index(spec["amplitude_column"])])]
+                                  for row in rows[:spec["count"]]], dtype=float).reshape(-1, 2)
+            trace = SignalData(samples[:, 0], samples[:, 1], sampling_rate=spec["sampling_rate"],
+                               source_name=spec["source_name"], metadata=spec["metadata"],
+                               column_names=tuple(spec["column_names"]))
+            if spec["additional"]:
+                channels[spec["label"]] = trace
+            if spec["reference"]:
+                reference = trace
         return SignalData(
             time=time,
             amplitude=amplitude,
@@ -289,6 +275,7 @@ class DataManager:
             metadata=metadata,
             column_names=(time_column, amplitude_column),
             reference=reference,
+            channels=channels,
         )
 
     @classmethod
@@ -297,12 +284,22 @@ class DataManager:
         path: Path,
         time_dataset: str | None = None,
         amplitude_dataset: str | None = None,
+        additional_datasets: tuple[str, ...] | None = None,
+        cancelled=None,
     ) -> SignalData:
         cls._require_h5py()
 
         with h5py.File(path, "r") as h5:
+            if h5.attrs.get("format") == "current_vis_rf_spectrum_v1":
+                raise ValueError("RF spectra contain frequency/power data. Open this file in the RF Capture tab.")
             metadata = cls._read_hdf5_metadata(h5)
             source_name = cls._to_text(h5.attrs.get("source_name", path.name))
+            if additional_datasets is not None:
+                description = describe_hdf5_measurements(h5, cls._collect_hdf5_datasets(h5), metadata)
+                selected = (amplitude_dataset or description["default_amplitude_dataset"] or "").lstrip("/")
+                if selected in description["measurements"] or additional_datasets:
+                    return load_hdf5_selection(h5, path, time_dataset, amplitude_dataset, additional_datasets,
+                                                description, metadata, cancelled)
 
             time_name = time_dataset or cls._to_text(h5.attrs.get("time_dataset", "")) or "time"
             amp_name = amplitude_dataset or cls._to_text(h5.attrs.get("amplitude_dataset", "")) or "amplitude"
@@ -319,6 +316,18 @@ class DataManager:
                                        column_names=("REFERENCE_TIME", cls._to_text(h5.attrs.get("reference_channel", "CH2"))))
             display_time_name = cls._to_text(h5.attrs.get("time_column", time_name)) or time_name
             display_amp_name = cls._to_text(h5.attrs.get("amplitude_column", amp_name)) or amp_name
+            channels = {}
+            if "captured_channels" in h5:
+                for group in h5["captured_channels"].values():
+                    label = cls._to_text(group.attrs["label"])
+                    trace = SignalData(group["time"][:], group["amplitude"][:],
+                                       source_name=cls._to_text(group.attrs["source_name"]),
+                                       sampling_rate=float(group.attrs["sampling_rate"]),
+                                       column_names=tuple(json.loads(group.attrs["column_names"])),
+                                       metadata=json.loads(group.attrs["metadata"]))
+                    channels[label] = trace
+                    if reference is not None and label == reference.column_names[1]:
+                        reference = trace
 
             if time_name == amp_name and time_name in h5 and isinstance(h5[time_name], h5py.Dataset):
                 ds = np.asarray(h5[time_name])
@@ -364,6 +373,7 @@ class DataManager:
                     metadata=metadata,
                     column_names=(display_time_name, display_amp_name),
                     reference=reference,
+                    channels=channels,
                 )
 
             if "signal" in h5 and isinstance(h5["signal"], h5py.Dataset):
@@ -502,6 +512,8 @@ class DataManager:
 
     @staticmethod
     def save_csv(file_path: str, data: SignalData):
+        if data.channels or data.reference is not None or data.metadata.get("source_time_format") == "ISO8601":
+            return DataManager.save_scope_csv(file_path, data)
         with open(file_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["time", "amplitude"])
@@ -538,6 +550,19 @@ class DataManager:
                 meta_group = h5.create_group("metadata")
                 for key, value in data.metadata.items():
                     meta_group.attrs[str(key)] = cls._to_text(value)
+            if data.channels:
+                captured = h5.create_group("captured_channels")
+                for index, (label, trace) in enumerate(data.channels.items()):
+                    group = captured.create_group(str(index))
+                    group.attrs.update(label=label, source_name=trace.source_name,
+                                       sampling_rate=float(trace.sampling_rate),
+                                       column_names=json.dumps(trace.column_names), metadata=json.dumps(trace.metadata))
+                    if trace is data.reference:
+                        group["time"] = h5["reference_time"]
+                        group["amplitude"] = h5["reference_amplitude"]
+                    else:
+                        group.create_dataset("time", data=trace.time, compression="gzip", compression_opts=4)
+                        group.create_dataset("amplitude", data=trace.amplitude, compression="gzip", compression_opts=4)
 
     @staticmethod
     def save_scope_csv(file_path: str, data: SignalData):
@@ -546,6 +571,28 @@ class DataManager:
 
         with open(file_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
+
+            if data.channels:
+                manifest, columns, streams = [], [time_col or "TIME", amp_col], [data.time, data.amplitude]
+                for label, trace in list(data.channel_traces().items())[1:]:
+                    time_name = f"{label}_TIME"
+                    manifest.append(dict(label=label, time_column=time_name, amplitude_column=label,
+                                         count=trace.n_samples, sampling_rate=float(trace.sampling_rate),
+                                         source_name=trace.source_name, metadata=trace.metadata,
+                                         column_names=trace.column_names, additional=label in data.channels,
+                                         reference=trace is data.reference))
+                    columns.extend((time_name, label))
+                    streams.extend((trace.time, trace.amplitude))
+                for key, value in data.metadata.items():
+                    if key not in {"multi_channel_primary_count", "captured_channel_data"}:
+                        writer.writerow([key, value])
+                writer.writerow(["multi_channel_primary_count", data.n_samples])
+                writer.writerow(["captured_channel_data", json.dumps(manifest)])
+                if data.sampling_rate > 0:
+                    writer.writerow(["Sample Interval", f"{1 / data.sampling_rate:.16g}"])
+                writer.writerow(columns)
+                writer.writerows(zip_longest(*streams, fillvalue="nan"))
+                return
 
             # Metadaten zuerst, damit der bestehende Loader sie mit einliest.
             if data.metadata:

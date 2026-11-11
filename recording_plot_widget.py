@@ -11,6 +11,7 @@ import pyqtgraph as pg
 from data_manager_signal_loader import DataManager
 from recording_analysis import recording_amplitude, recording_amplitudes, recording_harmonic_analysis
 from tec_sine_trace import is_trace_path, load_trace, trace_plot_series, DMM_SAMPLE, TEC_SAMPLE
+from rf_capture import is_rf_path
 
 
 def natural_key(path: Path):
@@ -422,7 +423,8 @@ class RecordingPlotWidget(QtWidgets.QWidget):
         hp, lp, frequencies = options
         try:
             paths = sorted((p for p in (folder.rglob("*") if self.recursive.isChecked() else folder.iterdir())
-                            if p.is_file() and p.suffix.lower() in {".csv", ".h5", ".hdf5"}), key=natural_key)
+                            if p.is_file() and not is_rf_path(p)
+                            and p.suffix.lower() in {".csv", ".h5", ".hdf5"}), key=natural_key)
         except OSError as exc:
             self.status.setText(str(exc))
             return

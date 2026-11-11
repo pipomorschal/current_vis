@@ -31,6 +31,17 @@ class ScopeCaptureConfig:
 	fresh_trigger: bool = False
 	trigger_wait_seconds: float = 30.0
 	auto_tec_output: bool = False
+	additional_channels: tuple[str, ...] = ()
+
+	def capture_channels(self):
+		primary = self.channel.strip().upper()
+		if self.reference_channel and self.reference_channel.strip().upper() == primary:
+			raise ValueError("Optical and reference channels must be different")
+		channels = list(dict.fromkeys([primary, *(c.strip().upper() for c in self.additional_channels),
+		                              *([self.reference_channel.strip().upper()] if self.reference_channel else [])]))
+		if any(channel not in {"CH1", "CH2", "CH3", "CH4"} for channel in channels):
+			raise ValueError("Select analog scope channels CH1 through CH4")
+		return channels
 
 
 class ScopeCommunicationError(RuntimeError):
@@ -90,6 +101,7 @@ class OscilloscopeImporter:
 	@classmethod
 	def capture_channel(cls, config: ScopeCaptureConfig) -> SignalData:
 		cls._ensure_pyvisa()
+		channels = config.capture_channels()
 
 		rm = None
 		inst = None
@@ -104,24 +116,18 @@ class OscilloscopeImporter:
 				stage = "waiting for a fresh triggered waveform"
 				return cls._capture_triggered(inst, config)
 
-			if config.reference_channel:
-				if config.reference_channel.upper() == config.channel.upper():
-					raise ValueError("Optical and reference channels must be different")
-				stage = "freezing the paired waveform record"
+			if len(channels) > 1:
+				stage = "freezing the multi-channel waveform record"
 				was_running = bool(cls._query_float(inst, "ACQUIRE:STATE?"))
 				try:
 					inst.write("ACQUIRE:STATE STOP")
-					data = cls._read_channel(inst, config, config.channel)
-					data.reference = cls._read_channel(inst, config, config.reference_channel)
-					data.metadata.update({"optical_channel": config.channel,
-					                      "reference_channel": config.reference_channel,
-					                      "paired_capture": "same stopped oscilloscope record"})
+					data = cls._read_channels(inst, config)
 				finally:
 					if was_running:
 						inst.write("ACQUIRE:STATE RUN")
 				return data
 			stage = "reading waveform"
-			return cls._read_channel(inst, config, config.channel)
+			return cls._read_channels(inst, config)
 
 		except MemoryError:
 			raise
@@ -165,9 +171,7 @@ class OscilloscopeImporter:
 				if time.monotonic() >= deadline:
 					raise TimeoutError("No completed triggered acquisition before trigger timeout")
 				time.sleep(0.1)
-			data = cls._read_channel(inst, config, config.channel)
-			if config.reference_channel:
-				data.reference = cls._read_channel(inst, config, config.reference_channel)
+			data = cls._read_channels(inst, config)
 			data.metadata["fresh_trigger"] = "true"
 			return data
 		finally:
@@ -176,6 +180,21 @@ class OscilloscopeImporter:
 			inst.write(f"TRIGGER:A:MODE {trigger_mode}")
 			if was_running:
 				inst.write("ACQUIRE:STATE RUN")
+
+	@classmethod
+	def _read_channels(cls, inst, config):
+		channels = config.capture_channels()
+		traces = {channel: cls._read_channel(inst, config, channel) for channel in channels}
+		data = traces[channels[0]]
+		data.channels = {channel: traces[channel] for channel in channels[1:]
+		                 if channel in {c.strip().upper() for c in config.additional_channels}}
+		if config.reference_channel:
+			data.reference = traces[config.reference_channel.strip().upper()]
+			data.metadata.update(optical_channel=channels[0], reference_channel=config.reference_channel.strip().upper())
+		if len(channels) > 1:
+			data.metadata.update(captured_channels=",".join(channels),
+			                     paired_capture="same stopped oscilloscope record")
+		return data
 
 	@classmethod
 	def _read_channel(cls, inst, config, channel):

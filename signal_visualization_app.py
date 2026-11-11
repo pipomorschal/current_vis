@@ -19,6 +19,7 @@ from signal_data_class import SignalData
 from signal_data_import import OscilloscopeImporter, ScopeCaptureConfig, ScopeCommunicationError
 from plot_panel_widget import PlotPanel
 from frequency_sweep_widget import FrequencyInput, FrequencySweepWidget
+from rf_capture_widget import RfCaptureWidget
 from recording_plot_widget import RecordingPlotWidget
 from capture_playback_widget import CapturePlaybackWidget
 from mini_game_widget import MiniGameWidget
@@ -30,6 +31,29 @@ from tec_sine_widget import TecSineWidget
 from scope_recording_io import next_scope_logging_path
 from tec_output_worker import TecShutdownWorker
 from gui_configuration import default_config_path, save_configuration, load_configuration
+from text_measurements import TextImportCancelled
+from channel_math import ChannelMathError, channel_aliases, evaluate_channel_math
+
+
+class TextFileImportWorker(QtCore.QThread):
+    """Preview/load CSV and HDF5 measurements without blocking Qt."""
+    def __init__(self, path, mapping=None, parent=None):
+        super().__init__(parent)
+        self.path, self.mapping = path, mapping
+        self.result, self.error = None, None
+
+    def run(self):
+        try:
+            if self.mapping is None:
+                preview = (DataManager.preview_hdf5 if Path(self.path).suffix.lower() in {".h5", ".hdf5"}
+                           else DataManager.preview_csv_or_txt)
+                self.result = preview(self.path, cancelled=self.isInterruptionRequested)
+            else:
+                self.result = DataManager.load_file(self.path, **self.mapping, cancelled=self.isInterruptionRequested)
+        except TextImportCancelled:
+            pass
+        except Exception as exc:
+            self.error = str(exc)
 
 
 class ScopeAcquireWorker(QtCore.QObject):
@@ -148,6 +172,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._selected_fft_frequency: float | None = None
         self.data: SignalData | None = None
         self.selected_data: SignalData | None = None
+        self._text_import_worker = None
         self._current_time_unit_scale = 1.0
         self._range_initialized = False
         self._fft_click_handler_installed = False
@@ -221,9 +246,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tabs.setCornerWidget(self.logo_label, QtCore.Qt.Corner.TopRightCorner)
 
         self.time_plot = PlotPanel("Time Domain")
+        self.time_plot.layout().insertWidget(0, self.time_channels_group)
+        self.time_plot.layout().insertWidget(1, self.time_math_group)
+        self.time_plot.layout().setStretch(2, 1)
         self.freq_plot = PlotPanel("Frequency Domain")
         self.demo_plot = PlotPanel("Demodulation")
         self.sweep_widget = FrequencySweepWidget()
+        self.rf_capture_widget = RfCaptureWidget()
         self.recording_widget = RecordingPlotWidget()
         self.tec_pid_widget = TecPidWidget()
         self.tec_sine_widget = TecSineWidget()
@@ -233,6 +262,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar_stack = QtWidgets.QStackedWidget()
         self.sidebar_stack.addWidget(self.controls)
         self.sidebar_stack.addWidget(self.sweep_widget.control_panel)
+        self.sidebar_stack.addWidget(self.rf_capture_widget.control_panel)
         self.sidebar_stack.addWidget(self.recording_widget.control_panel)
         self.sidebar_stack.addWidget(self.tec_pid_widget.control_panel)
         self.sidebar_stack.addWidget(self.tec_sine_widget.control_panel)
@@ -251,6 +281,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.freq_plot, "Frequency")
         self.tabs.addTab(self.demo_plot, "Demodulation")
         self.tabs.addTab(self.sweep_widget, "Frequency Sweep")
+        self.tabs.addTab(self.rf_capture_widget, "RF Capture")
         self.tabs.addTab(self.recording_widget, "Recordings")
         self.tabs.addTab(self.tec_sine_widget, "TEC Sine")
         self.tabs.addTab(self.tec_pid_widget, "TEC PID")
@@ -319,6 +350,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_scope_refresh = QtWidgets.QPushButton("Refresh VISA Resources")
         self.combo_scope_channel = QtWidgets.QComboBox()
         self.combo_scope_channel.addItems(["CH1", "CH2", "CH3", "CH4"])
+        self.scope_channels_group = QtWidgets.QGroupBox("Capture channels")
+        channel_layout = QtWidgets.QHBoxLayout(self.scope_channels_group)
+        self.scope_channel_checks = {}
+        for channel in ("CH1", "CH2", "CH3", "CH4"):
+            check = QtWidgets.QCheckBox(channel)
+            check.setChecked(channel == "CH1")
+            channel_layout.addWidget(check)
+            self.scope_channel_checks[channel] = check
+        self.combo_scope_channel.currentTextChanged.connect(self._update_capture_channels)
+        self._update_capture_channels()
         self.spin_scope_points = QtWidgets.QSpinBox()
         self.spin_scope_points.setRange(100, 10000000)
         self.spin_scope_points.setValue(10000000)
@@ -467,6 +508,7 @@ class MainWindow(QtWidgets.QMainWindow):
         form_data.addRow(QtWidgets.QLabel("Oscilloscope Input"))
         form_data.addRow("Resource", self.combo_scope_resource)
         form_data.addRow("Channel (optical)", self.combo_scope_channel)
+        form_data.addRow(self.scope_channels_group)
         form_data.addRow("Sample Points", self.spin_scope_points)
         form_data.addRow("Timeout", self.spin_scope_timeout_ms)
         form_data.addRow(self.group_scope_logging)
@@ -503,6 +545,68 @@ class MainWindow(QtWidgets.QMainWindow):
             "Zero disables the time-domain display filter. FFT and demodulation continue to use raw data."
         )
         form_time.addRow("Low-pass Cutoff", self.time_lowpass_input)
+        self.time_channels_group = QtWidgets.QGroupBox("Display captured channels")
+        self.time_channels_group.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        time_channel_outer = QtWidgets.QVBoxLayout(self.time_channels_group)
+        time_channel_outer.setContentsMargins(6, 2, 6, 2)
+        self._time_channel_scroll = QtWidgets.QScrollArea()
+        self._time_channel_scroll.setWidgetResizable(True)
+        self._time_channel_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self._time_channel_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._time_channel_scroll.setFixedHeight(45)
+        self._time_channel_row = QtWidgets.QWidget()
+        self._time_channel_layout = QtWidgets.QHBoxLayout(self._time_channel_row)
+        self._time_channel_layout.setContentsMargins(0, 0, 0, 0)
+        self._time_channel_scroll.setWidget(self._time_channel_row)
+        time_channel_outer.addWidget(self._time_channel_scroll)
+        self._time_channel_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.time_channel_checks = {}
+        for channel, color in zip(("CH1", "CH2", "CH3", "CH4"),
+                                  ("#2563eb", "#dc2626", "#15803d", "#9333ea")):
+            check = QtWidgets.QCheckBox(channel)
+            check.setChecked(True)
+            check.setStyleSheet(f"color: {color};")
+            check.toggled.connect(self._update_time_plot)
+            self.time_channel_checks[channel] = check
+            self._time_channel_layout.addWidget(check)
+        self.time_channels_group.hide()
+
+        self.time_math_group = QtWidgets.QGroupBox("Channel math")
+        self.time_math_group.setCheckable(True)
+        self.time_math_group.setChecked(False)
+        self.time_math_group.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        math_layout = QtWidgets.QVBoxLayout(self.time_math_group)
+        math_layout.setContentsMargins(6, 2, 6, 4)
+        math_row = QtWidgets.QHBoxLayout()
+        self.time_math_expression = QtWidgets.QLineEdit()
+        self.time_math_expression.setMaxLength(4096)
+        self.time_math_expression.setPlaceholderText("CH1 + CH2 / CH3   ;   CH1 / max(CH1)")
+        self.time_math_expression.setToolTip(
+            "Use +, -, *, /, **, parentheses, min(expression) and max(expression). "
+            "Normalize with S1/max(S1) or (S1-min(S1))/(max(S1)-min(S1)). "
+            "Min/max use finite samples in the selected common time range, after filtering and alignment; "
+            "zooming does not change them. Division/multiplication come before addition/subtraction. "
+            "Separate multiple expressions with semicolons (up to 8). "
+            "Calculations use the displayed low-pass filter and selected time range. "
+            "Channels with different timestamps are interpolated within their common time range."
+        )
+        self.btn_apply_time_math = QtWidgets.QPushButton("Apply")
+        math_row.addWidget(self.time_math_expression, 1)
+        math_row.addWidget(self.btn_apply_time_math)
+        math_layout.addLayout(math_row)
+        self._time_math_channels = QtWidgets.QLabel("Load data to see available channel names.")
+        self._time_math_channels.setWordWrap(True)
+        self._time_math_channels.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        self._time_math_channels.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        math_layout.addWidget(self._time_math_channels)
+        self._time_math_status = QtWidgets.QLabel()
+        self._time_math_status.setWordWrap(True)
+        self._time_math_status.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        self._time_math_status.hide()
+        math_layout.addWidget(self._time_math_status)
+        self.time_math_group.toggled.connect(self._update_time_plot)
+        self.time_math_expression.returnPressed.connect(self._update_time_plot)
+        self.btn_apply_time_math.clicked.connect(self._update_time_plot)
 
         self.group_fft = QtWidgets.QGroupBox("FFT Settings")
         form_fft = QtWidgets.QFormLayout(self.group_fft)
@@ -690,8 +794,8 @@ class MainWindow(QtWidgets.QMainWindow):
         processing_menu.addAction(self.action_auto_demod)
 
     def _configuration_busy(self):
-        return (self._scope_logging_active or self._scope_thread is not None or self._tec_shutdown_worker is not None
-                or self.sweep_widget.is_busy or self.tec_pid_widget.worker is not None
+        return (self._text_import_worker is not None or self._scope_logging_active or self._scope_thread is not None or self._tec_shutdown_worker is not None
+                or self.sweep_widget.is_busy or self.rf_capture_widget.is_busy or self.tec_pid_widget.worker is not None
                 or self.tec_sine_widget.worker is not None or self.tec_sine_widget.recording_worker is not None
                 or self.tec_sine_widget._shutdown_worker is not None or self.tec_sine_widget.meter_worker is not None
                 or self.tec_sine_widget._temperature_worker is not None
@@ -713,6 +817,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_tec_sweep_ui()
             self._update_scope_logging_ui()
             self.combo_scope_reference.setEnabled(self.check_scope_reference.isChecked())
+            self._update_capture_channels()
             for control in (self.edit_t4200_port, self.combo_t4200_channel, self.spin_t4200_float_offset):
                 control.setEnabled(self.check_ambient_temperature.isChecked())
             scope_available = (OscilloscopeImporter.pyvisa_available() and bool(self.combo_scope_resource.currentText())
@@ -736,6 +841,7 @@ class MainWindow(QtWidgets.QMainWindow):
             recordings.thd_harmonics.setEnabled(recordings.show_thd.isChecked())
             recordings._refresh_normalization()
             self.playback_widget._metadata_visibility()
+            self.rf_capture_widget._update_controls()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Configuration", f"Could not load configuration: {exc}")
             return False
@@ -791,6 +897,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sweep_widget.frequency_selected.connect(self._on_sweep_frequency_selected)
         self.sweep_widget.status_message.connect(self.statusBar().showMessage)
         self.sweep_widget.hardware_busy_changed.connect(self._on_sweep_hardware_busy_changed)
+        self.rf_capture_widget.hardware_busy_changed.connect(self._on_pid_hardware_busy_changed)
+        self.rf_capture_widget.use_time_inputs.connect(self._copy_rf_time_inputs)
         self.tec_pid_widget.hardware_busy_changed.connect(self._on_pid_hardware_busy_changed)
         self.tec_pid_widget.use_time_inputs.connect(self._copy_pid_time_inputs)
         self.tec_sine_widget.hardware_busy_changed.connect(self._on_pid_hardware_busy_changed)
@@ -824,6 +932,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.combo_scope_resource,
             self.btn_scope_refresh,
             self.combo_scope_channel,
+            self.scope_channels_group,
             self.spin_scope_points,
             self.spin_scope_timeout_ms,
             self.group_scope_logging,
@@ -873,6 +982,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_sweep_hardware_busy_changed(self, busy: bool):
         self.tec_pid_widget.set_external_hardware_busy(busy)
         self.tec_sine_widget.set_external_hardware_busy(busy)
+        self.rf_capture_widget.set_external_hardware_busy(busy)
         controls = self._scope_controls()
         if busy:
             self._scope_controls_before_sweep = [control.isEnabled() for control in controls]
@@ -897,6 +1007,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tec_pid_widget.points.setValue(self.spin_scope_points.value())
         self.tec_pid_widget.timeout.setValue(self.spin_scope_timeout_ms.value())
 
+    def _copy_rf_time_inputs(self):
+        self.rf_capture_widget.resource.setEditText(self.combo_scope_resource.currentText())
+        self.rf_capture_widget.timeout.setValue(self.spin_scope_timeout_ms.value())
+
     def _copy_sine_time_input(self):
         self.tec_sine_widget.resource.setEditText(self.combo_itc_resource.currentText())
         self.tec_sine_widget.scope_resource.setEditText(self.combo_scope_resource.currentText())
@@ -907,6 +1021,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_sidebar_visibility(self):
         current = self.tabs.currentWidget()
         self.sidebar_stack.setCurrentWidget(
+            self.rf_capture_widget.control_panel if current == self.rf_capture_widget else
             self.tec_sine_widget.control_panel if current == self.tec_sine_widget else
             self.tec_pid_widget.control_panel if current == self.tec_pid_widget else
             self.playback_widget.control_panel if current == self.playback_widget else
@@ -1125,6 +1240,8 @@ class MainWindow(QtWidgets.QMainWindow):
             point_count=int(self.spin_scope_points.value()),
             timeout_ms=int(self.spin_scope_timeout_ms.value()),
             reference_channel=reference,
+            additional_channels=tuple(channel for channel, check in self.scope_channel_checks.items()
+                                       if check.isChecked() and channel != self.combo_scope_channel.currentText()),
             itc4005_resource=itc_resource,
             t4200_port=ambient_port,
             t4200_channel=self.combo_t4200_channel.currentIndex() + 1,
@@ -1196,6 +1313,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sweep_widget.set_external_hardware_busy(True)
         self.tec_pid_widget.set_external_hardware_busy(True)
         self.tec_sine_widget.set_external_hardware_busy(True)
+        self.rf_capture_widget.set_external_hardware_busy(True)
         self.lbl_scope_logging_status.setText("Logging started; acquiring first capture...")
         self.statusBar().showMessage("Oscilloscope logging started.", 3000)
         self._start_next_scope_log_capture()
@@ -1292,6 +1410,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sweep_widget.set_external_hardware_busy(True)
         self.tec_pid_widget.set_external_hardware_busy(True)
         self.tec_sine_widget.set_external_hardware_busy(True)
+        self.rf_capture_widget.set_external_hardware_busy(True)
         if not is_logging:
             self.statusBar().showMessage("Oszilloskop-Akquise gestartet...", 3000)
         self._scope_thread.start()
@@ -1368,6 +1487,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sweep_widget.set_external_hardware_busy(False)
         self.tec_pid_widget.set_external_hardware_busy(False)
         self.tec_sine_widget.set_external_hardware_busy(False)
+        self.rf_capture_widget.set_external_hardware_busy(False)
         self.lbl_scope_logging_status.setText(message)
         self.statusBar().showMessage(message, 8000)
 
@@ -1451,6 +1571,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sweep_widget.set_external_hardware_busy(False)
             self.tec_pid_widget.set_external_hardware_busy(False)
             self.tec_sine_widget.set_external_hardware_busy(False)
+            self.rf_capture_widget.set_external_hardware_busy(False)
             return
 
         self._scope_capture_is_logging = False
@@ -1547,37 +1668,16 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Save Error", str(exc))
 
     def load_selected_file(self):
+        if self._text_import_worker is not None:
+            return
         file_path = self.path_edit.text().strip()
         if not file_path:
             return
         try:
             suffix = Path(file_path).suffix.lower()
-            if suffix in {".csv", ".txt"}:
-                preview = DataManager.preview_csv_or_txt(file_path)
-                dialog = FilePreviewDialog(preview, self)
-                if dialog.exec() != QtWidgets.QDialog.Accepted:
-                    return
-
-                self.data = DataManager.load_file(
-                    file_path,
-                    time_column=dialog.selected_time_column,
-                    amplitude_column=dialog.selected_amplitude_column,
-                )
-                self._sync_column_choices_from_data()
-                self.btn_save_loaded.setEnabled(True)
-            elif suffix in {".h5", ".hdf5"}:
-                preview = DataManager.preview_hdf5(file_path)
-                dialog = FilePreviewDialog(preview, self)
-                if dialog.exec() != QtWidgets.QDialog.Accepted:
-                    return
-
-                self.data = DataManager.load_file(
-                    file_path,
-                    time_dataset=dialog.selected_time_column,
-                    amplitude_dataset=dialog.selected_amplitude_column,
-                )
-                self._sync_column_choices_from_data()
-                self.btn_save_loaded.setEnabled(True)
+            if suffix in {".csv", ".txt", ".h5", ".hdf5"}:
+                self._start_text_import(file_path)
+                return
             else:
                 self.data = DataManager.load_file(file_path)
                 self._sync_column_choices_from_data()
@@ -1590,6 +1690,49 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_sidebar_visibility()
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Load Error", str(exc))
+
+    def _start_text_import(self, path, mapping=None):
+        worker = TextFileImportWorker(path, mapping, self)
+        self._text_import_worker = worker
+        self.btn_load.setEnabled(False)
+        self.btn_browse.setEnabled(False)
+        self.btn_load.setText("Reading file…")
+        self.statusBar().showMessage("Reading selected measurements…" if mapping is not None else "Inspecting file columns…")
+        worker.finished.connect(self._text_import_finished)
+        worker.start()
+
+    def _text_import_finished(self):
+        worker, self._text_import_worker = self._text_import_worker, None
+        self.btn_load.setEnabled(True)
+        self.btn_browse.setEnabled(True)
+        self.btn_load.setText("Load Selected File")
+        worker.deleteLater()
+        if worker.isInterruptionRequested():
+            self.statusBar().showMessage("File import cancelled.")
+            return
+        if worker.error:
+            QtWidgets.QMessageBox.critical(self, "Load Error", worker.error)
+            return
+        if worker.mapping is None:
+            dialog = FilePreviewDialog(worker.result, self)
+            if dialog.exec() == QtWidgets.QDialog.Accepted:
+                if Path(worker.path).suffix.lower() in {".h5", ".hdf5"}:
+                    mapping = dict(time_dataset=dialog.selected_time_column, amplitude_dataset=dialog.selected_amplitude_column,
+                                   additional_datasets=dialog.selected_additional_columns)
+                else:
+                    mapping = dict(time_column=dialog.selected_time_column, amplitude_column=dialog.selected_amplitude_column,
+                                   additional_columns=dialog.selected_additional_columns)
+                self._start_text_import(worker.path, mapping)
+            return
+        self.data = worker.result
+        self.path_edit.setText(worker.path)
+        self._sync_column_choices_from_data()
+        self.btn_save_loaded.setEnabled(True)
+        self._range_initialized = False
+        self.refresh_all_views()
+        self.tabs.setCurrentWidget(self.time_plot)
+        self._update_sidebar_visibility()
+        self.statusBar().showMessage(f"Loaded {len(self.data.channel_traces())} measurement(s) from {Path(worker.path).name}", 5000)
 
     def _sync_column_choices_from_data(self):
         self.combo_time_column.blockSignals(True)
@@ -1672,6 +1815,32 @@ class MainWindow(QtWidgets.QMainWindow):
         end_seconds = self.spin_end.value() * scale
         return Analysis.select_range(self.data, start_seconds, end_seconds)
 
+    def _update_capture_channels(self, *_):
+        primary = self.combo_scope_channel.currentText()
+        for channel, check in self.scope_channel_checks.items():
+            check.setEnabled(channel != primary)
+            if channel == primary:
+                check.setChecked(True)
+
+    def _update_time_channels(self):
+        available = self.data.channel_traces() if self.data is not None else {}
+        scope_channels = any(label in {"CH1", "CH2", "CH3", "CH4"} for label in available)
+        self.time_channels_group.setTitle("Display captured channels" if scope_channels else "Display measurements")
+        for label in available:
+            if label not in self.time_channel_checks:
+                check = QtWidgets.QCheckBox(label)
+                check.setChecked(True)
+                check.toggled.connect(self._update_time_plot)
+                self.time_channel_checks[label] = check
+                self._time_channel_layout.addWidget(check)
+        for label, check in self.time_channel_checks.items():
+            check.setEnabled(label in available)
+            check.setVisible((scope_channels and label in {"CH1", "CH2", "CH3", "CH4"}) or label in available)
+        self.time_channels_group.setVisible(len(available) > 1 or any(label.startswith("CH") for label in available))
+        aliases = channel_aliases(available)
+        names = ";  ".join(alias if alias == label else f"{alias} = {label}" for alias, label in aliases.items())
+        self._time_math_channels.setText(f"Available: {names}" if names else "Load data to see available channel names.")
+
     def _load_demo_data(self):
         fs = 1000.0
         t = np.arange(0, 5, 1 / fs)
@@ -1697,6 +1866,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage("Demo data loaded.", 3000)
 
     def refresh_all_views(self):
+        self._update_time_channels()
         if self.data is None:
             self.btn_save_loaded.setEnabled(False)
             self.time_plot.clear()
@@ -1708,10 +1878,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_time_unit_scale = scale
 
         if not self._range_initialized and self.data.n_samples > 0:
+            recorded = [trace for trace in self.data.channel_traces().values() if trace.n_samples]
             self.spin_start.blockSignals(True)
             self.spin_end.blockSignals(True)
-            self.spin_start.setValue(float(self.data.time[0]) / scale)
-            self.spin_end.setValue(float(self.data.time[-1]) / scale)
+            self.spin_start.setValue(min(float(trace.time[0]) for trace in recorded) / scale)
+            self.spin_end.setValue(max(float(trace.time[-1]) for trace in recorded) / scale)
             self.spin_start.blockSignals(False)
             self.spin_end.blockSignals(False)
             self._range_initialized = True
@@ -1747,24 +1918,75 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage("Views updated", 2500)
 
     def _update_time_plot(self):
-        if self.selected_data is None or self.selected_data.n_samples == 0:
+        self._time_math_status.hide()
+        if self.selected_data is None:
             self.time_plot.clear()
             return
 
         scale = self._time_unit_scale()
-        x = self.selected_data.time / scale
         cutoff_hz = self.time_lowpass_input.value_hz()
-        y = Analysis.lowpass_filter(self.selected_data, cutoff_hz=cutoff_hz)
+        sources = self.selected_data.channel_traces()
+        filtered = {}
 
-        self.time_plot.set_pen(pg.mkPen("b", width=1.2))
+        def filtered_trace(label):
+            if label not in filtered:
+                trace = sources[label]
+                filtered[label] = (trace.time / scale, Analysis.lowpass_filter(trace, cutoff_hz=cutoff_hz))
+            return filtered[label]
+
+        traces = {label: filtered_trace(label)
+                  for label, trace in sources.items()
+                  if trace.n_samples and self.time_channel_checks.get(label) is not None
+                  and self.time_channel_checks[label].isChecked()}
+
+        axis_labels = {}
+        for label, trace in self.selected_data.channel_traces().items():
+            unit = trace.metadata.get("amplitude_unit") or trace.metadata.get("units") or trace.metadata.get("unit")
+            axis_labels[label] = f"{label} ({unit})" if unit else label
+        if self.time_math_group.isChecked():
+            expressions = [expression.strip() for expression in self.time_math_expression.text().split(";")
+                           if expression.strip()]
+            messages = []
+            if not expressions:
+                messages.append("Enter an expression, for example CH1 + CH2 / CH3.")
+            elif len(expressions) > 8:
+                messages.append("Use at most 8 expressions, separated by semicolons.")
+            else:
+                aliases = channel_aliases(sources)
+                # Resolve operands lazily, so hidden/unreferenced channels need no filtering.
+                class MathInputs(dict):
+                    def __contains__(self, alias):
+                        return alias in aliases
+
+                    def __getitem__(self, alias):
+                        return filtered_trace(aliases[alias])
+
+                for expression in dict.fromkeys(expressions):
+                    try:
+                        time_values, values = evaluate_channel_math(expression, MathInputs())
+                        valid = np.isfinite(values)
+                        if not valid.any():
+                            raise ChannelMathError("No finite result; check for division by zero or invalid powers.")
+                        label = f"Math: {expression}"
+                        while label in traces:
+                            label = "Math: " + label
+                        traces[label] = (time_values, values)
+                        axis_labels[label] = label
+                        if not valid.all():
+                            messages.append(f"{expression}: {np.count_nonzero(~valid)} undefined samples shown as gaps.")
+                    except ChannelMathError as exc:
+                        messages.append(f"{expression}: {exc}")
+            if messages:
+                self._time_math_status.setText("\n".join(messages))
+                self._time_math_status.show()
         self.time_plot.set_axis_labels(
-            bottom="Time",
-            left=self.data.column_names[1] if self.data else "Amplitude",
+            bottom="Elapsed time" if self.data.metadata.get("source_time_format") == "ISO8601" else "Time",
+            left=axis_labels.get(next(iter(traces), ""), "Measurement value"),
             bottom_units=self._time_unit_label(),
         )
 
         # Adaptive plot: initial draw uses full data, zoom redraws use visible range
-        self.time_plot.set_data(x, y, auto_range=True)
+        self.time_plot.set_traces(traces, auto_range=True, axis_labels=axis_labels)
         if cutoff_hz > 0:
             self.time_plot.plot.setTitle(f"Time Domain (Low-pass: {cutoff_hz:g} Hz)")
         else:
@@ -2144,6 +2366,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_scope_resources()
 
     def closeEvent(self, event: QtGui.QCloseEvent):
+        if self._text_import_worker is not None:
+            self._text_import_worker.requestInterruption()
+            self.statusBar().showMessage("File import is stopping. Close again after it has stopped.")
+            event.ignore()
+            return
+        if not self.rf_capture_widget.shutdown():
+            self.statusBar().showMessage("RF acquisition is stopping. Close again after it has stopped.")
+            event.ignore()
+            return
         playback_stopped = self.playback_widget.shutdown()
         if self._tec_shutdown_worker is not None:
             self.statusBar().showMessage("Waiting for TEC output OFF verification before closing.")

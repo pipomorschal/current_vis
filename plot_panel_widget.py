@@ -44,6 +44,10 @@ class ZoomAdaptivePlotPanel(QtWidgets.QWidget):
         self._pen = pg.mkPen("b", width=1.2)
         self._curve = self.plot.plot([], [], pen=self._pen)
         self._additional_curves: list[pg.PlotDataItem] = []
+        self._additional_data: list[PlotDataStore] = []
+        self._metric_views: list[pg.ViewBox] = []
+        self._metric_axes: list[pg.AxisItem] = []
+        self._legend = None
         self._updating = False
         self._first_draw_done = False
 
@@ -60,6 +64,7 @@ class ZoomAdaptivePlotPanel(QtWidgets.QWidget):
 
         self.plot.getViewBox().sigXRangeChanged.connect(self._on_view_range_changed)
         self.plot.getViewBox().sigResized.connect(self._sync_right_view_geometry)
+        self.plot.getViewBox().sigResized.connect(self._sync_metric_views)
         layout.addWidget(self.plot)
 
     def _ensure_right_axis(self):
@@ -91,6 +96,7 @@ class ZoomAdaptivePlotPanel(QtWidgets.QWidget):
         self.plot.getAxis("right").setLabel("")
 
     def clear(self):
+        self._clear_additional_curves()
         self._full_data = None
         self._curve.setData([], [])
         for curve in self._additional_curves:
@@ -110,6 +116,7 @@ class ZoomAdaptivePlotPanel(QtWidgets.QWidget):
         self.plot.setLabel("left", left)
 
     def set_data(self, x: np.ndarray, y: np.ndarray, auto_range: bool = True):
+        self._clear_additional_curves()
         self._disable_right_axis()
         x = np.asarray(x, dtype=float)
         y = np.asarray(y, dtype=float)
@@ -118,42 +125,92 @@ class ZoomAdaptivePlotPanel(QtWidgets.QWidget):
         self._full_data = PlotDataStore(x=x, y=y)
         self.redraw(auto_range=auto_range, initial=True)
 
-    def set_multi_data(self, x: np.ndarray, data_dict: dict[str, np.ndarray], auto_range: bool = True):
-        self._disable_right_axis()
-        x = np.asarray(x, dtype=float)
-        
-        # Clear additional curves
-        for curve in self._additional_curves:
-            curve.setData([], [])
+    def _clear_additional_curves(self):
+        for index, curve in enumerate(self._additional_curves):
+            if self._metric_views:
+                self._metric_views[index].removeItem(curve)
+            else:
+                self.plot.removeItem(curve)
+        for axis, view in zip(self._metric_axes, self._metric_views):
+            axis.unlinkFromView()
+            self.plot.plotItem.layout.removeItem(axis)
+            self.plot.scene().removeItem(axis)
+            view.setXLink(None)
+            self.plot.scene().removeItem(view)
+        self._metric_axes.clear()
+        self._metric_views.clear()
+        self.plot.getAxis("left").setPen(pg.mkPen("k"))
+        self.plot.getAxis("left").setTextPen(pg.mkPen("k"))
+        self.plot.getAxis("left").setLabel(self._left_label, color="#000000")
         self._additional_curves.clear()
-        
-        # Use first dataset as primary (for zoom-adaptive logic)
-        first_key = next(iter(data_dict.keys())) if data_dict else None
-        if first_key is None:
-            self._full_data = None
-            self._curve.setData([], [])
+        self._additional_data.clear()
+        if self._legend is not None:
+            self._legend.clear()
+            self._legend.hide()
+
+    def set_multi_data(self, x: np.ndarray, data_dict: dict[str, np.ndarray], auto_range: bool = True):
+        self.set_traces({label: (x, y) for label, y in data_dict.items()}, auto_range=auto_range)
+
+    def _sync_metric_views(self):
+        main = self.plot.getViewBox()
+        for view in self._metric_views:
+            view.setGeometry(main.sceneBoundingRect())
+            view.linkedViewChanged(main, view.XAxis)
+
+    def set_traces(self, traces: dict[str, tuple[np.ndarray, np.ndarray]], auto_range: bool = True,
+                   *, axis_labels: dict[str, str] | None = None):
+        """Display traces with a shared time axis and optional independent y-axes."""
+        self._first_draw_done = False
+        self._disable_right_axis()
+        self._clear_additional_curves()
+        if not traces:
+            self.clear()
             return
-        
-        y_primary = np.asarray(data_dict[first_key], dtype=float)
-        x, y_primary = _nan_safe(x, y_primary)
-        self._full_data = PlotDataStore(x=x, y=y_primary)
-        
-        # Plot primary curve
+        if self._legend is None:
+            self._legend = self.plot.addLegend(labelTextColor="#222222")
+        self._legend.show()
+        colors = ["#2563eb", "#dc2626", "#15803d", "#9333ea", "#b45309"]
+        for index, (label, (x, y)) in enumerate(traces.items()):
+            x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+            # Retain missing/undefined values as line breaks (e.g. division by zero).
+            finite_time = np.isfinite(x)
+            x, y = x[finite_time], y[finite_time]
+            y = np.where(np.isfinite(y), y, np.nan)
+            data = PlotDataStore(x, y)
+            color_index = int(label[2:]) - 1 if label in {"CH1", "CH2", "CH3", "CH4"} else index
+            pen = pg.mkPen(colors[color_index % len(colors)], width=1.2)
+            if index == 0:
+                self._full_data = data
+                self._pen = pen
+                self._curve.setPen(pen)
+                curve = self._curve
+                if axis_labels is not None:
+                    self._left_label = axis_labels[label]
+                    self.plot.getAxis("left").setPen(pen)
+                    self.plot.getAxis("left").setTextPen(pen)
+                    self.plot.getAxis("left").setLabel(self._left_label, color=pen.color().name())
+            else:
+                if axis_labels is None:
+                    curve = self.plot.plot([], [], pen=pen)
+                else:
+                    view = pg.ViewBox()
+                    self.plot.scene().addItem(view)
+                    view.setXLink(self.plot.getViewBox())
+                    axis = pg.AxisItem("right")
+                    self.plot.plotItem.layout.addItem(axis, 2, 2 + index)
+                    axis.linkToView(view)
+                    axis.setPen(pen)
+                    axis.setTextPen(pen)
+                    axis.setLabel(axis_labels[label], color=pen.color().name())
+                    curve = pg.PlotDataItem([], [], pen=pen)
+                    view.addItem(curve)
+                    self._metric_views.append(view)
+                    self._metric_axes.append(axis)
+                self._additional_curves.append(curve)
+                self._additional_data.append(data)
+            self._legend.addItem(curve, label)
+        self._sync_metric_views()
         self.redraw(auto_range=auto_range, initial=True)
-        
-        # Add additional curves with different colors
-        colors = ["r", "g", "c", "m", "y", "orange", "purple", "brown"]
-        for idx, (label, y_data) in enumerate(data_dict.items()):
-            if label == first_key:
-                continue  # Already plotted as primary
-            
-            y_data = np.asarray(y_data, dtype=float)
-            x_safe, y_safe = _nan_safe(x, y_data)
-            
-            color = colors[(idx - 1) % len(colors)]
-            pen = pg.mkPen(color, width=1.2)
-            curve = self.plot.plot(x_safe, y_safe, pen=pen, name=label)
-            self._additional_curves.append(curve)
 
     def set_dual_axis_data(
         self,
@@ -167,9 +224,7 @@ class ZoomAdaptivePlotPanel(QtWidgets.QWidget):
         auto_range: bool = True,
     ):
         # Clears old multi-curves because this mode uses one left + one right curve.
-        for curve in self._additional_curves:
-            curve.setData([], [])
-        self._additional_curves.clear()
+        self._clear_additional_curves()
 
         self._ensure_right_axis()
         self._right_axis_active = True
@@ -232,6 +287,12 @@ class ZoomAdaptivePlotPanel(QtWidgets.QWidget):
             if xb.size == 0:
                 continue
 
+            if not np.isfinite(yb).all():
+                # Never bridge an undefined interval while reducing a large trace.
+                xs.append(xb[0])
+                ys.append(np.nan)
+                continue
+
             min_idx = int(np.argmin(yb))
             max_idx = int(np.argmax(yb))
             ordered = (min_idx, max_idx) if min_idx <= max_idx else (max_idx, min_idx)
@@ -267,8 +328,18 @@ class ZoomAdaptivePlotPanel(QtWidgets.QWidget):
 
         x, y = self._adaptive_reduce(x, y, self._target_points())
 
-        self._curve.setData(x, y)
+        self._curve.setData(x, y, connect="finite")
         self._curve.setPen(self._pen)
+
+        for curve, data in zip(self._additional_curves, self._additional_data):
+            extra_x, extra_y = data.x, data.y
+            window = self._visible_window() if not initial else None
+            if window is not None:
+                left = int(np.searchsorted(extra_x, window[0], side="left"))
+                right = int(np.searchsorted(extra_x, window[1], side="right"))
+                extra_x, extra_y = extra_x[left:right], extra_y[left:right]
+            extra_x, extra_y = self._adaptive_reduce(extra_x, extra_y, self._target_points())
+            curve.setData(extra_x, extra_y, connect="finite")
 
         self.plot.setLabel("bottom", self._bottom_label, units=self._bottom_units if self._bottom_units else None)
         self.plot.setLabel("left", self._left_label)
@@ -292,6 +363,18 @@ class ZoomAdaptivePlotPanel(QtWidgets.QWidget):
 
         if auto_range:
             self.plot.autoRange()
+            if self._metric_views:
+                # Overlay curves do not contribute to the main ViewBox's bounds.
+                times = [data.x for data in [self._full_data, *self._additional_data] if data.x.size]
+                if times:
+                    self.plot.setXRange(min(float(t.min()) for t in times),
+                                        max(float(t.max()) for t in times), padding=0.02)
+                self.plot.getViewBox().enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+                self.plot.getViewBox().updateAutoRange()
+                for view in self._metric_views:
+                    view.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+                    view.updateAutoRange()
+                self._sync_metric_views()
             if self._right_axis_active and self._right_view is not None:
                 self._right_view.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
                 self._right_view.autoRange()

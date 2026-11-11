@@ -202,29 +202,42 @@ class TektronixVisaClient:
     def connect(self, config: ScanConfig) -> None:
         self.connect_awg(config.awg_resource, config.timeout_ms)
         try:
-            self.scope = self.rm.open_resource(config.scope_resource)
-            timeout_ms = max(1000, int(config.timeout_ms))
-            self.scope.timeout = timeout_ms
-            try:
-                self.scope_idn = self.scope.query("*IDN?").strip()
-            except Exception:
-                self.scope_idn = config.scope_resource
-
-            # The MDO3024 exposes its RF trace through RF_NORMal/CURVE?.
-            self.scope.write("HEADer 0")
-            self.scope.write("VERBose 0")
-            self.scope.write("SELect:RF_NORMal 1")
-            self.scope.write("DATa:SOUrce RF_NORMal")
-            self.scope.write("DATa:ENCdg ASCii")
-            self.scope.write("DATa:WIDth 1")
-            self.scope.write("DATa:STARt 1")
-            self.scope.write("DATa:STOP 10000")
-            self.scope.write("WFMOutpre:ENCdg ASCii")
-            self.scope.write("WFMOutpre:BYT_Nr 4")
-            self._trace_unit = self._detect_trace_unit()
+            self._open_scope(config.scope_resource, config.timeout_ms)
         except Exception:
             self.disconnect()
             raise
+
+    def connect_scope(self, resource: str, timeout_ms: int = 10000) -> None:
+        """Open the RF scope alone, without opening or changing an AWG."""
+        self.disconnect()
+        try:
+            self.rm = _pyvisa_module().ResourceManager()
+            self._open_scope(resource, timeout_ms)
+        except Exception:
+            self.disconnect()
+            raise
+
+    def _open_scope(self, resource: str, timeout_ms: int) -> None:
+        self.scope = self.rm.open_resource(resource)
+        timeout_ms = max(1000, int(timeout_ms))
+        self.scope.timeout = timeout_ms
+        try:
+            self.scope_idn = self.scope.query("*IDN?").strip()
+        except Exception:
+            self.scope_idn = resource
+
+        # The MDO3024 exposes its RF trace through RF_NORMal/CURVE?.
+        self.scope.write("HEADer 0")
+        self.scope.write("VERBose 0")
+        self.scope.write("SELect:RF_NORMal 1")
+        self.scope.write("DATa:SOUrce RF_NORMal")
+        self.scope.write("DATa:ENCdg ASCii")
+        self.scope.write("DATa:WIDth 1")
+        self.scope.write("DATa:STARt 1")
+        self.scope.write("DATa:STOP 10000")
+        self.scope.write("WFMOutpre:ENCdg ASCii")
+        self.scope.write("WFMOutpre:BYT_Nr 4")
+        self._trace_unit = self._detect_trace_unit()
 
     def connect_awg(self, resource: str, timeout_ms: int = 10000) -> str:
         """Open only the AFG, leaving the oscilloscope free for other work."""

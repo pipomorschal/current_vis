@@ -64,6 +64,79 @@ the TEC channel (`OUTP2`), as documented in the
 
 ## Oszilloskopdaten in der GUI
 
+### Timestamped measurement CSV imports
+
+**Select File… → Load Selected File** also opens measurement logs with semicolon,
+comma or tab separators and ISO-8601 timestamps such as
+`2026-11-05T14:19:30.000000Z`. Numeric time columns and ordinary scope CSV files
+remain supported. UTF-8 BOMs and decimal commas in semicolon/tab files are handled.
+
+In **Import Preview**, keep the timestamp column as **Time column** and choose
+the main value in **Amplitude column**. Search and check optional **Additional
+measurements to plot**, for example RMS voltage, RMS current, temperature or a
+recorded THD column. The measurement names retain the export's exact labels;
+indexed suffixes are not assigned an assumed meaning. Empty columns show zero
+populated values and cannot be selected as additional measurements.
+
+Timestamped logs use elapsed seconds from the first valid source timestamp;
+the UTC origin is shown in the preview and retained in metadata. Each selected
+measurement keeps its own timestamps. Blank cells are omitted rather than
+filled with zeros or held/interpolated values; actual numeric zero is retained.
+The Time plot's **Display measurements** toggles show/hide the selected series.
+Each visible measurement or captured channel has its own color-matched, labelled
+y-axis and independent scale. All series share the same time axis and time zoom;
+units are included when present in the source metadata. This also applies to HDF5 imports.
+
+Enable **Channel math** in the Time tab, enter a formula such as
+`CH1 + CH2 / CH3`, then click **Apply** or press Enter. Supported operations are
+`+`, `-`, `*`, `/`, `**` (power), parentheses and numeric constants, with normal
+arithmetic precedence. `max(expression)` and `min(expression)` return the largest
+and smallest finite values, for example `S1/max(S1)` to normalize by the maximum,
+or `(S1-min(S1))/(max(S1)-min(S1))` to scale a varying signal from 0 to 1.
+`max(S1)` or `min(S1)` alone plots a horizontal line at that value.
+Separate up to eight formulas with semicolons to show
+multiple results, each on its own y-axis. The available channel names are listed
+below the input; measurement names containing spaces or punctuation receive
+aliases such as `S1` and `S2`.
+
+Math uses full-resolution samples in the selected time range, after the Time
+tab's optional low-pass filter. Hidden source channels can still be operands.
+When timestamps differ, other operands are linearly interpolated onto the first
+referenced channel's timestamps within their common time range; there is no
+extrapolation. Undefined samples, including division by zero, appear as gaps.
+Min/max use the full-resolution, filtered, aligned samples in the selected common
+time range, ignoring undefined values. Changing the Start/End range recalculates
+them; simply zooming the plot does not. A constant signal has no varying range and
+produces an undefined result for the min/max normalization formula.
+Formulas and the enabled state are included in saved GUI configurations.
+Math curves are display calculations; source recordings, FFT and demodulation
+continue to use the original channels.
+These values are the measurements already present in the file, including any
+THD columns; the importer does not reconstruct a raw waveform from them.
+
+Preview and loading run in the background. Wide files are streamed and only
+selected measurement arrays are retained. Saving imported measurements as
+HDF5 or CSV preserves the UTC origin and selected streams.
+
+### HDF5 measurement selection
+
+HDF5 (`.h5` / `.hdf5`) imports use the same searchable **Additional measurements
+to plot** checkboxes as CSV. Choose the main amplitude dataset, then check the
+other signals to display together. The list shows saved channel names and
+sample counts. Time arrays and nonnumeric metadata are excluded from the
+measurement list. A reference also stored among captured channels appears once.
+
+Saved scope/reference channels are initially checked to retain the existing
+multi-channel display. Uncheck any signals to omit them from this import.
+Changing the primary saved channel automatically selects its own time dataset.
+Additional signals use their individual stored time axes when available;
+otherwise they use the selected shared time dataset and must have a matching
+sample count. Selected signals can be toggled above the Time plot after loading.
+HDF5 preview/loading runs in the background and reads only the selected vectors.
+Ordinary single-signal and legacy matrix HDF5 imports remain supported.
+
+### Scope acquisition
+
 Im Bereich `Data` gibt es den Abschnitt `Oscilloscope Input`:
 
 1. `Refresh VISA Resources` klicken.
@@ -72,6 +145,26 @@ Im Bereich `Data` gibt es den Abschnitt `Oscilloscope Input`:
 4. `Acquire Oscilloscope` klicken.
 5. Die erfassten Daten werden direkt als aktive Datenquelle geladen und koennen wie eine Datei verarbeitet werden.
 6. Optional mit `Save Last Scope Capture` als HDF5 speichern.
+
+Unter **Capture channels** koennen CH1 bis CH4 gemeinsam ausgewaehlt werden.
+**Channel (optical)** bleibt der Hauptkanal fuer FFT, Demodulation und die
+Auswertung im Recordings-Tab. Der Hauptkanal ist immer enthalten. Die weiteren
+Kanaele muessen am Oszilloskop eingeschaltet sein; die Software liest sie aus
+demselben angehaltenen Datensatz und stellt den vorherigen Run/Stop-Zustand
+wieder her. Ein zusaetzlich ausgewaehlter Referenzkanal wird nur einmal gelesen.
+
+Oberhalb des Zeitplots unter **Display captured channels** lassen sich
+die aufgenommenen Kanaele einzeln ein- und ausblenden. Die Zeitkurven erscheinen
+gleichzeitig mit festen Kanalfarben und Legende. Zeitbereich, Zeiteinheit und
+Anzeige-Tiefpass gelten fuer alle sichtbaren Kanaele; jeder Kanal behaelt seine
+eigene Zeitachse und Abtastrate. Zoom reduziert alle Kurven fuer die Anzeige,
+waehrend die vollstaendigen Messwerte erhalten bleiben.
+
+Einzelaufnahmen und Logging speichern alle ausgewaehlten Kanaele gemeinsam in
+HDF5 oder CSV, einschliesslich ihrer Zeitachsen und Kalibrierinformationen.
+Beim erneuten Laden sind sie wieder zusammen darstellbar. Bereits vorhandene
+Aufnahmen mit Referenzkanal zeigen auch diesen im Time-Tab. Die Kanal- und
+Anzeigeauswahl wird mit der GUI-Konfiguration gespeichert.
 
 Fuer wiederholte Aufnahmen kann `Logging Mode` aktiviert werden. Dort werden
 das Intervall zwischen den Startzeitpunkten zweier Akquisen in Sekunden, die
@@ -84,6 +177,38 @@ die Serie sicher, nachdem eine bereits laufende Aufnahme gespeichert wurde.
 Im Tab `Demodulation` koennen Referenzfrequenz und Lock-in-Tiefpass direkt in
 `Hz`, `kHz`, `MHz` oder `GHz` eingegeben werden. Ein Wechsel des Praefixes
 erhaelt dabei den physikalischen Frequenzwert.
+
+## RF Capture
+
+The **RF Capture** tab beside Frequency Sweep acquires the complete oscilloscope
+RF Normal spectrum. It uses the same Tektronix MDO RF transfer as the sweep, with
+a scope-only connection. Select the RF input/trigger setup on the scope, choose
+its VISA resource (or **Use Time tab scope**), then **Capture RF spectrum**.
+Frequency is plotted in Hz with SI prefixes, and power in dBm. The readout shows
+capture time, center, span, RBW, point count and the largest spectral bin.
+
+**Use scope RF settings** is enabled by default. Uncheck it to set center/span
+in MHz and RBW in Hz from the tab. Captures run a new single sequence and wait
+for acquisition to stop before downloading the trace. **Acquisition wait** bounds
+the trigger wait; **VISA timeout** bounds individual queries. The scope frequency
+preamble supplies each bin's frequency; original trace values and units are also
+saved. See the [Tektronix programmer manual](https://download.tek.com/manual/MDO4000-B-C-MSO-DPO4000B-and-MDO3000-Oscilloscope-Programmer-Manual-077051007.pdf).
+
+Enable **Logging mode**, choose an existing output folder and HDF5/CSV, and press
+**Start RF logging**. Defaults are one spectrum every 10 s and a 60 min maximum;
+set the maximum to zero for **Until Stop**. Slow acquisitions skip missed slots.
+Every complete spectrum is saved as `rf_...h5/.csv` with frequency, dBm power,
+raw data, instrument settings and timestamps. A diagnostic `.log` records the
+session and any error. A failed acquisition/save stops the run; incomplete data
+is not published. Stop cancels active acquisition and allows an ongoing file
+save to finish. Scope I/O runs in a cancellable process, and other instrument
+modes are locked while RF capture/logging is active.
+
+Use **Save spectrum…** for a single acquisition and **Open RF spectrum…** to
+reopen a saved RF file in this tab. **Export plot PNG…** saves the application's
+spectrum plot; it is not a literal oscilloscope-screen image. RF data is separate
+from the time-waveform analysis in Recordings and Capture Playback. RF settings
+are included in the optional GUI configuration files.
 
 ## Modulationsfrequenz suchen
 

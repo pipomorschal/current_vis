@@ -8,30 +8,27 @@ from signal_data_class import SignalData
 class Analysis:
     @staticmethod
     def select_range(data: SignalData, start_time: float, end_time: float) -> SignalData:
-        if data.n_samples == 0:
-            return data
-
         lo = min(start_time, end_time)
         hi = max(start_time, end_time)
         mask = (data.time >= lo) & (data.time <= hi)
+        # Full-capture display needs no copies of four potentially huge records.
+        selected = slice(None) if np.all(mask) else mask
 
-        if not np.any(mask):
-            return SignalData(
-                time=np.array([], dtype=float),
-                amplitude=np.array([], dtype=float),
-                source_name=data.source_name,
-                sampling_rate=data.sampling_rate,
-                metadata=data.metadata.copy(),
-                column_names=data.column_names,
-            )
-
+        channels = {label: Analysis.select_range(trace, lo, hi) for label, trace in data.channels.items()}
+        reference = None
+        if data.reference is not None:
+            reference = next((channels[label] for label, trace in data.channels.items() if trace is data.reference), None)
+            if reference is None:
+                reference = Analysis.select_range(data.reference, lo, hi)
         return SignalData(
-            time=data.time[mask],
-            amplitude=data.amplitude[mask],
+            time=data.time[selected],
+            amplitude=data.amplitude[selected],
             source_name=data.source_name,
             sampling_rate=data.sampling_rate,
             metadata=data.metadata.copy(),
             column_names=data.column_names,
+            reference=reference,
+            channels=channels,
         )
 
     @staticmethod

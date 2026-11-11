@@ -13,6 +13,7 @@ import pyqtgraph as pg
 from data_manager_signal_loader import DataManager
 from recording_plot_widget import natural_key, recording_timestamp
 from tec_sine_trace import is_trace_path
+from rf_capture import is_rf_path
 
 
 CAPTURE_EXTENSIONS = {".h5", ".hdf5", ".csv", ".txt", ".wfm", ".npy", ".npz"}
@@ -73,7 +74,8 @@ class CaptureLoadWorker(QtCore.QThread):
                 for path in entries:
                     if self.isInterruptionRequested():
                         return
-                    if path.suffix.lower() in CAPTURE_EXTENSIONS and not is_trace_path(path) and path.is_file():
+                    if (path.suffix.lower() in CAPTURE_EXTENSIONS and not is_trace_path(path)
+                            and not is_rf_path(path) and path.is_file()):
                         paths.append(path)
                 self.result = sorted(paths, key=natural_key)
             else:

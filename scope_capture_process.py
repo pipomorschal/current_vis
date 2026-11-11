@@ -22,7 +22,7 @@ def capture_isolated(config, output_path=None, extra_metadata=None, cancelled=No
                      deadline_seconds=None):
     if not np.isfinite(config.tec_settle_seconds) or config.tec_settle_seconds < 0:
         raise ValueError("TEC settling time must be finite and non-negative")
-    channels = 2 if config.reference_channel else 1
+    channels = len(config.capture_channels())
     deadline_seconds = deadline_seconds if deadline_seconds is not None else (
         max(120, config.timeout_ms / 1000 * 12 * channels + 10 * bool(config.itc4005_resource)
             + 3 * bool(config.t4200_port)) + config.tec_settle_seconds
@@ -82,6 +82,13 @@ def capture_isolated(config, output_path=None, extra_metadata=None, cancelled=No
                                        amplitude=np.load(root / "reference_amplitude.npy"),
                                        source_name=ref["source_name"], sampling_rate=ref["sampling_rate"],
                                        metadata=ref["metadata"], column_names=tuple(ref["column_names"]))
+        for index, item in enumerate(info.get("channels", [])):
+            label = item.pop("label")
+            data.channels[label] = SignalData(time=np.load(root / f"channel_{index}_time.npy"),
+                                              amplitude=np.load(root / f"channel_{index}_amplitude.npy"),
+                                              **{**item, "column_names": tuple(item["column_names"])})
+            if label == data.metadata.get("reference_channel"):
+                data.reference = data.channels[label]
         return data
 
 
@@ -123,6 +130,13 @@ def run_capture(root):
             np.save(root / "reference_amplitude.npy", ref.amplitude)
             info["reference"] = {"source_name": ref.source_name, "sampling_rate": ref.sampling_rate,
                                  "metadata": ref.metadata, "column_names": ref.column_names}
+        info["channels"] = []
+        for index, (label, channel) in enumerate(data.channels.items()):
+            np.save(root / f"channel_{index}_time.npy", channel.time)
+            np.save(root / f"channel_{index}_amplitude.npy", channel.amplitude)
+            info["channels"].append(dict(label=label, source_name=channel.source_name,
+                                         sampling_rate=channel.sampling_rate, metadata=channel.metadata,
+                                         column_names=channel.column_names))
         (root / "result.json").write_text(json.dumps(info), encoding="utf-8")
         return 0
     except Exception as exc:
