@@ -363,6 +363,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_scope_points = QtWidgets.QSpinBox()
         self.spin_scope_points.setRange(100, 10000000)
         self.spin_scope_points.setValue(10000000)
+        self.spin_scope_points.setToolTip(
+            "Maximum samples to transfer from the current scope record. "
+            "This does not change the scope sample rate, timebase or record length."
+        )
         self.spin_scope_timeout_ms = QtWidgets.QSpinBox()
         self.spin_scope_timeout_ms.setRange(1000, 120000)
         self.spin_scope_timeout_ms.setValue(5000)
@@ -521,7 +525,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_start = QtWidgets.QDoubleSpinBox()
         self.spin_end = QtWidgets.QDoubleSpinBox()
         for s in (self.spin_start, self.spin_end):
-            s.setDecimals(6)
+            s.setDecimals(12)
             s.setRange(-1e12, 1e12)
             s.setSingleStep(0.1)
 
@@ -530,6 +534,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_time_unit.setCurrentText("s")
 
         self.btn_apply_range = QtWidgets.QPushButton("Apply Range")
+        self.check_time_auto_range = QtWidgets.QCheckBox("Use full capture range")
+        self.check_time_auto_range.setChecked(True)
+        self.check_time_auto_range.setToolTip(
+            "Follow the full time range of each new capture. Editing Start or End "
+            "switches this off and preserves your range for subsequent captures."
+        )
+        form_range.addRow(self.check_time_auto_range)
         form_range.addRow("Start", self.spin_start)
         form_range.addRow("End", self.spin_end)
         form_range.addRow("Unit", self.combo_time_unit)
@@ -871,6 +882,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.group_scope_logging.toggled.connect(self._update_scope_logging_ui)
         self._scope_log_timer.timeout.connect(self._start_next_scope_log_capture)
         self.btn_apply_range.clicked.connect(self.refresh_all_views)
+        self.spin_start.valueChanged.connect(self._on_time_range_edited)
+        self.spin_end.valueChanged.connect(self._on_time_range_edited)
+        self.check_time_auto_range.toggled.connect(self._on_time_auto_range_changed)
         self.spin_time_lowpass_cutoff.valueChanged.connect(self._on_time_lowpass_changed)
         self.combo_time_lowpass_unit.currentTextChanged.connect(self._on_time_lowpass_changed)
 
@@ -1806,6 +1820,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._convert_time_range_to_unit(old_scale, new_scale)
         self.refresh_all_views()
 
+    def _on_time_range_edited(self, *_):
+        # Auto-fill and unit conversions block spinbox signals. A user edit
+        # explicitly opts out of replacing Start/End on the next capture.
+        blocker = QtCore.QSignalBlocker(self.check_time_auto_range)
+        self.check_time_auto_range.setChecked(False)
+        del blocker
+
+    def _on_time_auto_range_changed(self, enabled):
+        if enabled:
+            self._range_initialized = False
+            self.refresh_all_views()
+
     def _selected_data(self) -> SignalData | None:
         if self.data is None:
             return None
@@ -1877,7 +1903,7 @@ class MainWindow(QtWidgets.QMainWindow):
         scale = self._time_unit_scale()
         self._current_time_unit_scale = scale
 
-        if not self._range_initialized and self.data.n_samples > 0:
+        if not self._range_initialized and self.check_time_auto_range.isChecked() and self.data.n_samples > 0:
             recorded = [trace for trace in self.data.channel_traces().values() if trace.n_samples]
             self.spin_start.blockSignals(True)
             self.spin_end.blockSignals(True)
@@ -1897,8 +1923,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_info.setText(
             f"Source: {self.data.source_name}\n"
             f"Samples: {self.data.n_samples}\n"
-            f"Sampling rate: {self.data.sampling_rate:.3f} Hz\n"
-            f"Duration: {self.data.duration:.3f} s\n"
+            f"Sampling rate: {self.data.sampling_rate:.9g} Hz\n"
+            f"Duration: {self.data.duration:.9g} s\n"
+            + (f"Captured time: {self.data.time[0]:.9g} to {self.data.time[-1]:.9g} s\n" if self.data.n_samples else "")
             + (f"\n\nMetadata:\n{meta_lines}" if meta_lines else "")
         )
 

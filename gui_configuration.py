@@ -141,6 +141,11 @@ def load_configuration(window, path):
                     value._unit_factor = value.UNIT_FACTORS[value.unit_combo.currentText()]
         sine._frequency_factor = sine.FREQUENCY_UNITS[sine.frequency_unit.currentText()]
         sine.frequency.setMinimum(1e-9 / sine._frequency_factor)
+        # Older configurations already contain Start/End but no auto-range flag.
+        # Preserve a nonempty saved range instead of replacing it on first capture.
+        if ("time.check_time_auto_range" not in payload["settings"]
+                and any(key in payload["settings"] for key in ("time.spin_start", "time.spin_end"))):
+            window.check_time_auto_range.setChecked(window.spin_start.value() == window.spin_end.value())
     finally:
         blockers.clear()
     return len(changes)

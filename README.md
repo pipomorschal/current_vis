@@ -146,6 +146,26 @@ Im Bereich `Data` gibt es den Abschnitt `Oscilloscope Input`:
 5. Die erfassten Daten werden direkt als aktive Datenquelle geladen und koennen wie eine Datei verarbeitet werden.
 6. Optional mit `Save Last Scope Capture` als HDF5 speichern.
 
+`Sample Points` begrenzt nur die Anzahl uebertragener Messwerte. Abtastrate,
+Zeitbasis und Record Length werden am Oszilloskop eingestellt und durch den
+Transfer nicht geaendert. Die Zeitachse stammt aus `WFMOutpre:XINCR?` und
+`WFMOutpre:XZERO?` der tatsaechlich uebertragenen, angehaltenen Waveform;
+die empfangene Punktzahl wird gegen `WFMOutpre:NR_PT?` geprueft.
+Auch bei einem einzelnen Kanal wird der vorherige Run/Stop-Zustand danach
+wiederhergestellt. Bei Envelope-Daten erscheint eine Fehlermeldung, da deren
+Min/Max-Paare keine einfache Folge gleichmaessiger Y-Messpunkte sind.
+Die Kalibrierbefehle folgen dem
+[Tektronix-Programmierhandbuch](https://download.tek.com/manual/MDO4000-B-C-MSO-DPO4000B-and-MDO3000-Oscilloscope-Programmer-Manual-077051007.pdf).
+
+Unter `Time Range` folgt `Use full capture range` dem gesamten uebertragenen
+Datensatz. Sobald Start oder End manuell geaendert wird, schaltet sich diese
+Automatik aus: Der eingegebene Ausschnitt bleibt auch nach weiteren Captures
+und beim Logging erhalten. Das erneute Aktivieren zeigt wieder den vollen
+Bereich. Diese Auswahl wird mit der Konfiguration gespeichert; auch Zeitbereiche
+aus aelteren Konfigurationen bleiben erhalten. Start/End sind reine Anzeige-
+und Analysegrenzen und aendern weder die Scope-Aufnahme noch die gespeicherten
+Rohdaten. Die Bereichseingabe unterstuetzt auch Nanosekunden-Zeitfenster.
+
 Unter **Capture channels** koennen CH1 bis CH4 gemeinsam ausgewaehlt werden.
 **Channel (optical)** bleibt der Hauptkanal fuer FFT, Demodulation und die
 Auswertung im Recordings-Tab. Der Hauptkanal ist immer enthalten. Die weiteren

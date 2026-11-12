@@ -101,7 +101,7 @@ class OscilloscopeImporter:
 	@classmethod
 	def capture_channel(cls, config: ScopeCaptureConfig) -> SignalData:
 		cls._ensure_pyvisa()
-		channels = config.capture_channels()
+		config.capture_channels()
 
 		rm = None
 		inst = None
@@ -116,18 +116,16 @@ class OscilloscopeImporter:
 				stage = "waiting for a fresh triggered waveform"
 				return cls._capture_triggered(inst, config)
 
-			if len(channels) > 1:
-				stage = "freezing the multi-channel waveform record"
-				was_running = bool(cls._query_float(inst, "ACQUIRE:STATE?"))
-				try:
-					inst.write("ACQUIRE:STATE STOP")
-					data = cls._read_channels(inst, config)
-				finally:
-					if was_running:
-						inst.write("ACQUIRE:STATE RUN")
-				return data
-			stage = "reading waveform"
-			return cls._read_channels(inst, config)
+			# Calibration and CURVe must describe the same stopped record, even
+			# for a single channel while the scope is continuously acquiring.
+			stage = "freezing the waveform record"
+			was_running = bool(cls._query_float(inst, "ACQUIRE:STATE?"))
+			try:
+				inst.write("ACQUIRE:STATE STOP")
+				return cls._read_channels(inst, config)
+			finally:
+				if was_running:
+					inst.write("ACQUIRE:STATE RUN")
 
 		except MemoryError:
 			raise
@@ -202,18 +200,30 @@ class OscilloscopeImporter:
 		points = int(max(100, config.point_count))
 
 		inst.write(f"DATA:SOURCE {channel}")
+		inst.write("DATA:ENC RPB")
 		inst.write("DATA:WIDTH 2")
 		inst.write("DATA:START 1")
 		inst.write(f"DATA:STOP {points}")
-		inst.write("DATA:ENC RPB")
 
 		stage = "reading waveform calibration"
 		logging.getLogger("scope_recording").info(stage)
-		xincr = cls._query_float(inst, "WFMPRE:XINCR?", fallback=1.0)
-		ymult = cls._query_float(inst, "WFMPRE:YMULT?", fallback=1.0)
-		yzero = cls._query_float(inst, "WFMPRE:YZERO?", fallback=0.0)
-		yoff = cls._query_float(inst, "WFMPRE:YOFF?", fallback=0.0)
-		xzero = cls._query_float(inst, "WFMPRE:XZERO?", fallback=0.0)
+		# On MDO scopes WFMOutpre describes CURVe?; WFMInpre describes
+		# uploaded reference data. Never use unrelated/stale reference scaling.
+		xunit = cls._parse_query_response(inst.query("WFMOutpre:XUNIT?")).strip('"').lower()
+		point_format = cls._parse_query_response(inst.query("WFMOutpre:PT_FMT?")).upper()
+		if xunit != "s":
+			raise ValueError(f"Expected a time-domain waveform in seconds; received {xunit!r}")
+		if point_format != "Y":
+			raise ValueError(f"Unsupported waveform point format {point_format!r}; select Sample, HiRes or Average, not Envelope")
+		count = cls._query_float(inst, "WFMOutpre:NR_PT?")
+		if count < 1 or count != int(count) or count > points:
+			raise ValueError(f"Invalid waveform transfer length: {count}; requested at most {points}")
+		xincr = cls._query_float(inst, "WFMOutpre:XINCR?")
+		ymult = cls._query_float(inst, "WFMOutpre:YMULT?")
+		yzero = cls._query_float(inst, "WFMOutpre:YZERO?")
+		yoff = cls._query_float(inst, "WFMOutpre:YOFF?")
+		xzero = cls._query_float(inst, "WFMOutpre:XZERO?")
+		pt_off = cls._query_float(inst, "WFMOutpre:PT_OFF?")
 		if xincr <= 0 or ymult == 0:
 			raise ValueError("Invalid waveform sample interval or voltage scale")
 
@@ -228,22 +238,31 @@ class OscilloscopeImporter:
 		raw = np.asarray(raw, dtype=float)
 		if raw.size == 0 or not np.all(np.isfinite(raw)):
 			raise ValueError("Empty or non-finite waveform received")
+		if raw.ndim != 1 or raw.size != int(count):
+			raise ValueError(f"Incomplete waveform: received {raw.size} samples, expected {int(count)}")
 		volts = (raw - yoff) * ymult + yzero
-		time = xzero + np.arange(volts.size, dtype=float) * xincr
+		time = xzero + (np.arange(volts.size, dtype=float) - pt_off) * xincr
 
 		metadata = {
 			"source": "oscilloscope",
 			"amplitude_unit": "V",
 			"resource": config.resource_name,
 			"channel": channel,
-			"point_count": str(points),
+			"point_count": str(raw.size),
+			"requested_point_count": str(points),
+			"waveform_preamble": "WFMOutpre",
 			"Sample Interval": str(xincr),
+			"XZERO": str(xzero),
+			"PT_OFF": str(pt_off),
 			"YMULT": str(ymult),
 			"YZERO": str(yzero),
 			"YOFF": str(yoff),
 		}
 
 		fs = 1.0 / xincr if xincr > 0 else 1.0
+		logging.getLogger("scope_recording").info(
+			"Captured %s: %d samples (limit %d), interval %.12g s, rate %.12g Hz, time %.12g to %.12g s",
+			channel, raw.size, points, xincr, fs, time[0], time[-1])
 		return SignalData(
 			time=time,
 			amplitude=volts,
