@@ -146,10 +146,27 @@ Im Bereich `Data` gibt es den Abschnitt `Oscilloscope Input`:
 5. Die erfassten Daten werden direkt als aktive Datenquelle geladen und koennen wie eine Datei verarbeitet werden.
 6. Optional mit `Save Last Scope Capture` als HDF5 speichern.
 
+**Capture displayed scope window** ist im Time-Tab standardmaessig aktiviert.
+Der Capture uebernimmt den am Oszilloskop sichtbaren Zeitbereich: Hauptzeitbasis
+mit Position/Delay, oder bei aktivem Wave-Inspector-Zoom das untere Zoomfenster.
+Aus dem angehaltenen Record werden nur die entsprechenden Original-Samples
+uebertragen, angezeigt und gespeichert. Die Abtastrate bleibt unveraendert;
+es findet keine Interpolation oder Reduktion der gespeicherten Messwerte statt.
+Alle ausgewaehlten Kanaele verwenden denselben ausgelesenen Fensterbereich.
+Ein bereits gestopptes Single-Shot-Signal wird dabei nicht neu getriggert.
+
+Wenn das Fenster mehr Samples als `Sample Points` enthaelt, fordert die GUI
+einen hoeheren Wert an, statt unbemerkt das Fenster abzukuerzen oder die
+Abtastrate zu verringern. Deaktivieren der Option liest wie bisher den Record
+ab dem ersten Sample bis zur eingestellten Punktgrenze. Diese Auswahl wird in
+der GUI-Konfiguration gespeichert. Fensterquelle, angeforderte Zeitgrenzen,
+Record-Laenge und tatsaechliche Transfer-Indizes stehen in den Capture-Metadaten.
+Alte Aufnahmen ohne diese Fenster-Metadaten werden unveraendert geladen.
+
 `Sample Points` begrenzt nur die Anzahl uebertragener Messwerte. Abtastrate,
 Zeitbasis und Record Length werden am Oszilloskop eingestellt und durch den
 Transfer nicht geaendert. Die Zeitachse stammt aus `WFMOutpre:XINCR?` und
-`WFMOutpre:XZERO?` der tatsaechlich uebertragenen, angehaltenen Waveform;
+`WFMOutpre:XZERO?` des angehaltenen Records und den ausgewaehlten Sample-Indizes;
 die empfangene Punktzahl wird gegen `WFMOutpre:NR_PT?` geprueft.
 Auch bei einem einzelnen Kanal wird der vorherige Run/Stop-Zustand danach
 wiederhergestellt. Bei Envelope-Daten erscheint eine Fehlermeldung, da deren

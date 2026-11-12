@@ -364,8 +364,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_scope_points.setRange(100, 10000000)
         self.spin_scope_points.setValue(10000000)
         self.spin_scope_points.setToolTip(
-            "Maximum samples to transfer from the current scope record. "
+            "Maximum samples to transfer. Matching the scope window requires enough points "
+            "for that entire window; it is never silently truncated or resampled. "
             "This does not change the scope sample rate, timebase or record length."
+        )
+        self.check_scope_display_window = QtWidgets.QCheckBox("Capture displayed scope window")
+        self.check_scope_display_window.setChecked(True)
+        self.check_scope_display_window.setToolTip(
+            "Capture the time interval displayed on the oscilloscope, including an active zoom window. "
+            "Uses the original samples and sample interval. Uncheck to transfer the acquisition record "
+            "from its beginning, up to Sample Points."
         )
         self.spin_scope_timeout_ms = QtWidgets.QSpinBox()
         self.spin_scope_timeout_ms.setRange(1000, 120000)
@@ -513,6 +521,7 @@ class MainWindow(QtWidgets.QMainWindow):
         form_data.addRow("Resource", self.combo_scope_resource)
         form_data.addRow("Channel (optical)", self.combo_scope_channel)
         form_data.addRow(self.scope_channels_group)
+        form_data.addRow(self.check_scope_display_window)
         form_data.addRow("Sample Points", self.spin_scope_points)
         form_data.addRow("Timeout", self.spin_scope_timeout_ms)
         form_data.addRow(self.group_scope_logging)
@@ -948,6 +957,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.combo_scope_channel,
             self.scope_channels_group,
             self.spin_scope_points,
+            self.check_scope_display_window,
             self.spin_scope_timeout_ms,
             self.group_scope_logging,
             self.btn_scope_acquire,
@@ -1252,6 +1262,7 @@ class MainWindow(QtWidgets.QMainWindow):
             resource_name=resource,
             channel=self.combo_scope_channel.currentText().strip(),
             point_count=int(self.spin_scope_points.value()),
+            match_scope_display=self.check_scope_display_window.isChecked(),
             timeout_ms=int(self.spin_scope_timeout_ms.value()),
             reference_channel=reference,
             additional_channels=tuple(channel for channel, check in self.scope_channel_checks.items()

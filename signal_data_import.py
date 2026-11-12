@@ -32,6 +32,7 @@ class ScopeCaptureConfig:
 	trigger_wait_seconds: float = 30.0
 	auto_tec_output: bool = False
 	additional_channels: tuple[str, ...] = ()
+	match_scope_display: bool = False
 
 	def capture_channels(self):
 		primary = self.channel.strip().upper()
@@ -88,6 +89,53 @@ class OscilloscopeImporter:
 			return value
 		except Exception as exc:
 			raise ScopeCommunicationError(f"Calibration query {command} failed: {exc}") from exc
+
+	@classmethod
+	def _query_switch(cls, inst, command):
+		value = cls._parse_query_response(inst.query(command)).upper()
+		if value in {"1", "ON"}:
+			return True
+		if value in {"0", "OFF"}:
+			return False
+		raise ScopeCommunicationError(f"Unexpected {command} response: {value!r}")
+
+	@classmethod
+	def _display_window(cls, inst):
+		"""Read the MDO's ten-division main or Wave Inspector zoom time window."""
+		zoom = cls._query_switch(inst, "ZOOM:MODE?")
+		if zoom and cls._query_switch(inst, "ZOOM:ZOOM1:STATE?"):
+			scale = cls._query_float(inst, "ZOOM:ZOOM1:SCALE?")
+			center = cls._query_float(inst, "ZOOM:ZOOM1:TRIGPOS?")
+			metadata = {"scope_window_source": "zoom", "scope_zoom_center_s": str(center)}
+		else:
+			scale = cls._query_float(inst, "HORIZONTAL:SCALE?")
+			delay = cls._query_switch(inst, "HORIZONTAL:DELAY:MODE?")
+			metadata = {"scope_window_source": "main", "scope_delay_mode": str(delay)}
+			if delay:
+				center = cls._query_float(inst, "HORIZONTAL:DELAY:TIME?")
+				metadata["scope_horizontal_delay_s"] = str(center)
+			else:
+				position = cls._query_float(inst, "HORIZONTAL:POSITION?")
+				center = (0.5 - position / 100.0) * 10 * scale
+				metadata["scope_horizontal_position_percent"] = str(position)
+		start, end = center - 5 * scale, center + 5 * scale
+		if scale <= 0 or not np.isfinite([start, end]).all() or end <= start:
+			raise ScopeCommunicationError("Invalid oscilloscope display time window")
+		metadata.update(scope_seconds_per_division=str(scale),
+		                scope_window_start_s=str(start), scope_window_end_s=str(end))
+		return start, end, metadata
+
+	@staticmethod
+	def _window_indices(start, end, first_time, interval, count):
+		"""Select original samples in [start, end), without changing their spacing."""
+		bounds = (np.asarray([start, end]) - first_time) / interval
+		# Absorb only floating-point roundoff at exact sample boundaries.
+		tolerance = 8 * np.finfo(float).eps * np.maximum(1, np.abs(bounds))
+		first, stop = (max(0, min(count, int(np.ceil(value - tol))))
+		               for value, tol in zip(bounds, tolerance))
+		if stop <= first:
+			raise ScopeCommunicationError("The displayed scope window contains no samples from the captured record")
+		return first, stop
 
 	@classmethod
 	def list_resources(cls) -> tuple[str, ...]:
@@ -182,7 +230,13 @@ class OscilloscopeImporter:
 	@classmethod
 	def _read_channels(cls, inst, config):
 		channels = config.capture_channels()
-		traces = {channel: cls._read_channel(inst, config, channel) for channel in channels}
+		if config.match_scope_display:
+			# Read display geometry once for all channels in this stopped acquisition.
+			inst.write(f"DATA:SOURCE {channels[0]}")
+			window = cls._display_window(inst)
+			traces = {channel: cls._read_channel(inst, config, channel, window=window) for channel in channels}
+		else:
+			traces = {channel: cls._read_channel(inst, config, channel) for channel in channels}
 		data = traces[channels[0]]
 		data.channels = {channel: traces[channel] for channel in channels[1:]
 		                 if channel in {c.strip().upper() for c in config.additional_channels}}
@@ -195,7 +249,7 @@ class OscilloscopeImporter:
 		return data
 
 	@classmethod
-	def _read_channel(cls, inst, config, channel):
+	def _read_channel(cls, inst, config, channel, *, window=None):
 		channel = channel.strip().upper()
 		points = int(max(100, config.point_count))
 
@@ -203,7 +257,13 @@ class OscilloscopeImporter:
 		inst.write("DATA:ENC RPB")
 		inst.write("DATA:WIDTH 2")
 		inst.write("DATA:START 1")
-		inst.write(f"DATA:STOP {points}")
+		transfer_limit = points
+		if window is not None:
+			record_length = cls._query_float(inst, "HORIZONTAL:RECORDLENGTH?")
+			if record_length < 1 or record_length != int(record_length):
+				raise ValueError(f"Invalid oscilloscope record length: {record_length}")
+			transfer_limit = int(record_length)
+		inst.write(f"DATA:STOP {transfer_limit}")
 
 		stage = "reading waveform calibration"
 		logging.getLogger("scope_recording").info(stage)
@@ -216,8 +276,8 @@ class OscilloscopeImporter:
 		if point_format != "Y":
 			raise ValueError(f"Unsupported waveform point format {point_format!r}; select Sample, HiRes or Average, not Envelope")
 		count = cls._query_float(inst, "WFMOutpre:NR_PT?")
-		if count < 1 or count != int(count) or count > points:
-			raise ValueError(f"Invalid waveform transfer length: {count}; requested at most {points}")
+		if count < 1 or count != int(count) or count > transfer_limit:
+			raise ValueError(f"Invalid waveform transfer length: {count}; requested at most {transfer_limit}")
 		xincr = cls._query_float(inst, "WFMOutpre:XINCR?")
 		ymult = cls._query_float(inst, "WFMOutpre:YMULT?")
 		yzero = cls._query_float(inst, "WFMOutpre:YZERO?")
@@ -226,6 +286,29 @@ class OscilloscopeImporter:
 		pt_off = cls._query_float(inst, "WFMOutpre:PT_OFF?")
 		if xincr <= 0 or ymult == 0:
 			raise ValueError("Invalid waveform sample interval or voltage scale")
+		first_sample_time = xzero - pt_off * xincr
+		first, stop = 0, int(count)
+		window_metadata = {"capture_window": "record"}
+		if window is not None:
+			start, end, settings = window
+			first, stop = cls._window_indices(start, end, first_sample_time, xincr, int(count))
+			if stop - first > points:
+				raise ValueError(f"The displayed scope window requires {stop - first} samples; "
+				                 f"increase Sample Points from {points} to at least {stop - first}. "
+				                 "The window will not be truncated or resampled.")
+			window_metadata = {**settings, "capture_window": "scope_display", "record_point_count": str(int(count)),
+			                   "record_first_sample_time_s": str(first_sample_time)}
+			inst.write(f"DATA:START {first + 1}")
+			inst.write(f"DATA:STOP {stop}")
+			# Verify that the scope honored the requested subrange before reading.
+			actual_start = cls._query_float(inst, "DATA:START?")
+			actual_stop = cls._query_float(inst, "DATA:STOP?")
+			actual_count = cls._query_float(inst, "WFMOutpre:NR_PT?")
+			if (actual_start, actual_stop, actual_count) != (first + 1, stop, stop - first):
+				raise ValueError("Oscilloscope did not honor the displayed-window transfer range")
+			if not np.isclose(cls._query_float(inst, "WFMOutpre:XINCR?"), xincr, rtol=1e-12, atol=0):
+				raise ValueError("Oscilloscope sample interval changed during the window transfer")
+			count = actual_count
 
 		stage = "reading CURVe binary waveform"
 		logging.getLogger("scope_recording").info(stage)
@@ -241,7 +324,9 @@ class OscilloscopeImporter:
 		if raw.ndim != 1 or raw.size != int(count):
 			raise ValueError(f"Incomplete waveform: received {raw.size} samples, expected {int(count)}")
 		volts = (raw - yoff) * ymult + yzero
-		time = xzero + (np.arange(volts.size, dtype=float) - pt_off) * xincr
+		# Use the full-record origin plus the selected record indices. This does
+		# not depend on whether a firmware adjusts XZERO after DATA:START changes.
+		time = first_sample_time + (first + np.arange(volts.size, dtype=float)) * xincr
 
 		metadata = {
 			"source": "oscilloscope",
@@ -257,6 +342,9 @@ class OscilloscopeImporter:
 			"YMULT": str(ymult),
 			"YZERO": str(yzero),
 			"YOFF": str(yoff),
+			"data_start": str(first + 1),
+			"data_stop": str(stop),
+			**window_metadata,
 		}
 
 		fs = 1.0 / xincr if xincr > 0 else 1.0
