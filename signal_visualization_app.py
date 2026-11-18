@@ -33,6 +33,7 @@ from tec_output_worker import TecShutdownWorker
 from gui_configuration import default_config_path, save_configuration, load_configuration
 from text_measurements import TextImportCancelled
 from channel_math import ChannelMathError, channel_aliases, evaluate_channel_math
+from ui_controls import CollapsibleSection, WheelValueGuard
 
 
 class TextFileImportWorker(QtCore.QThread):
@@ -216,6 +217,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_all_views()
         self.tabs.setCurrentWidget(self.time_plot)
         self._update_sidebar_visibility()
+        self._wheel_value_guard = WheelValueGuard(self)
 
     def _debug(self, message: str):
         if self._debug_enabled:
@@ -247,7 +249,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.time_plot = PlotPanel("Time Domain")
         self.time_plot.layout().insertWidget(0, self.time_channels_group)
-        self.time_plot.layout().insertWidget(1, self.time_math_group)
+        self.time_plot.layout().insertWidget(1, self._time_math_section)
         self.time_plot.layout().setStretch(2, 1)
         self.freq_plot = PlotPanel("Frequency Domain")
         self.demo_plot = PlotPanel("Demodulation")
@@ -383,7 +385,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_scope_save = QtWidgets.QPushButton("Save Last Scope Capture")
         self.btn_scope_save.setEnabled(False)
 
-        self.group_scope_logging = QtWidgets.QGroupBox("Logging Mode")
+        self.group_scope_logging = QtWidgets.QGroupBox("Enable logging")
         self.group_scope_logging.setCheckable(True)
         self.group_scope_logging.setChecked(False)
         scope_log_form = QtWidgets.QFormLayout(self.group_scope_logging)
@@ -446,7 +448,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.check_itc_temperature.toggled.connect(self._update_tec_sweep_ui)
         scope_log_form.addRow(self.check_itc_temperature)
         scope_log_form.addRow("ITC4005 VISA", self.combo_itc_resource)
-        self.group_tec_sweep = QtWidgets.QGroupBox("TEC temperature sweep")
+        self.group_tec_sweep = QtWidgets.QGroupBox("Enable TEC sweep")
         self.group_tec_sweep.setCheckable(True)
         self.group_tec_sweep.setChecked(False)
         tec_form = QtWidgets.QFormLayout(self.group_tec_sweep)
@@ -482,7 +484,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_tec_sweep_summary = QtWidgets.QLabel()
         self.lbl_tec_sweep_summary.setWordWrap(True)
         tec_form.addRow(self.lbl_tec_sweep_summary)
-        scope_log_form.addRow(self.group_tec_sweep)
+        self._tec_sweep_section = CollapsibleSection("TEC temperature sweep", self.group_tec_sweep)
+        scope_log_form.addRow(self._tec_sweep_section)
         scope_log_form.addRow(self.check_auto_tec_output)
         self.group_tec_sweep.toggled.connect(self._update_tec_sweep_ui)
         for spin in (self.spin_tec_sweep_min, self.spin_tec_sweep_max,
@@ -515,19 +518,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.combo_time_column = QtWidgets.QComboBox()
         self.combo_amplitude_column = QtWidgets.QComboBox()
+        advanced_capture = QtWidgets.QGroupBox()
+        advanced_capture_form = QtWidgets.QFormLayout(advanced_capture)
+        advanced_capture_form.addRow(self.check_scope_display_window)
+        advanced_capture_form.addRow("Sample Points", self.spin_scope_points)
+        advanced_capture_form.addRow("Timeout", self.spin_scope_timeout_ms)
+        self._capture_options_section = CollapsibleSection("Advanced capture settings", advanced_capture)
+        file_options = QtWidgets.QGroupBox()
+        file_options_form = QtWidgets.QFormLayout(file_options)
+        file_options_form.addRow(_button_grid(self.btn_demo, self.btn_save_loaded))
+        file_options_form.addRow("Time Column", self.combo_time_column)
+        file_options_form.addRow("Amplitude Column", self.combo_amplitude_column)
+        self._file_options_section = CollapsibleSection("File / data options", file_options)
+        self._logging_section = CollapsibleSection("Logging Mode", self.group_scope_logging)
         form_data.addRow(self.path_edit)
-        form_data.addRow(_button_grid(self.btn_browse, self.btn_load, self.btn_demo, self.btn_save_loaded))
+        form_data.addRow(_button_grid(self.btn_browse, self.btn_load))
         form_data.addRow(QtWidgets.QLabel("Oscilloscope Input"))
         form_data.addRow("Resource", self.combo_scope_resource)
         form_data.addRow("Channel (optical)", self.combo_scope_channel)
         form_data.addRow(self.scope_channels_group)
-        form_data.addRow(self.check_scope_display_window)
-        form_data.addRow("Sample Points", self.spin_scope_points)
-        form_data.addRow("Timeout", self.spin_scope_timeout_ms)
-        form_data.addRow(self.group_scope_logging)
+        form_data.addRow(self._capture_options_section)
+        form_data.addRow(self._logging_section)
         form_data.addRow(_button_grid(self.btn_scope_refresh, self.btn_scope_acquire, self.btn_scope_save))
-        form_data.addRow("Time Column", self.combo_time_column)
-        form_data.addRow("Amplitude Column", self.combo_amplitude_column)
+        form_data.addRow(self._file_options_section)
 
         group_range = QtWidgets.QGroupBox("Time Range")
         form_range = QtWidgets.QFormLayout(group_range)
@@ -591,7 +604,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._time_channel_layout.addWidget(check)
         self.time_channels_group.hide()
 
-        self.time_math_group = QtWidgets.QGroupBox("Channel math")
+        self.time_math_group = QtWidgets.QGroupBox("Enable channel math")
         self.time_math_group.setCheckable(True)
         self.time_math_group.setChecked(False)
         self.time_math_group.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
@@ -627,6 +640,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.time_math_group.toggled.connect(self._update_time_plot)
         self.time_math_expression.returnPressed.connect(self._update_time_plot)
         self.btn_apply_time_math.clicked.connect(self._update_time_plot)
+        self._time_math_section = CollapsibleSection("Channel math", self.time_math_group)
 
         self.group_fft = QtWidgets.QGroupBox("FFT Settings")
         form_fft = QtWidgets.QFormLayout(self.group_fft)
@@ -708,17 +722,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_info = QtWidgets.QLabel("No data loaded.")
         self.lbl_info.setWordWrap(True)
         info_layout.addWidget(self.lbl_info)
+        self._time_settings_section = CollapsibleSection("Time Domain Settings", self.group_time)
+        self._metadata_section = CollapsibleSection("Source / Metadata", self.group_info)
 
         layout.addWidget(self.group_data)
         layout.addWidget(group_range)
-        layout.addWidget(self.group_time)
+        layout.addWidget(self._time_settings_section)
         layout.addWidget(self.group_fft)
         layout.addWidget(self.group_demod)
-        layout.addWidget(self.group_info)
+        layout.addWidget(self._metadata_section)
         layout.addStretch(1)
 
         sidebar_forms = (
             form_data,
+            advanced_capture_form,
+            file_options_form,
             scope_log_form,
             form_range,
             form_time,
@@ -834,6 +852,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         try:
             count = load_configuration(self, path)
+            for section in self.findChildren(CollapsibleSection):
+                section._update_title()
             self._update_tec_sweep_ui()
             self._update_scope_logging_ui()
             self.combo_scope_reference.setEnabled(self.check_scope_reference.isChecked())
@@ -1054,8 +1074,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sweep_widget.control_panel if current == self.sweep_widget else self.controls
         )
         self.group_data.setVisible(current == self.time_plot)
-        self.group_info.setVisible(current == self.time_plot)
-        self.group_time.setVisible(current == self.time_plot)
+        self._metadata_section.setVisible(current == self.time_plot)
+        self._time_settings_section.setVisible(current == self.time_plot)
         self.group_fft.setVisible(current == self.freq_plot)
         self.group_demod.setVisible(current == self.demo_plot)
 
@@ -2399,6 +2419,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Export Error", str(exc))
 
     def showEvent(self, event: QtGui.QShowEvent):
+        self._wheel_value_guard.install()
         super().showEvent(event)
         if self.combo_scope_resource.count() == 0:
             self._refresh_scope_resources()
@@ -2462,3 +2483,5 @@ class MainWindow(QtWidgets.QMainWindow):
             logging.getLogger("scope_recording").exception("Could not save GUI configuration")
             QtWidgets.QMessageBox.warning(self, "Configuration", f"Could not save settings to {self.config_path}: {exc}")
         super().closeEvent(event)
+        if event.isAccepted():
+            self._wheel_value_guard.uninstall()

@@ -146,6 +146,20 @@ Im Bereich `Data` gibt es den Abschnitt `Oscilloscope Input`:
 5. Die erfassten Daten werden direkt als aktive Datenquelle geladen und koennen wie eine Datei verarbeitet werden.
 6. Optional mit `Save Last Scope Capture` als HDF5 speichern.
 
+Die erweiterten Bereiche im Time-Tab sind beim Start eingeklappt: `Logging Mode`,
+TEC-Sweep, `Advanced capture settings`, `File / data options`, `Time Domain
+Settings`, `Source / Metadata` und `Channel math`. Ein Klick auf den Pfeil oder
+die Ueberschrift klappt den Bereich auf bzw. zu. Das Zuklappen aendert keine
+Messparameter und laesst aktive Messungen weiterlaufen. Aktivierte Funktionen
+werden auch eingeklappt mit `(enabled)` gekennzeichnet; die eigentliche
+Aktivierung erfolgt weiterhin ueber die Checkbox im geoeffneten Bereich.
+
+Das Mausrad bzw. Trackpad aendert in der GUI keine Zahlenwerte oder geschlossenen
+Auswahlfelder, auch wenn ein Feld den Fokus hat. Stattdessen scrollt die
+umgebende Seitenleiste. Werte lassen sich weiterhin per Tastatur, Pfeiltasten,
+Spinbox-Pfeilen oder durch bewusste Auswahl setzen. In einer geoeffneten
+Auswahlliste funktioniert das Scrollen weiterhin.
+
 **Capture displayed scope window** ist im Time-Tab standardmaessig aktiviert.
 Der Capture uebernimmt den am Oszilloskop sichtbaren Zeitbereich: Hauptzeitbasis
 mit Position/Delay, oder bei aktivem Wave-Inspector-Zoom das untere Zoomfenster.
