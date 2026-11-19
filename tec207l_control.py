@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import csv
+import json
+from contextlib import nullcontext
 from datetime import datetime
 import math
 from pathlib import Path
@@ -56,6 +58,27 @@ def make_program(settings):
     if type(cycles) is not int or cycles < 1:
         raise ValueError("Sine cycles must be a positive integer")
     return sine, sine.period_seconds * cycles, sine.interval_seconds
+
+
+def apply_output_limit(device, channel, percent):
+    """Use readback to confirm the limit before any output-enable operation."""
+    requested = Tec207L.validate_max_output(percent)
+    try:
+        device.set_max_output(channel, requested)
+        actual = device.get_max_output(channel)
+        if actual != requested:
+            raise RuntimeError(f"CH{channel} output limit was not confirmed: requested {requested}% Vin, read {actual!r}")
+        return actual
+    except Exception as exc:
+        # A running TEC must not continue under an unconfirmed ceiling.
+        # This is scoped to the selected channel; the other TEC keeps running.
+        try:
+            device.set_enable(channel, False)
+            if device.get_enable(channel):
+                raise RuntimeError("Output OFF was not confirmed")
+        except Exception as off_error:
+            raise RuntimeError(f"{exc}; Output OFF: {off_error}") from exc
+        raise
 
 
 class Tec207LConnection(QtCore.QThread):
@@ -116,19 +139,22 @@ class Tec207LConnection(QtCore.QThread):
             return {"model": dev.get_sensor_model(channel), "ntc": dev.get_ntc(channel), "pt": dev.get_pt(channel)}
         if action == "target":
             return dev.set_target_temp(channel, args[0])
+        if action == "limit":
+            return apply_output_limit(dev, channel, args[0])
         if action == "output":
             enabled, mode, limit = args
+            Tec207L.validate_max_output(limit)
             # Configure limits before enabling a channel.
             if not enabled:
                 dev.set_enable(channel, False)
+            apply_output_limit(dev, channel, limit)
             dev.set_output_mode(channel, mode)
-            dev.set_max_output(channel, limit)
             if enabled:
                 dev.set_enable(channel, True)
             actual = dev.get_enable(channel)
             if actual != enabled:
                 raise RuntimeError(f"CH{channel} output {'ON' if enabled else 'OFF'} was not confirmed")
-            return {"enable": actual}
+            return {"enable": actual, "limit": limit}
         if action == "pid":
             return dev.set_pid(channel, *args)
         if action == "sensor":
@@ -200,7 +226,8 @@ class Tec207LConnection(QtCore.QThread):
                     for ch in (1, 2):
                         sample = {"actual": self.device.get_actual_temp(ch), "target": self.device.get_target_temp(ch),
                                   "current": self.device.get_output_current(ch), "resistance": self.device.get_sensor_resistance(ch),
-                                  "enable": self.device.get_enable(ch), "monotonic": time.monotonic(),
+                                  "enable": self.device.get_enable(ch), "limit": self.device.get_max_output(ch),
+                                  "monotonic": time.monotonic(),
                                   "timestamp": datetime.now().astimezone().isoformat(timespec="microseconds")}
                         if not all(math.isfinite(sample[key]) for key in ("actual", "target", "current", "resistance")):
                             raise ValueError(f"CH{ch} returned non-finite data")
@@ -251,6 +278,42 @@ class Tec207LJob(QtCore.QThread):
         self.stop_event = threading.Event()
         self.force_off = threading.Event()
 
+    def _zn_tune(self, callbacks, limit):
+        path = Path(self.settings["result_path"]) if self.settings.get("result_path") else None
+        report = dict(channel=self.channel, settings=self.settings, trials=[], outcome="running", events=[])
+        keys = ["elapsed_s", "gain_p", "phase", "target_C", "temperature_C", "limit_percent", "current_A", "output_percent"]
+        try:
+            with path.open("x", newline="", encoding="utf-8") if path else nullcontext(None) as handle:
+                writer = csv.writer(handle) if handle else None
+                if writer:
+                    writer.writerow(["Time", "channel", *keys])
+                    handle.flush()
+                def sample(row):
+                    if writer:
+                        writer.writerow([datetime.now().astimezone().isoformat(timespec="microseconds"),
+                                         self.channel, *[row[key] for key in keys]])
+                        handle.flush()
+                def progress(message):
+                    report["events"].append(dict(time=datetime.now().astimezone().isoformat(), message=message))
+                    callbacks["on_step"](message)
+                result = run_autopid(self.device, self.channel, on_step=progress, should_stop=callbacks["should_stop"],
+                                     output_limit=limit, on_sample=sample, on_trial=report["trials"].append,
+                                     **self.settings.get("zn_settings", {}))
+                report.update(outcome="cancelled" if result.get("aborted") else "completed", result=result)
+                if path:
+                    result["result_path"] = str(path)
+                return result
+        except Exception as exc:
+            report.update(outcome="error", error=str(exc))
+            raise RuntimeError(f"{exc}" + (f"; tuning trace: {path}" if path else "")) from exc
+        finally:
+            if path:
+                try:
+                    with path.with_suffix(".json").open("x", encoding="utf-8") as handle:
+                        json.dump(report, handle, indent=2, allow_nan=False, default=str)
+                except Exception as exc:
+                    self.progress.emit(self.channel, f"Could not save tuning summary: {exc}")
+
     def _program(self):
         program, duration, interval = make_program(self.settings)
         target = self.device.get_target_temp(self.channel)
@@ -291,7 +354,14 @@ class Tec207LJob(QtCore.QThread):
         try:
             if self.stop_event.is_set():
                 return
-            if self.settings.get("auto_output", True):
+            # Per-channel drafts also apply to sweeps and both tuning methods,
+            # even when automatic output control is disabled. Never reuse a
+            # stale device limit or copy the other TEC element's setting.
+            limit = self.settings["limit"] if "limit" in self.settings else self.device.get_max_output(self.channel)
+            apply_output_limit(self.device, self.channel, limit)
+            if self.stop_event.is_set():
+                return
+            if self.settings.get("auto_output", True) and self.kind != "zn_tune":
                 self.device.set_enable(self.channel, True)
             callbacks = dict(on_step=lambda text: self.progress.emit(self.channel, text), should_stop=self.stop_event.is_set)
             if self.kind in {"range", "sine", "sine_sweep"}:
@@ -311,7 +381,7 @@ class Tec207LJob(QtCore.QThread):
             elif self.kind == "hardware_tune":
                 result = run_hw_autotune(self.device, self.channel, **callbacks)
             elif self.kind == "zn_tune":
-                result = run_autopid(self.device, self.channel, **callbacks)
+                result = self._zn_tune(callbacks, limit)
             else:
                 raise ValueError("Unknown TEC207L job")
         except Exception as exc:

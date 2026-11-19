@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import threading
 import time
+import math
 
 import serial
 
@@ -271,11 +272,28 @@ class Tec207L:
         return self.query(channel, "LIMITED")
 
     def set_max_output(self, channel: int, percent: int) -> None:
+        self.validate_max_output(percent)
         self.set(channel, "LIMITED", int(percent))
+
+    @staticmethod
+    def validate_max_output(percent):
+        """LIMITED is an integer voltage percentage, not a limit in watts."""
+        if (isinstance(percent, bool) or not isinstance(percent, (int, float))
+                or not math.isfinite(percent) or not 0 <= percent <= 90 or int(percent) != percent):
+            raise ValueError("TEC207L output voltage limit must be a whole percentage from 0 to 90")
+        return int(percent)
 
     def get_output_current(self, channel: int) -> float:
         """Actual output current in ampere."""
         return self.query(channel, "CURRENT") / 1e3
+
+    def get_output_percent(self, channel: int) -> float:
+        """PWMDUTY diagnostic: raw 200000 corresponds to 10% of Vin."""
+        return self.query(channel, "PWMDUTY") / 20000.
+
+    def get_control_mode(self) -> int:
+        """CONTMODE=0 is independent; modes 2/3 couple CH2 to CH1."""
+        return int(self.general_query("CONTMODE"))
 
     def get_full_state(self, channel: int) -> dict:
         """Read the complete current configuration of one channel.

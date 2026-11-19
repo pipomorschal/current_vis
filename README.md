@@ -56,6 +56,20 @@ setpoints, current, sensor resistance and output state for both channels.
 The monitoring interval is configurable under **Connection timing**; actual
 sampling also includes serial transaction time.
 
+The **Max output** controls at the top are separate for CH1 and CH2, so different
+TEC elements can use different ceilings. Each accepts **0–90 % Vin** (percentage
+of that channel's input/supply voltage), as defined by the manufacturer's
+[LIMITED register](https://img.staticdj.com/3534f43b684aba758e37f8365a41ea83.pdf)
+(section 3.3.1). This is a voltage ceiling, not an electrical power limit in watts.
+**Apply limit** writes and reads back only that channel's ceiling without enabling
+its output; **Device limit** shows the latest hardware value separately from the
+editable draft. Connecting reads existing limits without writing defaults.
+Manual output enable, temperature programs, step tests and both PID tuning methods
+apply and verify the selected channel's limit before enabling. A failed limit
+write/readback attempts to turn off only that channel and reports the failure.
+Limits remain in effect after a program finishes or is stopped. They are included
+in configuration profiles, and mouse-wheel gestures cannot change them.
+
 Advanced sections start collapsed and parameter editors use the application's
 mouse-wheel protection. Each channel supports:
 
@@ -71,6 +85,50 @@ mouse-wheel protection. Each channel supports:
   control; it enables the output as part of tuning.
 - **Step response test**: configurable target list, tolerance, continuous hold
   interval and per-step timeout, with a results table and automatic CSV export.
+
+**Ziegler-Nichols settings** is a separate, initially collapsed section for each
+channel. Defaults are P=2000 through P=200000, 30 seconds settling and 600 seconds
+observation **per gain**, a 0.5-second sample interval, 0.005 °C reversal threshold,
+minimum period 5 seconds and maximum deviation from the target of ±5 °C. A full
+unsuccessful default search can take almost two hours; Stop remains available.
+Set the observation time long enough for at least four expected thermal cycles.
+Actual sample timestamps include serial communication and contention with CH1.
+
+The search detects local temperature peaks/troughs rather than requiring target
+crossings: P-only control can have a steady offset. It requires three full periods
+with consistent period and amplitude, adequate sampling and measurable reversals.
+Decaying transients and predominantly output-clipped cycles cannot identify a
+usable Ziegler-Nichols ultimate gain. A limited-output thermal system may never
+reach such a gain; no PID is applied merely to make the search succeed.
+
+The channel's Max output limit is never raised by the search. It is checked
+before each gain change and every five seconds during the temperature readings.
+Limit changes, excessive temperature deviation, disabled output or a changed
+setpoint stop tuning. A lower limit observed during a run is preserved during
+cleanup. Failed or cancelled searches restore the old PID/setpoint/output mode
+with the affected output OFF, and report cleanup failures. The other channel is
+not reconfigured. Successful tuning keeps the configured output ceiling and
+uses the normal automatic-output checkbox to decide whether to switch OFF.
+
+The controller must use **independent-channel mode (CONTMODE=0)**; modes 2/3 make
+CH2 follow CH1, so changing CH2 PID would not identify its own loop. Active device
+AUTOPID is also rejected before starting the PC gain search. Shared controller
+mode is read, never changed automatically. These registers and the read-only
+PWMDUTY diagnostic are described in the manufacturer's
+[Communication Protocol, sections 3.3.6, 3.3.12 and 3.4.4](https://cnres.appracle.com/3534f43b684aba758e37f8365a41ea83.pdf).
+PWMDUTY is used to flag output-limited trials, not to infer electrical watts. If
+the firmware does not support that optional diagnostic, the trace records it as
+unavailable and the hardware LIMITED ceiling is still monitored.
+
+Every GUI ZN attempt creates `autopid_chN_*.csv` in the selected log folder and
+a matching `.json` diagnostic summary, including failed and cancelled attempts.
+The CSV contains actual timestamps, gain, phase, target/measured temperature,
+verified output limit, current and last output-percentage reading. Electrical
+diagnostics refresh at five-second intervals. The JSON includes settings,
+progress messages, per-gain cycle measurements and the failure reason. The
+progress and errors identify missing cycles, noise, decaying amplitude, output
+limiting, coupled channels and exhausted gain search separately. Start logging
+both channels as well if thermal interaction between the TEC elements is suspected.
 
 Both channels can run programs independently. **Stop selected channel program**
 stops the selected job; **All outputs OFF** stops both jobs and disables both

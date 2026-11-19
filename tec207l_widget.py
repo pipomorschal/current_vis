@@ -14,6 +14,7 @@ from serial.tools import list_ports
 from plot_panel_widget import PlotPanel
 from ui_controls import CollapsibleSection
 from tec207l.device import OUTPUT_MODES, SENSOR_MODELS
+from tec207l.autopid import AutopidSettings
 from tec207l_control import Tec207LConnection, Tec207LJob, make_program, write_history
 
 
@@ -170,6 +171,7 @@ class Tec207LWidget(QtWidgets.QWidget):
         main.addWidget(self._status)
         readouts = QtWidgets.QHBoxLayout()
         self._readouts = {}
+        self._limit_readouts = {}
         for ch in (1, 2):
             group = QtWidgets.QGroupBox(f"CH{ch}")
             layout = QtWidgets.QVBoxLayout(group)
@@ -177,6 +179,16 @@ class Tec207LWidget(QtWidgets.QWidget):
             label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
             layout.addWidget(label)
             self._readouts[ch] = label
+            limit = self._integer(ch, "limit", 30, 0, 90)
+            limit.setPrefix("Max output: ")
+            limit.setSuffix(" % Vin")
+            limit.setToolTip("Maximum output voltage relative to this channel's supply voltage (0–90%). "
+                             "This is not a power limit in watts. Applied and verified before every program or PID tune.")
+            limit_form = QtWidgets.QFormLayout()
+            layout.addLayout(limit_form)
+            self._action(limit_form, ch, "Apply limit", lambda _checked=False, channel=ch: self._apply(channel, "limit"), beside=limit)
+            self._limit_readouts[ch] = QtWidgets.QLabel("Device limit: —")
+            layout.addWidget(self._limit_readouts[ch])
             readouts.addWidget(group)
         main.addLayout(readouts)
         toolbar = QtWidgets.QHBoxLayout()
@@ -238,7 +250,6 @@ class Tec207LWidget(QtWidgets.QWidget):
         for key, label in OUTPUT_MODES.items():
             mode.addItem(label, key)
         form.addRow("Mode", mode)
-        form.addRow("Max output", self._integer(ch, "limit", 30, 0, 90))
         form = self._form(layout, "PID / auto-tuning")
         for name, value in (("p", 3000), ("i", 150), ("d", 0)):
             form.addRow(name.upper(), self._integer(ch, f"pid_{name}", value))
@@ -246,6 +257,21 @@ class Tec207LWidget(QtWidgets.QWidget):
         self._action(form, ch, "Read PID", lambda: self._submit(ch, "read_pid"))
         self._action(form, ch, "Start device PID auto-tune", lambda: self._start_job(ch, "hardware_tune"))
         self._action(form, ch, "Start Ziegler-Nichols auto-PID", lambda: self._start_job(ch, "zn_tune"))
+        form = self._form(layout, "Ziegler-Nichols settings")
+        form.addRow("Starting P", self._integer(ch, "zn_p_start", 2000, 1))
+        form.addRow("Maximum P", self._integer(ch, "zn_p_max", 200000, 1))
+        for name, label, value, low, high, decimals, suffix in (
+                ("settle_s", "Settle per gain", 30, 0, 86400, 1, " s"),
+                ("max_window_s", "Observe per gain", 600, 20, 86400, 1, " s"),
+                ("sample_s", "Sample interval", .5, .1, 60, 2, " s"),
+                ("hysteresis", "Reversal threshold", .005, .0001, 1, 4, " °C"),
+                ("min_period_s", "Minimum period", 5, 1, 3600, 1, " s"),
+                ("max_deviation", "Max error from target", 5, .01, 50, 3, " °C")):
+            form.addRow(label, self._number(ch, "zn_" + name, value, low, high, decimals, suffix))
+        note = QtWidgets.QLabel("Keeps this channel's Max output limit. Requires independent channels (CONTMODE=0). "
+                               "Saves a tuning CSV and diagnostic JSON in the log folder.")
+        note.setWordWrap(True)
+        form.addRow(note)
         form = self._form(layout, "Sensor configuration")
         model = self._field(ch, "model", QtWidgets.QComboBox())
         for key, label in SENSOR_MODELS.items():
@@ -335,6 +361,10 @@ class Tec207LWidget(QtWidgets.QWidget):
             for key, value in (("target", state["target"]), ("enable", state["enable"]),
                                ("mode", state["mode"]), ("limit", state["limit"])):
                 self._set_value(ch, key, value)
+            self._show_limit(ch, state["limit"])
+
+    def _show_limit(self, ch, value):
+        self._limit_readouts[ch].setText(f"Device limit: {value} % Vin")
 
     def _refresh_ports(self):
         current = self.port.currentText()
@@ -420,6 +450,8 @@ class Tec207LWidget(QtWidgets.QWidget):
         try:
             if action == "target":
                 args = (self._value(ch, "target"),)
+            elif action == "limit":
+                args = (self._value(ch, "limit"),)
             elif action == "output":
                 args = tuple(self._value(ch, key) for key in ("enable", "mode", "limit"))
             elif action == "pid":
@@ -444,6 +476,10 @@ class Tec207LWidget(QtWidgets.QWidget):
             self._fill_state(ch, {"pid": result}, "pid")
         elif action == "read_sensor":
             self._fill_state(ch, result, "sensor")
+        elif action == "limit":
+            self._show_limit(ch, result)
+        elif action == "output":
+            self._show_limit(ch, result["limit"])
         elif action == "all_off":
             for channel in (1, 2):
                 self._set_value(channel, "enable", False)
@@ -453,7 +489,7 @@ class Tec207LWidget(QtWidgets.QWidget):
 
     def _job_settings(self, ch, kind):
         names = ("minimum", "maximum", "increment", "dwell_s", "repeats", "center", "amplitude", "frequency_hz",
-                 "update_s", "cycles", "auto_output", "accuracy", "hold_s", "timeout_s")
+                 "update_s", "cycles", "auto_output", "accuracy", "hold_s", "timeout_s", "limit")
         settings = {key: self._value(ch, key) for key in names}
         settings["mode"] = kind
         if kind in {"range", "sine", "sine_sweep"}:
@@ -465,6 +501,10 @@ class Tec207LWidget(QtWidgets.QWidget):
             if not targets or len(targets) > 10000 or not all(math.isfinite(v) and -40 <= v <= 100 for v in targets):
                 raise ValueError("Enter a comma-separated target list between -40 and 100 °C")
             settings.update(targets=targets, result_path=str(self._result_path(f"steptest_ch{ch}")))
+        if kind == "zn_tune":
+            params = {name: self._value(ch, "zn_" + name) for name in AutopidSettings.__dataclass_fields__}
+            AutopidSettings(**params)
+            settings.update(zn_settings=params, result_path=str(self._result_path(f"autopid_ch{ch}")))
         return settings
 
     def _start_job(self, ch, kind):
@@ -479,7 +519,7 @@ class Tec207LWidget(QtWidgets.QWidget):
             reserved = True
             job = Tec207LJob(self._connection.device, ch, kind, settings, self)
             self._jobs[ch] = job
-            job.progress.connect(lambda channel, text: self._job_status[channel].setText(f"CH{channel}: {text}"))
+            job.progress.connect(self._job_progress)
             job.completed.connect(self._job_completed)
             job.failed.connect(lambda channel, text: self._job_status[channel].setText(f"CH{channel}: error: {text}"))
             job.finished.connect(lambda channel=ch: self._job_finished(channel))
@@ -493,6 +533,11 @@ class Tec207LWidget(QtWidgets.QWidget):
                     job.deleteLater()
                 self._connection.release_channel(ch)
             self._message(str(exc))
+
+    def _job_progress(self, channel, text):
+        self._job_status[channel].setText(f"CH{channel}: {text}")
+        if self._jobs.get(channel) and self._jobs[channel].kind == "zn_tune":
+            self._communication.appendPlainText(f"CH{channel}: {text}")
 
     def _job_completed(self, ch, result):
         self._job_status[ch].setText(f"CH{ch}: {'stopped' if result.get('aborted') else 'completed'}"
@@ -535,6 +580,8 @@ class Tec207LWidget(QtWidgets.QWidget):
         if self._started_at is None:
             self._started_at = sample["monotonic"]
         self._history[ch].append(sample)
+        if "limit" in sample:
+            self._show_limit(ch, sample["limit"])
         self._readouts[ch].setText(f"Temperature: {sample['actual']:.5f} °C\nTarget: {sample['target']:.5f} °C   "
                                   f"Current: {sample['current']:.3f} A\nResistance: {sample['resistance']:.3f} Ω   "
                                   f"Output: {'ON' if sample['enable'] else 'OFF'}")
