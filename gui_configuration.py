@@ -45,7 +45,8 @@ def controls_for(window):
 
     for section, owner in (("time", window), ("sweep", window.sweep_widget), ("rf_capture", window.rf_capture_widget),
                            ("recordings", window.recording_widget), ("tec_sine", window.tec_sine_widget),
-                           ("tec_pid", window.tec_pid_widget), ("playback", window.playback_widget)):
+                           ("tec_pid", window.tec_pid_widget), ("tec207l", window.tec207l_widget),
+                           ("playback", window.playback_widget)):
         for name, value in vars(owner).items():
             if not name.startswith("_"):
                 visit(f"{section}.{name}", value)

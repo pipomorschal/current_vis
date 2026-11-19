@@ -41,6 +41,55 @@ and analysis before loading a profile. Configurations are validated before
 applying, and files are replaced only after a complete successful write.
 `SIGNAL_VISUALIZATION_CONFIG` can override the automatic-save path.
 
+## TEC207L dual-channel controller
+
+The **TEC207L** tab integrates the serial driver and control algorithms from
+`TecController.zip` into the existing Qt interface. Select the adapter COM port
+and baud rate, then **Connect**. The supplied project's USB-TTL default is
+**38400 baud, 8N1**; 9600 and other rates are selectable for other interfaces.
+Connecting reads the model, firmware and both channels' actual settings.
+
+Select **CH1** or **CH2** for independent setpoint, output mode/limit, sensor
+(NTC/PT coefficients and model), and PID controls. Apply buttons write settings;
+periodic readings do not overwrite drafts. The live view shows temperatures,
+setpoints, current, sensor resistance and output state for both channels.
+The monitoring interval is configurable under **Connection timing**; actual
+sampling also includes serial transaction time.
+
+Advanced sections start collapsed and parameter editors use the application's
+mouse-wheel protection. Each channel supports:
+
+- **Temperature range sweep**: minimum, maximum, increment, dwell and repeat count
+  (default N=1). Each target is held for the configured dwell after its write.
+- **Sine / DC offset sweep**: center, AC amplitude (including zero), frequency,
+  update interval and cycle count. Enable **Sweep DC offset** to use the range
+  sweep's limits, dwell and repeats. Sine phase follows elapsed wall-clock time;
+  its update interval must provide at least 20 points per nonzero AC cycle.
+- **PID / auto-tuning**: manual PID, the controller's own AUTOPID routine, and
+  the standalone project's Ziegler-Nichols oscillation search at the current
+  hardware setpoint. Ziegler-Nichols temporarily selects cool/heat and P-only
+  control; it enables the output as part of tuning.
+- **Step response test**: configurable target list, tolerance, continuous hold
+  interval and per-step timeout, with a results table and automatic CSV export.
+
+Both channels can run programs independently. **Stop selected channel program**
+stops the selected job; **All outputs OFF** stops both jobs and disables both
+outputs. **Output ON at start / OFF after job** is checked by default and OFF
+is verified after completion, cancellation or failure. Range/sine and step tests
+restore their previous setpoint. Disconnect or closing requests cancellation
+and waits for job cleanup before releasing the serial port; close again after
+cleanup, consistent with the other instrument tabs.
+
+**Data logging / export** writes every background sample from both channels to
+a timestamped CSV with per-channel temperature, setpoint, current, resistance
+and output state. Logging must be started explicitly and continues independently
+of a temperature program. Existing files are never overwritten. Load these CSVs
+through the normal file importer to select metrics using the existing checkbox
+interface. **Export history CSV** exports the in-memory history (last 10,000
+samples per channel); continuous logging has no such sample limit. Channel drafts,
+ports, sweep parameters and display settings are included in GUI configuration
+profiles. Loading a profile does not connect or write to the controller.
+
 ## Automatic TEC output control
 
 **TEC output ON at start / OFF after run** defaults to checked in Time-tab

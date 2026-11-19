@@ -27,6 +27,7 @@ from scope_capture_process import capture_isolated
 from recording_temperatures import read_optional_temperatures, apply_tec_sweep_setpoint
 from tec_temperature_sweep import TecTemperatureSweep
 from tec_pid_widget import TecPidWidget
+from tec207l_widget import Tec207LWidget
 from tec_sine_widget import TecSineWidget
 from scope_recording_io import next_scope_logging_path
 from tec_output_worker import TecShutdownWorker
@@ -258,6 +259,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recording_widget = RecordingPlotWidget()
         self.tec_pid_widget = TecPidWidget()
         self.tec_sine_widget = TecSineWidget()
+        self.tec207l_widget = Tec207LWidget()
         self.playback_widget = CapturePlaybackWidget()
         self.mini_game_widget = MiniGameWidget()
 
@@ -268,6 +270,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar_stack.addWidget(self.recording_widget.control_panel)
         self.sidebar_stack.addWidget(self.tec_pid_widget.control_panel)
         self.sidebar_stack.addWidget(self.tec_sine_widget.control_panel)
+        self.sidebar_stack.addWidget(self.tec207l_widget.control_panel)
         self.sidebar_stack.addWidget(self.playback_widget.control_panel)
         self.sidebar_stack.addWidget(self.mini_game_widget.control_panel)
         self.sidebar_stack.setMinimumWidth(340)
@@ -287,6 +290,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.recording_widget, "Recordings")
         self.tabs.addTab(self.tec_sine_widget, "TEC Sine")
         self.tabs.addTab(self.tec_pid_widget, "TEC PID")
+        self.tabs.addTab(self.tec207l_widget, "TEC207L")
         self.tabs.addTab(self.playback_widget, "Capture Playback")
         self.tabs.addTab(self.mini_game_widget, " ")
 
@@ -837,6 +841,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 or self.tec_sine_widget.worker is not None or self.tec_sine_widget.recording_worker is not None
                 or self.tec_sine_widget._shutdown_worker is not None or self.tec_sine_widget.meter_worker is not None
                 or self.tec_sine_widget._temperature_worker is not None
+                or self.tec207l_widget.configuration_busy()
                 or self.playback_widget.is_busy or self.playback_widget.is_playing
                 or self.recording_widget._thread is not None or self._demod_thread is not None)
 
@@ -882,6 +887,7 @@ class MainWindow(QtWidgets.QMainWindow):
             recordings._refresh_normalization()
             self.playback_widget._metadata_visibility()
             self.rf_capture_widget._update_controls()
+            self.tec207l_widget.refresh_configuration()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Configuration", f"Could not load configuration: {exc}")
             return False
@@ -1068,6 +1074,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.rf_capture_widget.control_panel if current == self.rf_capture_widget else
             self.tec_sine_widget.control_panel if current == self.tec_sine_widget else
             self.tec_pid_widget.control_panel if current == self.tec_pid_widget else
+            self.tec207l_widget.control_panel if current == self.tec207l_widget else
             self.playback_widget.control_panel if current == self.playback_widget else
             self.mini_game_widget.control_panel if current == self.mini_game_widget else
             self.recording_widget.control_panel if current == self.recording_widget else
@@ -2445,6 +2452,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not self.tec_pid_widget.shutdown():
             self.statusBar().showMessage("TEC PID is stopping. Close again after the acquisition has stopped.")
+            event.ignore()
+            return
+        if not self.tec207l_widget.shutdown():
+            self.statusBar().showMessage("TEC207L programs / serial communication are stopping. Close again after they have stopped.")
             event.ignore()
             return
         if not self.recording_widget.shutdown():
